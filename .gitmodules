@@ -1,0 +1,4 @@
+[submodule "third_party/assets"]
+	path = third_party/assets
+	url = git@github.com:qiyuanchn/RoomGen.Agent.Assets.git
+	branch = main
