@@ -120,11 +120,20 @@ def run_denoise_pass(build_dir: str, prefilter: str = "ACCURATE", quality: str =
 # P1 scene dressing: details, materials, furniture, lights
 # --------------------------------------------------------------------------- #
 def build_details_layer(spec: spec_mod.SceneSpec, shell_info: dict) -> dict:
-    """Skirting, casings, window glass and shell edge bevels."""
+    """Skirting, casings, window glass and shell edge bevels.
+
+    On a multi-floor spec the layer is skipped: ``details.py`` builds its trim on
+    the ground plane (skirting at ``z = 0``, casings and glass at the opening's
+    own height) and is not storey-aware yet, so a second-storey door would get
+    its casing on the ground floor.  The shell itself stays storey-aware.
+    """
+    report = {"skirting": 0, "casings": 0, "glass": 0, "bevels": 0}
+    if spec.floors:
+        report["skipped"] = "details.py is not storey-aware yet (multi-floor spec)"
+        return report
     config = spec.details or {}
     collection = shell.ensure_collection(DETAILS_COLLECTION)
     objects = []
-    report = {"skirting": 0, "casings": 0, "glass": 0, "bevels": 0}
     if config.get("skirting", False):
         pieces = details.build_skirting(spec, collection)
         report["skirting"] = len(pieces)
@@ -269,6 +278,7 @@ def place_furniture(spec: spec_mod.SceneSpec, libraries: dict, scene_materials: 
             continue
         if item.asset.startswith("builtin:"):
             kind = item.asset.split(":", 1)[1]
+            floor_z = spec.room_elevation(item.room)
             if kind == "rug":
                 size = item.size
                 obj = details.make_rug(
@@ -277,12 +287,15 @@ def place_furniture(spec: spec_mod.SceneSpec, libraries: dict, scene_materials: 
                 )
                 if scene_materials.get("rug") is not None:
                     obj.data.materials.append(scene_materials["rug"])
+                # make_rug builds on the ground plane; lift it to the room's storey
+                obj.location.z += floor_z
                 placements.append({"name": name, "asset": item.asset, "kind": "builtin",
-                                   "pos": item.pos, "rot_z_deg": item.rot_z_deg, "z": 0.0,
+                                   "pos": item.pos, "rot_z_deg": item.rot_z_deg,
+                                   "z": round(floor_z, 4),
                                    "size_m": [size[0], size[1], 0.012]})
                 continue
             if kind == "table_lamp":
-                base_z = float(item.z or 0.0)
+                base_z = float(item.z) if item.z is not None else floor_z
                 parts = details.make_table_lamp(item.pos, collection=collection, name=f"lamp_{name}")
                 shade = materials_mod_plain_principled("mat_lamp_shade", (0.95, 0.90, 0.82), 0.7)
                 _add_emission(shade, strength=1.6)
@@ -300,7 +313,7 @@ def place_furniture(spec: spec_mod.SceneSpec, libraries: dict, scene_materials: 
             # the created objects, which is how settle.resolve_targets finds them
             from blender_agent import fixtures as fixtures_mod
             if fixtures_mod.is_fixture(kind):
-                base_z = float(item.z or 0.0)
+                base_z = float(item.z) if item.z is not None else floor_z
                 objects = fixtures_mod.build(kind, item.pos, item.rot_z_deg, collection,
                                              name=f"fixture_{name}", base_z=base_z)
                 placements.append({"name": name, "asset": item.asset, "kind": "builtin",
@@ -316,9 +329,11 @@ def place_furniture(spec: spec_mod.SceneSpec, libraries: dict, scene_materials: 
         asset_collection = assets.append_asset(libraries[asset_id], asset_id)
         asset_object = asset_collection.objects[0]
         size = [float(v) * item.scale for v in asset_object.dimensions]
-        height = float(item.z) if item.z is not None else 0.0
+        floor_z = spec.room_elevation(item.room)
+        # ``z`` is a world height; without one the piece stands on its room's floor
+        height = float(item.z) if item.z is not None else floor_z
         if item.mount == "ceiling":
-            height = spec.wall_height - size[2]
+            height = spec.room_top(item.room) - size[2]
         instance = assets.place_asset(
             asset_collection, f"furn_{name}", item.pos, item.rot_z_deg,
             height, item.scale,
@@ -500,9 +515,16 @@ def main(argv) -> int:
     else:
         shell_info = shell.build_shell(spec)
         print(
-            f"[run_build] shell: {len(shell_info['floors'])} floors, {len(shell_info['ceilings'])} ceilings, "
-            f"{len(shell_info['walls'])} walls, cutters applied: {shell_info['cutters_applied']}"
+            f"[run_build] shell: {len(shell_info['floors'])} floor slabs, {len(shell_info['ceilings'])} ceilings, "
+            f"{len(shell_info['walls'])} walls, {len(shell_info.get('stairs', []))} stair steps, "
+            f"{len(shell_info.get('slab_openings', []))} slab openings, cutters applied: "
+            f"{shell_info['cutters_applied']}"
         )
+        if spec.floors:
+            for storey in shell_info["storeys"]:
+                print(f"[run_build]   floor '{storey['id']}': elevation {storey['elevation']:.2f} m, "
+                      f"height {storey['height']:.2f} m, slab {storey['slab_thickness']:.2f} m, "
+                      f"rooms {storey['rooms']}")
 
     flat_materials = stage.build_materials(spec)
     if front3d_ctx is not None:
@@ -653,8 +675,29 @@ def main(argv) -> int:
             "ply_objects": [obj.name for obj in shell_objects],
             "wall_spans": len(shell_info["walls"]),
             "cutters_applied": shell_info["cutters_applied"],
+            "storeys": shell_info.get("storeys", []),
+            "ceiling_from_upper": shell_info.get("ceiling_from_upper", []),
+            "slab_openings": shell_info.get("slab_openings", []),
+            "stairs": [obj.name for obj in shell_info.get("stairs", [])],
+            "ramps": [obj.name for obj in shell_info.get("ramps", [])],
             "dome_radius": dome_radius,
             "dome_center": dome_center,
+        },
+        "building": {
+            "schema_version": spec.schema_version,
+            "floors": [
+                {"id": floor.id, "elevation": floor.elevation, "height": floor.height,
+                 "slab_thickness": floor.slab_thickness} for floor in spec.floors
+            ],
+            "connectors": [
+                {"kind": c.kind, "from_room": c.from_room, "to_room": c.to_room,
+                 "from_floor": c.from_floor, "to_floor": c.to_floor, "width": c.width,
+                 "height": c.height, "center": c.center, "run": c.run, "rise": c.rise,
+                 "steps": c.steps, "landing_m": c.landing_m}
+                for c in spec.connectors
+            ],
+            "slab_openings": [{"outline": opening.outline, "floors": opening.floors}
+                              for opening in spec.slab_openings],
         },
         "visible_geometry": {
             "ply": os.path.basename(furnished_ply),

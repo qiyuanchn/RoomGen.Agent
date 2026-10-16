@@ -135,6 +135,82 @@ PANOWORLD_BATCH_SUMMARY_ONLY=1 \
   bash scripts/batch_generate.sh 0 100 outputs/stream     # rebuild the table only
 ```
 
+## Two-storey buildings (multi-floor contract)
+
+The first storey contract is the one described above and keeps working
+unchanged (a spec without `floors` is schema_version 1).  A building spec adds
+`schema_version: 2` and the storeys:
+
+```jsonc
+"schema_version": 2,
+"floors": [{"id": "f0", "elevation": 0.0, "height": 2.7, "slab_thickness": 0.15},
+           {"id": "f1", "elevation": 2.85, "height": 2.7, "slab_thickness": 0.15}],
+"rooms":  [{"id": "hall", "floor_id": "f0", "polygon": [[0,0],[3,0],[3,6],[0,6]]},
+           {"id": "landing", "floor_id": "f1", "polygon": [[0,0],[3,0],[3,6],[0,6]]},
+           ...],                                    // optional per-room "height"
+"connectors": [
+  {"kind": "door",  "from_room": "hall", "to_room": "living", "from_floor": "f0",
+   "to_floor": "f0", "center": [3.0, 5.5], "width": 0.9, "height": 2.05},
+  {"kind": "stair", "from_room": "hall", "to_room": "landing", "from_floor": "f0",
+   "to_floor": "f1", "width": 0.85, "run": 2.6, "rise": 2.85, "steps": 16,
+   "landing_m": 1.0, "center": [1.5, 3.0], "direction_deg": 90}],
+"slab_openings": [{"outline": [[0.65,1.2],[2.35,1.2],[2.35,4.95],[0.65,4.95]],
+                   "floors": ["f1"]}]
+```
+
+* A floor's `elevation` is its **walking surface**, `height` its net height and
+  `slab_thickness` the slab **below** it (`[elevation - slab_thickness,
+  elevation]`).  One storey's ceiling is the next storey's slab — the builder
+  never emits both, and a spec whose upper slab would reach below the lower
+  ceiling is rejected before anything is built.
+* Walls merge **within one storey only**; door and window cutters are applied
+  per storey (a second-storey door cannot notch a first-storey wall even though
+  both share their XY), and window `sill`/`height` stay relative to the room
+  floor.
+* `connectors` carry every connection (`door`/`open_passage` on one floor,
+  `stair`/`ramp` between two).  `slab_opening` punches its outline through the
+  floor slab of each listed storey — the stairwell.  Legacy `openings` still
+  work and are folded into the same connection list.
+* Stairs are **built geometry**: a straight run (`landing_m: 0`) or a switchback
+  with a half landing, `steps` risers of `rise / steps`, treads of
+  `run / (steps/2)` per flight, solid blocks from the lower floor up.
+* Furniture and camera `z` are **world** heights: the bottom of a piece standing
+  on a room's floor is that floor's `elevation`, the settle pass drops it onto
+  the same plane, and everything written out (manifest, extrinsics, settled
+  poses) stays in world coordinates.
+
+`checks.py` verifies the 2.5D building: one walkable grid per storey (slab
+openings are holes unless a stair fills them), a stair/ramp edge joining the
+cell in front of the first riser to the cell in front of the top step, riser /
+tread / width / pitch / landing bands, the fly-through opening in the slab
+above, ≥ 2.0 m headroom over every step, a clear stair mouth, and — because the
+walk bands are per storey — furniture stacked in XY on two floors is never a
+false collision.  `settle.py` drops each piece onto its own storey's floor,
+`export_scene.py` writes `topdown_<floor>.png` per storey (plus a stacked
+`topdown.png` and a `connectors.json`), and `map.json` links two viewpoints
+when their rooms share a door **or a stair** — the cross-floor adjacency.
+`tools/validate_blender_agent_p0.py` measures every door inside its own storey,
+probes each step top and each slab opening against the shell, and checks that
+the upper slab and the lower ceiling are exactly one slab sandwich.
+
+```bash
+# hand-written two-storey demo (4 rooms per storey, one switchback stair)
+python blender_agent/checks.py tests/fixtures/two_floor_demo.json
+PANOWORLD_RES=1024x512 PANOWORLD_SAMPLES=24 \
+  bash scripts/blender_agent_run.sh tests/fixtures/two_floor_demo.json outputs/two_floor_demo
+```
+
+Known limits of this first version: `details.py` (skirting, casings, window
+glass) is not storey-aware, so the details layer is skipped on multi-floor
+specs; `stage.build_window_portals` still places its area lights at the opening
+height without the storey elevation (leave `lighting.window_portal_w` at 0 on a
+multi-floor spec, lamps still work); the ceiling of a room under another storey
+shows the upper floor's material; an upper storey that covers only *part* of a
+room below counts as covering it (the uncovered part gets no ceiling slab); and
+only straight / switchback stairs and solid ramps are implemented — no curved
+flights, no mezzanines, and a ramp that climbs a whole storey needs a long run
+(the slope band is a loose 30 %).
+
 ## Layout
 
 ```
@@ -293,6 +369,7 @@ python tests/test_front3d_math.py                       # transform-order units
 bash  tests/test_front3d_replay.sh                      # replay end-to-end
 python tests/test_layout_gen.py                         # layout generator units
 python tests/test_settle.py                             # furniture settling units + box self-check
+python tests/test_multifloor.py                         # storey contract, stairs, 2.5D checks, probes
 python tests/test_batch_stats.py                        # batch grading, exit codes, retry, resume
 bash  scripts/blender_agent_run.sh configs/blender_agent_p0_demo.json outputs/p0
 ```

@@ -14,13 +14,25 @@ Checks, in order:
 5. **door geometry**, per opening and independent of the cameras: local rays
    from *both* sides of every door measure the hole in the wall (is it really
    open, is the wall really there beside it, is the opening as wide and as high
-   as the spec says) -- see :func:`check_door_openings`
+   as the spec says) -- see :func:`check_door_openings`.  Every door is measured
+   inside its **own storey**: the probe z band starts at the storey's floor
+   (``floor.elevation``) and stops below its room height.
 6. **door visibility coverage** (informational, never fails a scene): for every
    camera the doors of its own room are projected into the ERP frame with the
    matrix-inverse projection of :func:`world_to_erp` and compared with the
    rendered depth, so a scene report says how many doorways each viewpoint
    actually sees through; reasonable occlusion is a number here, not a verdict
-7. ``map.json`` is a symmetric graph over the supplied cameras
+7. **built stairs** (multi-floor, :func:`check_stairs_built`): every step and
+   landing is probed with a vertical ray -- the hit must be the declared walking
+   surface -- and each stair's slab opening is probed from above, where the ray
+   must not stop inside the slab band (the stairwell is really open)
+8. **storey sandwich** (multi-floor, :func:`check_floor_stacks`): for a room with
+   another storey above it, an up ray inside the lower room and a down ray over
+   the upper surface must be exactly one slab thickness apart, so the upper
+   floor slab and the lower ceiling are one body, not two overlapping slabs
+9. ``map.json`` is a symmetric graph over the supplied cameras; it links two
+   views when their rooms share a door **or a stair**, so the exported graph
+   carries the cross-floor adjacency
 
 Ground truth ray casting note: trimesh's own ``RayMeshIntersector`` needs the
 optional ``rtree`` package, which is not part of this environment.  The caster
@@ -389,8 +401,12 @@ class MeshRayCaster:
                     best[block] = np.minimum(best[block], distances.min(axis=1))
                 t_best[rays] = best
             if getattr(self, "far_triangles", np.empty(0)).size:
-                self._cast_far(o.astype(np.float64), d.astype(np.float64),
-                               t_best.astype(np.float64))
+                # float64 refinement of the rays whose nearest hit is the far
+                # enclosure (the sky dome); the result has to be written back into
+                # the float32 buffer, otherwise every sky ray stays a miss
+                t_best64 = t_best.astype(np.float64)
+                self._cast_far(o.astype(np.float64), d.astype(np.float64), t_best64)
+                t_best[:] = t_best64
             result[start : start + chunk] = t_best.astype(np.float64)
         return result
 
@@ -518,6 +534,11 @@ def check_door_openings(spec: spec_mod.SceneSpec, caster, probe_m: float = 0.35,
       the wall is its width, the open run from the floor up is its height, and
       both are compared with the spec.
 
+    Doors are measured **within their own storey**: the probe z values start at
+    the storey's walking surface (``floor.elevation + 0.10``) and stop below the
+    room height, so a second-storey door is measured where the second storey is
+    -- never at another storey's wall of the same XY.
+
     This replaces the old spot check (``spec.openings[0]`` against every camera,
     one column each, ``door_depth > 1.5 * wall_depth``): a door sealed in another
     wall was never looked at, and the ratio itself was meaningless for a real
@@ -529,15 +550,25 @@ def check_door_openings(spec: spec_mod.SceneSpec, caster, probe_m: float = 0.35,
     segments = spec.wall_segments()
     doors: list = []
 
-    for index, opening in enumerate(spec.openings):
+    for index, connector in enumerate(spec.door_connections()):
+        floor = spec.room_floor(connector.from_room)
+        elevation = float(floor.elevation)
+        headroom = min(spec.room_height(connector.from_room), spec.room_height(connector.to_room))
+        height = float(connector.height or spec_mod.DEFAULT_DOOR_HEIGHT_M)
         report: dict = {
             "index": index,
-            "between": list(opening.between),
-            "center": [float(opening.center[0]), float(opening.center[1])],
-            "spec_width_m": float(opening.width),
-            "spec_height_m": float(opening.height),
+            "kind": connector.kind,
+            "between": [connector.from_room, connector.to_room],
+            "floor": floor.id,
+            "floor_elevation_m": round(elevation, 3),
+            "center": [float(connector.center[0]), float(connector.center[1])],
+            "spec_width_m": float(connector.width),
+            "spec_height_m": height,
         }
-        segment = spec_mod.wall_segment_for_point(segments, opening.center, opening.between[0])
+        segment = spec_mod.wall_segment_for_point(
+            segments, connector.center, connector.from_room,
+            floor_id=connector.from_floor if spec.floors else None,
+        )
         if segment is None:
             report.update({"pass": False, "failures": ["opening centre is not on a wall shared by both rooms"]})
             doors.append(report)
@@ -545,18 +576,18 @@ def check_door_openings(spec: spec_mod.SceneSpec, caster, probe_m: float = 0.35,
 
         direction = np.array(segment.direction, dtype=np.float64)
         normal = np.array([-direction[1], direction[0]], dtype=np.float64)
-        centre = np.array([float(opening.center[0]), float(opening.center[1])], dtype=np.float64)
-        width, height = float(opening.width), float(opening.height)
+        centre = np.array([float(connector.center[0]), float(connector.center[1])], dtype=np.float64)
+        width = float(connector.width)
         failures: list = []
 
         # which side of the wall each room is on (the ray probe has to stand
         # inside that room, so the sign comes from the room polygon itself)
         probe_sign = {}
-        for room_id in opening.between:
+        for room_id in (connector.from_room, connector.to_room):
             probe_sign[room_id] = 1.0 if spec_mod.point_in_polygon(
                 centre + normal * probe_m, spec.room(room_id).polygon) else -1.0
-        if probe_sign[opening.between[0]] == probe_sign[opening.between[1]]:
-            probe_sign = {opening.between[0]: 1.0, opening.between[1]: -1.0}
+        if probe_sign[connector.from_room] == probe_sign[connector.to_room]:
+            probe_sign = {connector.from_room: 1.0, connector.to_room: -1.0}
 
         def offset_ray(along: float, z: float, side: float):
             origin = np.array([centre[0] + direction[0] * along + normal[0] * side * probe_m,
@@ -580,21 +611,21 @@ def check_door_openings(spec: spec_mod.SceneSpec, caster, probe_m: float = 0.35,
                     start = None
             return best
 
-        z_scan = min(max(height / 2.0, 0.45), height - 0.15, float(spec.wall_height) - 0.15)
+        z_scan = elevation + min(max(height / 2.0, 0.45), height - 0.15, headroom - 0.15)
         along_scan = np.arange(-(width / 2.0 + 0.5), width / 2.0 + 0.5 + 1e-9, step_m)
-        z_values = np.arange(0.10, float(spec.wall_height) - 0.05 + 1e-9, step_m)
+        z_values = np.arange(elevation + 0.10, elevation + headroom - 0.05 + 1e-9, step_m)
 
         measured_widths, measured_heights = [], []
-        for room_id in opening.between:
+        for room_id in (connector.from_room, connector.to_room):
             side = probe_sign[room_id]
             through = [offset_ray(along, z, side)
-                       for z in np.linspace(0.10, max(0.10, height - 0.10), 5)
+                       for z in np.linspace(elevation + 0.10, elevation + max(0.10, height - 0.10), 5)
                        for along in np.linspace(-(width / 2.0 - 0.05), width / 2.0 - 0.05, 7)]
             open_fraction = float(np.mean(cast(through) >= t_exit - 1e-4))
 
             beside = [offset_ray(along, z, side)
                       for along in (-(width / 2.0 + 0.15), width / 2.0 + 0.15)
-                      for z in (0.6, z_scan)]
+                      for z in (elevation + 0.6, z_scan)]
             beside_hits = cast(beside)
             solid_fraction = float(np.mean((beside_hits >= t_enter - 1e-4) & (beside_hits <= t_exit + 1e-3)))
 
@@ -618,7 +649,7 @@ def check_door_openings(spec: spec_mod.SceneSpec, caster, probe_m: float = 0.35,
                 if not is_open:
                     break
                 top = float(value)
-            measured_height = (top + step_m / 2.0) if top > 0.0 else 0.0
+            measured_height = (top - elevation + step_m / 2.0) if top > elevation else 0.0
             measured_heights.append(measured_height)
 
             report.setdefault("sides", {})[room_id] = {
@@ -655,6 +686,189 @@ def check_door_openings(spec: spec_mod.SceneSpec, caster, probe_m: float = 0.35,
     }
 
 
+def _point_segment_distance(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
+    dx, dy = bx - ax, by - ay
+    length_sq = dx * dx + dy * dy
+    if length_sq < 1e-12:
+        return float(np.hypot(px - ax, py - ay))
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length_sq))
+    return float(np.hypot(px - (ax + t * dx), py - (ay + t * dy)))
+
+
+def _polygon_centroid_xy(polygon):
+    area = 0.0
+    cx = cy = 0.0
+    n = len(polygon)
+    for i in range(n):
+        x0, y0 = float(polygon[i][0]), float(polygon[i][1])
+        x1, y1 = float(polygon[(i + 1) % n][0]), float(polygon[(i + 1) % n][1])
+        cross = x0 * y1 - x1 * y0
+        area += cross
+        cx += (x0 + x1) * cross
+        cy += (y0 + y1) * cross
+    area /= 2.0
+    if abs(area) < 1e-12:
+        return (sum(float(p[0]) for p in polygon) / n, sum(float(p[1]) for p in polygon) / n)
+    return (cx / (6.0 * area), cy / (6.0 * area))
+
+
+def _probe_points(spec: spec_mod.SceneSpec, polygon, floor_id: str, margin: float = 0.25,
+                  step: float = 0.25, limit: int = 12, avoid_stairs: bool = True) -> list:
+    """Grid points inside ``polygon``, away from walls / slab openings / stairs."""
+    segments = [seg for seg in spec.wall_segments()
+                if not spec.floors or seg.floor_id == floor_id]
+    footprints = []
+    if avoid_stairs:
+        footprints = [plan.footprint for plan in spec.stair_plans()] \
+            + [plan.footprint for plan in spec.ramp_plans()]
+    xs = [float(p[0]) for p in polygon]
+    ys = [float(p[1]) for p in polygon]
+    out = []
+    y = min(ys) + margin
+    while y <= max(ys) - margin and len(out) < limit:
+        x = min(xs) + margin
+        while x <= max(xs) - margin and len(out) < limit:
+            if spec_mod.point_in_polygon((x, y), polygon) \
+                    and not spec.in_slab_opening(floor_id, (x, y)) \
+                    and not any(spec_mod.point_in_polygon((x, y), poly) for poly in footprints) \
+                    and all(_point_segment_distance(x, y, seg.p0[0], seg.p0[1], seg.p1[0], seg.p1[1]) >= margin
+                            for seg in segments):
+                out.append((x, y))
+            x += step
+        y += step
+    return out
+
+
+def check_stairs_built(spec: spec_mod.SceneSpec, caster) -> dict:
+    """Geometric acceptance of the *built* stairs: step tops, openings, arrival.
+
+    Every step / landing box is probed with a vertical ray from above: the hit
+    must be its declared walking surface (within 6 cm), which proves the steps
+    really exist in the shell at the right heights.  Each stair's slab opening is
+    probed from above on the floor above: a ray must *not* stop in the slab's own
+    z band, so the stairwell is really open there.
+    """
+    if not spec.floors:
+        return {"pass": True, "skipped": "single storey", "stairs": []}
+    results = []
+    ok = True
+    for plan in spec.stair_plans():
+        label = f"{plan.connector.from_room}->{plan.connector.to_room}"
+        failures = []
+        steps = []
+        for box in plan.boxes:
+            cx, cy = _polygon_centroid_xy(box["polygon"])
+            top = float(box["z1"])
+            origin = np.array([[cx, cy, top + 0.35]], dtype=np.float64)
+            direction = np.array([[0.0, 0.0, -1.0]], dtype=np.float64)
+            hit = float(caster.cast(origin, direction)[0])
+            measured = origin[0][2] - hit if np.isfinite(hit) else float("nan")
+            passed = bool(np.isfinite(measured) and abs(measured - top) <= 0.06)
+            steps.append({"role": box["role"], "expected_top_m": round(top, 3),
+                          "measured_m": None if not np.isfinite(measured) else round(measured, 3),
+                          "pass": passed})
+            if not passed:
+                failures.append(f"{label}: {box['role']} top at {top:.3f} m measured "
+                                f"{measured:.3f} m")
+        opening_probes = []
+        to_floor = spec.floor(plan.connector.to_floor)
+        for opening in spec.slab_openings_for(plan.connector.to_floor):
+            xs = [float(p[0]) for p in opening.outline]
+            ys = [float(p[1]) for p in opening.outline]
+            probe_points = []
+            y = min(ys) + 0.05
+            while y <= max(ys) - 0.05 and len(probe_points) < 24:
+                x = min(xs) + 0.05
+                while x <= max(xs) - 0.05 and len(probe_points) < 24:
+                    if spec_mod.point_in_polygon((x, y), opening.outline) \
+                            and not spec_mod.point_in_polygon((x, y), plan.footprint):
+                        probe_points.append((x, y))
+                    x += 0.10
+                y += 0.10
+            origins = np.array([[x, y, to_floor.elevation + 0.4] for x, y in probe_points])
+            if len(probe_points):
+                directions = np.tile(np.array([[0.0, 0.0, -1.0]]), (len(probe_points), 1))
+                hits = caster.cast(origins, directions)
+                band = (to_floor.elevation - to_floor.slab_thickness - 0.02, to_floor.elevation + 0.02)
+                for (x, y), hit in zip(probe_points, hits):
+                    measured = to_floor.elevation + 0.4 - float(hit) if np.isfinite(hit) else None
+                    in_slab = measured is not None and band[0] <= measured <= band[1]
+                    opening_probes.append({"x": round(x, 3), "y": round(y, 3),
+                                           "measured_m": None if measured is None else round(measured, 3),
+                                           "in_slab_band": bool(in_slab)})
+                    if in_slab:
+                        failures.append(f"{label}: the slab of floor '{to_floor.id}' is still there at "
+                                        f"({x:.2f}, {y:.2f}) -- the opening is not cut")
+        results.append({"stair": label, "steps": steps, "opening_probes": opening_probes,
+                        "failures": failures, "pass": not failures})
+        ok = ok and not failures
+    return {"pass": ok, "stairs": results}
+
+
+def check_floor_stacks(spec: spec_mod.SceneSpec, caster) -> dict:
+    """The storey sandwich: upper slab bottom == lower ceiling plane, no overlap.
+
+    For every lower room with a room of another storey above it, a vertical probe
+    measures the ceiling from below (up ray from inside the lower room) and the
+    upper walking surface from above (down ray): the two must be exactly one slab
+    thickness apart, so the upper floor slab and the lower ceiling are the same
+    body instead of two overlapping ones.
+    """
+    if not spec.floors:
+        return {"pass": True, "skipped": "single storey", "pairs": []}
+    pairs = []
+    failures = []
+    for lower in spec.rooms:
+        lower_floor = spec.room_floor(lower.id)
+        ceiling = lower_floor.elevation + spec.room_height(lower.id)
+        probes = _probe_points(spec, lower.polygon, lower_floor.id)
+        for upper in spec.rooms:
+            upper_floor = spec.room_floor(upper.id)
+            if upper_floor.elevation <= lower_floor.elevation + 1e-9:
+                continue
+            if spec_mod.polygon_overlap_area(lower.polygon, upper.polygon) < 0.5:
+                continue
+            upper_probes = [p for p in probes if spec_mod.point_in_polygon(p, upper.polygon)
+                            and not spec.in_slab_opening(upper_floor.id, p)]
+            if not upper_probes:
+                pairs.append({"lower": lower.id, "upper": upper.id, "probes": 0,
+                              "note": "no probe point clear of walls, stairs and openings"})
+                continue
+            x, y = upper_probes[0]
+            up_origin = np.array([[x, y, ceiling - 0.4]], dtype=np.float64)
+            down_origin = np.array([[x, y, upper_floor.elevation + 0.4]], dtype=np.float64)
+            down = np.array([[0.0, 0.0, -1.0]], dtype=np.float64)
+            up = np.array([[0.0, 0.0, 1.0]], dtype=np.float64)
+            up_hit = float(caster.cast(up_origin, up)[0])
+            down_hit = float(caster.cast(down_origin, down)[0])
+            measured_ceiling = ceiling - 0.4 + up_hit if np.isfinite(up_hit) else None
+            measured_surface = upper_floor.elevation + 0.4 - down_hit if np.isfinite(down_hit) else None
+            expected_ceiling = upper_floor.elevation - upper_floor.slab_thickness
+            entry = {
+                "lower": lower.id, "upper": upper.id, "probe": [round(x, 3), round(y, 3)],
+                "expected_ceiling_m": round(expected_ceiling, 3),
+                "measured_ceiling_m": None if measured_ceiling is None else round(measured_ceiling, 3),
+                "measured_surface_m": None if measured_surface is None else round(measured_surface, 3),
+                "slab_thickness_spec_m": round(upper_floor.slab_thickness, 3),
+            }
+            problems = []
+            if measured_ceiling is None or abs(measured_ceiling - expected_ceiling) > 0.05:
+                problems.append(f"lower ceiling measured {measured_ceiling} m vs expected "
+                                f"{expected_ceiling:.3f} m")
+            if measured_surface is None or abs(measured_surface - upper_floor.elevation) > 0.05:
+                problems.append(f"upper walking surface measured {measured_surface} m vs expected "
+                                f"{upper_floor.elevation:.3f} m")
+            if measured_ceiling is not None and measured_surface is not None \
+                    and abs((measured_surface - measured_ceiling) - upper_floor.slab_thickness) > 0.05:
+                problems.append(f"slab sandwich is {measured_surface - measured_ceiling:.3f} m thick, "
+                                f"spec says {upper_floor.slab_thickness:.3f} m (overlapping slabs?)")
+            entry["failures"] = problems
+            entry["pass"] = not problems
+            pairs.append(entry)
+            failures.extend(f"{lower.id}/{upper.id}: {problem}" for problem in problems)
+    return {"pass": not failures, "pairs": pairs, "violations": failures}
+
+
 def door_visibility_check(spec: spec_mod.SceneSpec, camera: spec_mod.CameraSpec,
                           rendered: np.ndarray, c2w: np.ndarray) -> dict:
     """Informational: which of the camera's own doors does it see through?
@@ -665,23 +879,28 @@ def door_visibility_check(spec: spec_mod.SceneSpec, camera: spec_mod.CameraSpec,
     door plane: a sight line that really passes through the opening arrives
     *behind* the door plane, an occluded one arrives in front of it.  The result
     is a coverage number, so reasonable occlusion (furniture between the camera
-    and the doorway) is reported instead of failing the scene.
+    and the doorway) is reported instead of failing the scene.  The sample point
+    sits at the door's own storey (``floor.elevation + height / 2``).
     """
     height, width = rendered.shape
-    doors = [opening for opening in spec.openings if camera.room in opening.between]
+    doors = [connector for connector in spec.door_connections() if camera.room in (
+        connector.from_room, connector.to_room)]
     if not doors:
         return {"role": "informational", "pass": True, "skipped": "camera room has no opening"}
     entries = []
-    for index, opening in enumerate(doors):
-        z_sample = float(min(max(opening.height / 2.0, 0.30), opening.height - 0.10))
-        point = np.array([float(opening.center[0]), float(opening.center[1]), z_sample])
+    for index, connector in enumerate(doors):
+        elevation = spec.room_elevation(camera.room)
+        door_height = float(connector.height or spec_mod.DEFAULT_DOOR_HEIGHT_M)
+        z_sample = elevation + float(min(max(door_height / 2.0, 0.30), door_height - 0.10))
+        point = np.array([float(connector.center[0]), float(connector.center[1]), z_sample])
         column, row, distance = erp_pixel_of_point(point, c2w, width, height)
         column = max(2, min(width - 3, column))
         row = max(2, min(height - 3, row))
         measured = float(np.median(rendered[row - 2:row + 3, column - 2:column + 3]))
         entries.append({
-            "between": list(opening.between),
+            "between": [connector.from_room, connector.to_room],
             "opening": index,
+            "floor": spec.room_floor(connector.from_room).id,
             "column": int(column),
             "row": int(row),
             "door_distance_m": round(distance, 3),
@@ -900,6 +1119,40 @@ def main(argv=None) -> int:
         record("door_openings_geometry", doors["pass"],
                ply=os.path.relpath(door_ply_path, REPO_ROOT), **doors)
         del door_caster
+
+    # ---- 5b: the built stairs and the storey sandwich (multi-floor) ------- #
+    if spec.floors:
+        shell_caster = None
+        if door_ply_path is not None and os.path.isfile(door_ply_path):
+            if door_ply_path == ply_path and caster is not None:
+                shell_caster = caster
+            else:
+                _stairs_mesh, shell_caster = load_caster(door_ply_path)
+        if shell_caster is None:
+            record("stairs_built", False, error="no PLY with the shell geometry to measure the stairs")
+            record("floor_stacks", False, error="no PLY with the shell geometry to measure the slabs")
+        else:
+            stairs = check_stairs_built(spec, shell_caster)
+            for stair in stairs.get("stairs", []):
+                print(f"[validate] stair {stair['stair']}: "
+                      f"{'PASS' if stair['pass'] else 'FAIL'} "
+                      f"{len(stair['steps'])} steps, {len(stair['opening_probes'])} opening probes"
+                      + (f" -- {stair['failures'][0]}" if stair.get("failures") else ""))
+            record("stairs_built", stairs["pass"], **stairs)
+            stacks = check_floor_stacks(spec, shell_caster)
+            for pair in stacks.get("pairs", []):
+                if pair.get("probes") == 0:
+                    print(f"[validate] floor stack {pair['lower']}/{pair['upper']}: skipped "
+                          f"({pair.get('note')})")
+                else:
+                    print(f"[validate] floor stack {pair['lower']}/{pair['upper']}: "
+                          f"ceiling {pair.get('measured_ceiling_m')} m, surface "
+                          f"{pair.get('measured_surface_m')} m, slab "
+                          f"{pair.get('slab_thickness_spec_m')} m"
+                          + (f" -- {pair['failures'][0]}" if pair.get("failures") else ""))
+            record("floor_stacks", stacks["pass"], **stacks)
+            if shell_caster is not caster:
+                del shell_caster
 
     # ---- 6: door visibility coverage (informational, never gates) --------- #
     seen = sum(entry.get("visible", 0) for entry in door_visibility.values())

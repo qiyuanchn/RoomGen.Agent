@@ -25,16 +25,28 @@ contract shared with the generator:
 * doors stay clear: no blocking furniture within 0.15 m of the door approach
   rectangle (door width + 0.4 m, 0.85 m deep on each side of the wall).  The
   zone only guards the doorway itself; keeping the whole passage walkable is the
-  circulation check's job.
-* circulation: a 5 cm grid over the apartment.  A cell is *free* when it is
-  inside a room inset by the wall half thickness or inside a door corridor, and
-  not inside a blocking footprint dilated by 0.20 m.  A blocking item is one
-  whose Z interval intersects the walkable band (0.20 m .. 1.60 m), so rugs,
-  wall art and ceiling lamps never block.  BFS from the centre of the first
-  opening must reach every room (at least 25% of that room's walkable cells,
-  never fewer than 8) and every camera.
+  circulation check's job.  Doors and their approach zones belong to one storey:
+  furniture on another floor at the same XY never blocks them.
+* circulation is 2.5D: every storey gets its own 5 cm walkable grid.  A cell is
+  *free* when it is inside a room of that storey inset by the wall half
+  thickness or inside a door corridor of that storey, and not inside a blocking
+  footprint dilated by 0.20 m -- a blocking item intersects its own storey's
+  walkable band (floor + 0.20 m .. floor + 1.60 m), so rugs, wall art and
+  ceiling lamps never block and furniture one storey up never blocks the floor
+  below.  Slab openings are holes (not walkable) except where a stair fills
+  them.  BFS from the centre of the first opening must reach every room (at
+  least 25% of that room's walkable cells, never fewer than 8), every camera and
+  -- through the ``stair`` / ``ramp`` connectors -- every storey.  Two storeys
+  stack in XY without either being false-blocked; a stair links the cell in
+  front of its first riser on the lower floor to the cell in front of its top
+  step on the upper floor.
+* stairs are accepted on their own numbers as well: riser / tread / width /
+  pitch / landing for both the straight run and the switchback, the fly-through
+  opening in the slab above, the walk-through headroom (>= 2.0 m measured
+  against the slab) and a clear stair mouth -- no blocking furniture on the
+  stair, in front of its first riser or in front of its top step.
 * cameras sit inside their room and at least 0.50 m away from blocking
-  furniture.
+  furniture of their own storey.
 
 CLI::
 
@@ -165,16 +177,25 @@ class ItemBox:
     placement: str
     rot_z_deg: float
     rotation_on_grid: bool
+    floor_z: float = 0.0
+    floor_id: str = ""
     attached_to: Optional[str] = None
 
     @property
+    def walk_band(self) -> Tuple[float, float]:
+        """Walkable Z band of this item's storey (legacy/ground floor: 0.20..1.60)."""
+        return (self.floor_z + WALK_BAND_M[0], self.floor_z + WALK_BAND_M[1])
+
+    @property
     def blocks_walking(self) -> bool:
-        return self.placement != FLOOR_FLAT and self.z[0] < WALK_BAND_M[1] and self.z[1] > WALK_BAND_M[0]
+        band = self.walk_band
+        return self.placement != FLOOR_FLAT and self.z[0] < band[1] and self.z[1] > band[0]
 
     @property
     def blocks_camera(self) -> bool:
-        return self.placement not in (FLOOR_FLAT, CEILING, MOUNTED) and self.z[0] < WALK_BAND_M[1] \
-            and self.z[1] > WALK_BAND_M[0]
+        band = self.walk_band
+        return self.placement not in (FLOOR_FLAT, CEILING, MOUNTED) and self.z[0] < band[1] \
+            and self.z[1] > band[0]
 
 
 
@@ -191,11 +212,16 @@ def item_boxes(spec: "spec_mod.SceneSpec", index: Dict[str, dict]) -> Tuple[List
         placement = str(getattr(item, "placement", "") or "")
         if placement not in PLACEMENT_CLASSES:
             placement = ""
-        z0 = float(item.z) if item.z is not None else 0.0
+        floor = spec.room_floor(item.room)
+        floor_z = float(floor.elevation)
+        top = floor_z + spec.room_height(item.room)
+        # a world z on the room's own floor is "standing on the floor"; anything
+        # lifted off it (relative to *that* floor) is mounted or stacked
+        z0 = (float(item.z) - floor_z) if item.z is not None else 0.0
         if item.mount == "ceiling":
             placement = CEILING
-            z0 = spec.wall_height - dims[2]
-        elif placement == "" and item.z is not None and item.z >= 0.5:
+            z0 = top - dims[2]
+        elif placement == "" and item.z is not None and float(item.z) - floor_z >= 0.5:
             placement = MOUNTED
         elif placement == "" and item.asset == "builtin:rug":
             placement = FLOOR_FLAT
@@ -206,11 +232,13 @@ def item_boxes(spec: "spec_mod.SceneSpec", index: Dict[str, dict]) -> Tuple[List
                 asset=item.asset,
                 room=item.room,
                 aabb=rotated_aabb(item.pos, dims, rot),
-                z=(z0, z0 + dims[2]),
+                z=(floor_z + z0, floor_z + z0 + dims[2]),
                 dims=dims,
                 placement=placement,  # filled below when empty
                 rot_z_deg=rot,
                 rotation_on_grid=abs(rot / 90.0 - round(rot / 90.0)) < 1e-9,
+                floor_z=floor_z,
+                floor_id=floor.id,
                 attached_to=(str(getattr(item, "attached_to", "")) or None),
             )
         )
@@ -340,7 +368,7 @@ def infer_placement(box: ItemBox, room, wall_gap_m: float) -> str:
         return box.placement
     if box.asset == "builtin:rug":
         return FLOOR_FLAT
-    if box.z[0] >= 1.2:
+    if box.z[0] - box.floor_z >= 1.2:
         return MOUNTED
     if wall_gap_m <= WALL_GAP_HUG_MAX_M:
         return WALL_HUG
@@ -359,30 +387,41 @@ class DoorZone:
     height: float
     direction: Tuple[float, float]
     rects: Dict[str, Tuple[float, float, float, float]]
+    floor_id: str = ""
+    floor_z: float = 0.0
 
 
 def door_zones(spec: "spec_mod.SceneSpec", wall_thickness: float) -> List[DoorZone]:
-    """Door approach rectangles, one per adjoining room."""
+    """Door approach rectangles, one per adjoining room (per storey)."""
     segments = spec.wall_segments()
     zones: List[DoorZone] = []
-    for opening in spec.openings:
-        segment = spec_mod.wall_segment_for_point(segments, opening.center, opening.between[0])
+    for connector in spec.door_connections():
+        center = connector.center
+        if center is None:
+            continue
+        floor = spec.room_floor(connector.from_room)
+        segment = spec_mod.wall_segment_for_point(
+            segments, center, connector.from_room,
+            floor_id=connector.from_floor if spec.floors else None,
+        )
         if segment is None:
             continue
         ux, uy = segment.direction
-        half_w = opening.width / 2.0 + DOOR_ZONE_EXTRA_W_M / 2.0
+        half_w = connector.width / 2.0 + DOOR_ZONE_EXTRA_W_M / 2.0
         half_d = wall_thickness / 2.0 + DOOR_ZONE_DEPTH_M
         rects: Dict[str, Tuple[float, float, float, float]] = {}
-        for room_id in (opening.between[0], opening.between[1]):
-            nx, ny = spec_mod.inward_normal(room_id, opening.center, spec)
-            ax, ay = opening.center[0] + nx * half_d, opening.center[1] + ny * half_d
-            bx, by = opening.center[0] - nx * wall_thickness / 4.0, opening.center[1] - ny * wall_thickness / 4.0
+        for room_id in (connector.from_room, connector.to_room):
+            nx, ny = spec_mod.inward_normal(room_id, center, spec)
+            ax, ay = center[0] + nx * half_d, center[1] + ny * half_d
+            bx, by = center[0] - nx * wall_thickness / 4.0, center[1] - ny * wall_thickness / 4.0
             rects[room_id] = (min(ax, bx) - abs(ux) * half_w, min(ay, by) - abs(uy) * half_w,
                               max(ax, bx) + abs(ux) * half_w, max(ay, by) + abs(uy) * half_w)
-        zones.append(DoorZone(a=opening.between[0], b=opening.between[1],
-                              center=(float(opening.center[0]), float(opening.center[1])),
-                              width=float(opening.width), height=float(opening.height),
-                              direction=(ux, uy), rects=rects))
+        zones.append(DoorZone(a=connector.from_room, b=connector.to_room,
+                              center=(float(center[0]), float(center[1])),
+                              width=float(connector.width),
+                              height=float(connector.height or spec_mod.DEFAULT_DOOR_HEIGHT_M),
+                              direction=(ux, uy), rects=rects,
+                              floor_id=floor.id, floor_z=float(floor.elevation)))
     return zones
 
 
@@ -473,14 +512,17 @@ def check_spec(spec: "spec_mod.SceneSpec", assets_index: Optional[Dict[str, dict
             for box in boxes:
                 if box.room != room_id or not box.blocks_walking:
                     continue
+                if spec.floors and box.floor_id != zone.floor_id:
+                    continue
                 distance = rect_distance(box.aabb, rect)
                 if distance < DOOR_CLEARANCE_M - 1e-9:
                     door_blocks.append(
                         f"{box.name} ({room_id}) is {distance:.3f} m from the door between "
                         f"{zone.a}/{zone.b} (min {DOOR_CLEARANCE_M} m)"
                     )
-        doors[f"{zone.a}|{zone.b}"] = {"center": list(zone.center), "width": zone.width,
-                                       "height": zone.height}
+        label = f"{zone.a}|{zone.b}" if not spec.floors else f"{zone.floor_id}:{zone.a}|{zone.b}"
+        doors[label] = {"center": list(zone.center), "width": zone.width,
+                        "height": zone.height, "floor": zone.floor_id}
     record("doors_clear", not door_blocks, violations=door_blocks, doors=doors)
     violations.extend(door_blocks)
 
@@ -528,9 +570,40 @@ def check_spec(spec: "spec_mod.SceneSpec", assets_index: Optional[Dict[str, dict
     record("circulation_reachable", not reach_bad and circulation["start_reachable"],
            violations=reach_bad + ([circulation["start_note"]] if not circulation["start_reachable"] else []),
            rooms=circulation["rooms"], cameras=circulation["cameras"],
-           start=circulation["start"], grid={"step_m": grid_m, "free_cells": circulation["free_cells"],
-                                             "reachable_cells": circulation["reachable_cells"]})
+           start=circulation["start"], floors=circulation.get("floors"),
+           grid={"step_m": grid_m, "free_cells": circulation["free_cells"],
+                 "reachable_cells": circulation["reachable_cells"],
+                 "stair_links": circulation.get("stair_links", 0)})
     violations.extend(reach_bad)
+
+    # -- stairs: numbers, slab opening, headroom, clear mouth ---------------- #
+    stairs = stair_report(spec)
+    record("stairs_geometry", stairs["geometry_ok"], stairs=stairs["stairs"],
+           violations=stairs["geometry_violations"])
+    record("stairs_slab_openings", stairs["openings_ok"], stairs=stairs["stairs"],
+           violations=stairs["opening_violations"])
+    record("stairs_headroom", stairs["headroom_ok"], stairs=stairs["stairs"],
+           violations=stairs["headroom_violations"], min_headroom_m=spec_mod.STAIR_HEADROOM_MIN_M)
+    clear_stairs = stair_clearance(spec, boxes)
+    record("stairs_clear", not clear_stairs, violations=clear_stairs, stairs=stairs["stairs"])
+    violations.extend(stairs["geometry_violations"] + stairs["opening_violations"]
+                      + stairs["headroom_violations"] + clear_stairs)
+
+    # -- informational: same-XY items on different floors are not a clash ---- #
+    cross_floor = []
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            a, b = boxes[i], boxes[j]
+            if a.floor_id == b.floor_id and a.floor_z == b.floor_z:
+                continue
+            if a.aabb[2] > b.aabb[0] and b.aabb[2] > a.aabb[0] \
+                    and a.aabb[3] > b.aabb[1] and b.aabb[3] > a.aabb[1]:
+                cross_floor.append({"a": a.name, "b": b.name, "a_floor": a.floor_id,
+                                    "b_floor": b.floor_id,
+                                    "a_z": [round(a.z[0], 3), round(a.z[1], 3)],
+                                    "b_z": [round(b.z[0], 3), round(b.z[1], 3)]})
+    record("cross_floor_xy_ok_info", True, role="informational", pairs=cross_floor,
+           note="same-XY items on different storeys share no 3D volume; this list is a sanity read")
 
     report = {
         "kind": "blender_agent_layout_checks",
@@ -616,129 +689,456 @@ def room_connectivity(polygon: Sequence[Sequence[float]], boxes: Sequence[ItemBo
             "grid_m": grid_m}
 
 
+def _grid_cell(x0: float, y0: float, grid_m: float, nx: int, ny: int, x: float, y: float):
+    ix = int(round((x - x0) / grid_m))
+    iy = int(round((y - y0) / grid_m))
+    if 0 <= ix < nx and 0 <= iy < ny:
+        return ix, iy
+    return None
+
+
+def _stair_links(spec: "spec_mod.SceneSpec", floor_index: Dict[str, int], storeys: List[dict]):
+    """Cross-storey BFS edges: stair/ramp entry cell (lower) <-> exit cell (upper)."""
+    links: Dict[int, List[int]] = {}
+
+    def node(floor_position: int, point: Sequence[float]):
+        storey = storeys[floor_position]
+        cell = _grid_cell(storey["x0"], storey["y0"], storey["step"], storey["nx"], storey["ny"],
+                          float(point[0]), float(point[1]))
+        if cell is None:
+            return None
+        return storey["offset"] + cell[0] * storey["ny"] + cell[1]
+
+    plans = list(spec.stair_plans()) + list(spec.ramp_plans())
+    for plan in plans:
+        from_position = floor_index.get(plan.connector.from_floor)
+        to_position = floor_index.get(plan.connector.to_floor)
+        if from_position is None or to_position is None:
+            continue
+        a = node(from_position, plan.base_point)
+        b = node(to_position, plan.head_point)
+        if a is None or b is None:
+            continue
+        links.setdefault(a, []).append(b)
+        links.setdefault(b, []).append(a)
+    return links
+
+
 def circulation_report(spec: "spec_mod.SceneSpec", boxes: Sequence[ItemBox], zones: Sequence[DoorZone],
                        grid_m: float = GRID_M) -> dict:
-    """5 cm grid BFS from the first door: are all rooms and cameras reachable?"""
-    xs = [float(p[0]) for room in spec.rooms for p in room.polygon]
-    ys = [float(p[1]) for room in spec.rooms for p in room.polygon]
-    x0, y0, x1, y1 = min(xs) - grid_m, min(ys) - grid_m, max(xs) + grid_m, max(ys) + grid_m
-    nx = int(math.ceil((x1 - x0) / grid_m)) + 1
-    ny = int(math.ceil((y1 - y0) / grid_m)) + 1
+    """Per-storey walkable grids plus cross-storey stair links, BFS from the first door.
 
-    def cell_of(x: float, y: float) -> Tuple[int, int]:
-        return (int(round((x - x0) / grid_m)), int(round((y - y0) / grid_m)))
+    Single-storey (legacy) specs get exactly one grid, so the numbers match the
+    pre-multi-floor checker.  On a multi-floor plan every storey has its own
+    grid; slab openings are holes unless a stair fills them, and each
+    stair/ramp connector adds an edge between the cell in front of its first
+    riser (lower floor) and the cell in front of its top step (upper floor).
+    """
+    storeys_meta = spec.floors or [_synthetic_check_floor(spec)]
+    floor_index = {floor.id: position for position, floor in enumerate(storeys_meta)}
+    storeys: List[dict] = []
+    global_free = bytearray()
+    global_blocked = bytearray()
+    global_room: List[Optional[str]] = []
+    offset = 0
 
-    def center_of(ix: int, iy: int) -> Tuple[float, float]:
-        return (x0 + ix * grid_m, y0 + iy * grid_m)
-
-    free = bytearray(nx * ny)
-    room_of: List[Optional[str]] = [None] * (nx * ny)
-    for room in spec.rooms:
-        poly = inset_polygon(room.polygon, spec.wall_thickness / 2.0)
-        for ix in range(nx):
-            cx = x0 + ix * grid_m
-            if cx < min(p[0] for p in poly) - grid_m or cx > max(p[0] for p in poly) + grid_m:
-                continue
-            for iy in range(ny):
-                cy = y0 + iy * grid_m
-                if cy < min(p[1] for p in poly) - grid_m or cy > max(p[1] for p in poly) + grid_m:
-                    continue
-                if point_in_polygon((cx, cy), poly):
-                    free[ix * ny + iy] = 1
-                    room_of[ix * ny + iy] = room.id
-    for zone in zones:
-        rect = corridor_rect(zone, spec.wall_thickness)
-        for ix in range(nx):
-            cx = x0 + ix * grid_m
-            if cx < rect[0] or cx > rect[2]:
-                continue
-            for iy in range(ny):
-                cy = y0 + iy * grid_m
-                if cy < rect[1] or cy > rect[3]:
-                    continue
-                free[ix * ny + iy] = 1
-    blocked = bytearray(nx * ny)
-    for box in boxes:
-        if not box.blocks_walking:
+    for floor in storeys_meta:
+        rooms = spec.floor_rooms(floor.id) if spec.floors else list(spec.rooms)
+        xs = [float(p[0]) for room in rooms for p in room.polygon]
+        ys = [float(p[1]) for room in rooms for p in room.polygon]
+        if not xs:
             continue
-        rect = (box.aabb[0] - FURNITURE_DILATION_M, box.aabb[1] - FURNITURE_DILATION_M,
-                box.aabb[2] + FURNITURE_DILATION_M, box.aabb[3] + FURNITURE_DILATION_M)
-        for ix in range(nx):
-            cx = x0 + ix * grid_m
-            if cx < rect[0] or cx > rect[2]:
-                continue
-            for iy in range(ny):
-                cy = y0 + iy * grid_m
-                if cy < rect[1] or cy > rect[3]:
+        x0, y0 = min(xs) - grid_m, min(ys) - grid_m
+        nx = int(math.ceil((max(xs) + grid_m - x0) / grid_m)) + 1
+        ny = int(math.ceil((max(ys) + grid_m - y0) / grid_m)) + 1
+        free = bytearray(nx * ny)
+        room_of: List[Optional[str]] = [None] * (nx * ny)
+        for room in rooms:
+            poly = inset_polygon(room.polygon, spec.wall_thickness / 2.0)
+            for ix in range(nx):
+                cx = x0 + ix * grid_m
+                if cx < min(p[0] for p in poly) - grid_m or cx > max(p[0] for p in poly) + grid_m:
                     continue
-                blocked[ix * ny + iy] = 1
+                for iy in range(ny):
+                    cy = y0 + iy * grid_m
+                    if cy < min(p[1] for p in poly) - grid_m or cy > max(p[1] for p in poly) + grid_m:
+                        continue
+                    if point_in_polygon((cx, cy), poly):
+                        free[ix * ny + iy] = 1
+                        room_of[ix * ny + iy] = room.id
+        for zone in zones:
+            if spec.floors and zone.floor_id != floor.id:
+                continue
+            if not spec.floors and zone.floor_id:
+                continue
+            rect = corridor_rect(zone, spec.wall_thickness)
+            for ix in range(nx):
+                cx = x0 + ix * grid_m
+                if cx < rect[0] or cx > rect[2]:
+                    continue
+                for iy in range(ny):
+                    cy = y0 + iy * grid_m
+                    if rect[1] <= cy <= rect[3]:
+                        free[ix * ny + iy] = 1
+        # slab openings are holes -- unless a stair fills them
+        if spec.floors:
+            occupied = [plan.footprint for plan in spec.stair_plans()] + \
+                       [plan.footprint for plan in spec.ramp_plans()]
+            for opening in spec.slab_openings_for(floor.id):
+                for ix in range(nx):
+                    cx = x0 + ix * grid_m
+                    for iy in range(ny):
+                        cy = y0 + iy * grid_m
+                        if not point_in_polygon((cx, cy), opening.outline):
+                            continue
+                        if any(point_in_polygon((cx, cy), poly) for poly in occupied):
+                            continue
+                        free[ix * ny + iy] = 0
+                        room_of[ix * ny + iy] = None
+        blocked = bytearray(nx * ny)
+        for box in boxes:
+            if not box.blocks_walking:
+                continue
+            if spec.floors and box.floor_id != floor.id:
+                continue
+            rect = (box.aabb[0] - FURNITURE_DILATION_M, box.aabb[1] - FURNITURE_DILATION_M,
+                    box.aabb[2] + FURNITURE_DILATION_M, box.aabb[3] + FURNITURE_DILATION_M)
+            for ix in range(nx):
+                cx = x0 + ix * grid_m
+                if cx < rect[0] or cx > rect[2]:
+                    continue
+                for iy in range(ny):
+                    cy = y0 + iy * grid_m
+                    if cy < rect[1] or cy > rect[3]:
+                        continue
+                    blocked[ix * ny + iy] = 1
+        # the stair itself is walkable (and furniture on it is rejected by its
+        # own check, not by breaking the floor's circulation)
+        if spec.floors:
+            for plan in list(spec.stair_plans()) + list(spec.ramp_plans()):
+                if plan.connector.from_floor != floor.id and plan.connector.to_floor != floor.id:
+                    continue
+                for ix in range(nx):
+                    cx = x0 + ix * grid_m
+                    for iy in range(ny):
+                        cy = y0 + iy * grid_m
+                        if point_in_polygon((cx, cy), plan.footprint):
+                            free[ix * ny + iy] = 1
+                            blocked[ix * ny + iy] = 0
+
+        storeys.append({"id": floor.id, "elevation": float(floor.elevation), "x0": x0, "y0": y0,
+                        "step": grid_m, "nx": nx, "ny": ny, "free": free, "blocked": blocked,
+                        "room_of": room_of, "offset": offset})
+        global_free += free
+        global_blocked += blocked
+        global_room += room_of
+        offset += nx * ny
 
     room_stats = {room.id: {"free_cells": 0, "reachable_cells": 0} for room in spec.rooms}
-    for index in range(nx * ny):
-        if free[index] and not blocked[index] and room_of[index] is not None:
-            room_stats[room_of[index]]["free_cells"] += 1
+    for floor_position, storey in enumerate(storeys):
+        free, blocked, room_of = storey["free"], storey["blocked"], storey["room_of"]
+        for index in range(len(free)):
+            if free[index] and not blocked[index] and room_of[index] is not None:
+                room_stats[room_of[index]]["free_cells"] += 1
 
     start = None
     start_note = ""
+    start_position = 0
     if zones:
-        start = cell_of(*zones[0].center)
+        start_position = floor_index.get(zones[0].floor_id, 0)
+        storey = storeys[start_position] if storeys else None
+        if storey is not None:
+            start = _grid_cell(storey["x0"], storey["y0"], storey["step"], storey["nx"], storey["ny"],
+                               zones[0].center[0], zones[0].center[1])
+            if start is not None:
+                start = (storey["offset"] + start[0] * storey["ny"] + start[1],)
     else:
         first = spec.cameras[0] if spec.cameras else None
         if first is not None:
-            start = cell_of(first.pos[0], first.pos[1])
+            start_position = 0
+            storey = storeys[start_position] if storeys else None
+            if storey is not None:
+                cell = _grid_cell(storey["x0"], storey["y0"], storey["step"], storey["nx"],
+                                  storey["ny"], first.pos[0], first.pos[1])
+                if cell is not None:
+                    start = (storey["offset"] + cell[0] * storey["ny"] + cell[1],)
+
+    links = _stair_links(spec, floor_index, storeys) if spec.floors else {}
     start_reachable = False
-    reachable = bytearray(nx * ny)
+    reachable = bytearray(len(global_free))
     if start is not None:
-        queue = [start]
-        if 0 <= start[0] < nx and 0 <= start[1] < ny:
-            index = start[0] * ny + start[1]
-            if free[index] and not blocked[index]:
-                reachable[index] = 1
-                start_reachable = True
+        start_index = start[0]
+        if global_free[start_index] and not global_blocked[start_index]:
+            start_reachable = True
+            reachable[start_index] = 1
+        else:
+            storey = storeys[start_position]
+            start_note = (f"the start cell at {zones[0].center if zones else start_index} is blocked "
+                          f"(free={bool(global_free[start_index])})")
+        queue = [start_index]
         while queue:
-            ix, iy = queue.pop()
-            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                jx, jy = ix + dx, iy + dy
-                if not (0 <= jx < nx and 0 <= jy < ny):
+            index = queue.pop()
+            for neighbour in _neighbours(index, storeys, links):
+                if reachable[neighbour] or not global_free[neighbour] or global_blocked[neighbour]:
                     continue
-                index = jx * ny + jy
-                if reachable[index] or not free[index] or blocked[index]:
-                    continue
-                reachable[index] = 1
-                queue.append((jx, jy))
-        if not start_reachable:
-            start_note = (f"the start cell at {zones[0].center if zones else start} is blocked "
-                          f"(free={bool(free[start[0] * ny + start[1]])})")
+                reachable[neighbour] = 1
+                queue.append(neighbour)
     if start_reachable:
-        for index in range(nx * ny):
-            if reachable[index] and room_of[index] is not None:
-                room_stats[room_of[index]]["reachable_cells"] += 1
+        for index in range(len(global_free)):
+            if reachable[index] and global_room[index] is not None:
+                room_stats[global_room[index]]["reachable_cells"] += 1
 
     camera_stats = {}
     for cam in spec.cameras:
-        ix, iy = cell_of(cam.pos[0], cam.pos[1])
-        inside = 0 <= ix < nx and 0 <= iy < ny
-        index = ix * ny + iy if inside else -1
-        camera_stats[cam.name] = {
-            "cell": [ix, iy],
-            "free": bool(inside and free[index]),
-            "blocked": bool(inside and blocked[index]),
-            "reachable": bool(inside and reachable[index]),
-        }
+        position = floor_index.get(spec.room(cam.room).floor_id or "", 0) if spec.floors else 0
+        storey = storeys[position] if storeys else None
+        stats = {"cell": None, "free": False, "blocked": False, "reachable": False,
+                 "floor": storey["id"] if storey else ""}
+        if storey is not None:
+            cell = _grid_cell(storey["x0"], storey["y0"], storey["step"], storey["nx"], storey["ny"],
+                              cam.pos[0], cam.pos[1])
+            if cell is not None:
+                index = storey["offset"] + cell[0] * storey["ny"] + cell[1]
+                stats.update({
+                    "cell": [cell[0], cell[1]],
+                    "free": bool(global_free[index]),
+                    "blocked": bool(global_blocked[index]),
+                    "reachable": bool(reachable[index]),
+                })
+        camera_stats[cam.name] = stats
     for stats in room_stats.values():
         stats["reachable_fraction"] = round(stats["reachable_cells"] / stats["free_cells"], 3) \
             if stats["free_cells"] else 0.0
+    shape = [storeys[0]["nx"], storeys[0]["ny"]] if storeys else [0, 0]
     return {
         "start": list(zones[0].center) if zones else None,
         "start_reachable": start_reachable,
         "start_note": start_note,
         "rooms": room_stats,
         "cameras": camera_stats,
-        "free_cells": int(sum(free)),
+        "free_cells": int(sum(global_free)),
         "reachable_cells": int(sum(reachable)),
         "grid_step_m": grid_m,
-        "grid_shape": [nx, ny],
+        "grid_shape": shape,
+        "floors": {
+            storey["id"]: {
+                "elevation": storey["elevation"], "grid_shape": [storey["nx"], storey["ny"]],
+                "free_cells": int(sum(storey["free"])),
+                "walkable_cells": int(sum(1 for index in range(len(storey["free"]))
+                                          if storey["free"][index] and not storey["blocked"][index])),
+            }
+            for storey in storeys
+        },
+        "stair_links": len(links) // 2,
     }
+
+
+def _neighbours(index: int, storeys: Sequence[dict], links: Dict[int, List[int]]):
+    """4-neighbour cells of one flattened grid node plus its stair links."""
+    for storey in storeys:
+        size = storey["nx"] * storey["ny"]
+        if index < storey["offset"] + size:
+            local = index - storey["offset"]
+            ix, iy = divmod(local, storey["ny"])
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                jx, jy = ix + dx, iy + dy
+                if 0 <= jx < storey["nx"] and 0 <= jy < storey["ny"]:
+                    yield storey["offset"] + jx * storey["ny"] + jy
+            break
+    for neighbour in links.get(index, ()):
+        yield neighbour
+
+
+def _synthetic_check_floor(spec: "spec_mod.SceneSpec") -> "spec_mod.FloorSpec":
+    return spec_mod.FloorSpec(id="", elevation=0.0, height=spec.wall_height,
+                              slab_thickness=spec_mod.DEFAULT_SLAB_M)
+
+
+def _footprint_openings(spec: "spec_mod.SceneSpec", plan) -> List["spec_mod.SlabOpeningSpec"]:
+    return spec.slab_openings_for(plan.connector.to_floor)
+
+
+def _footprint_opening_coverage(spec: "spec_mod.SceneSpec", plan, step: float = 0.10) -> dict:
+    """Share of a stair footprint covered by the slab openings of the floor above."""
+    openings = _footprint_openings(spec, plan)
+    xs = [float(p[0]) for p in plan.footprint]
+    ys = [float(p[1]) for p in plan.footprint]
+    x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+    nx = max(2, int(math.ceil((x1 - x0) / step)) + 1)
+    ny = max(2, int(math.ceil((y1 - y0) / step)) + 1)
+    inside = total = 0
+    for ix in range(nx):
+        x = x0 + (x1 - x0) * ix / (nx - 1)
+        for iy in range(ny):
+            y = y0 + (y1 - y0) * iy / (ny - 1)
+            if not point_in_polygon((x, y), plan.footprint):
+                continue
+            total += 1
+            if any(point_in_polygon((x, y), opening.outline) for opening in openings):
+                inside += 1
+    return {"fraction": (inside / total) if total else 0.0, "samples": total,
+            "openings": len(openings)}
+
+
+def _obstruction_bottoms(spec: "spec_mod.SceneSpec", point: Sequence[float],
+                         z: float) -> List[Tuple[float, str]]:
+    """Every storey surface above ``point`` at height ``z``: (bottom_z, label).
+
+    A slab counts where the point lies under a room of that storey and outside
+    every slab opening of it; a ceiling plane counts where the room really owns a
+    ceiling (nothing above covers it) -- which is the top storey's roof.
+    """
+    out: List[Tuple[float, str]] = []
+    for floor in spec.floors:
+        for room in spec.floor_rooms(floor.id):
+            if not point_in_polygon(point, room.polygon):
+                continue
+            ceiling = floor.elevation + spec.room_height(room.id)
+            slab_bottom = floor.elevation - floor.slab_thickness
+            # the storey's slab is in the way as soon as its top surface is at or
+            # above the point (a point *inside* the slab reports a negative clearance)
+            if floor.elevation >= z - 1e-9:
+                if not any(point_in_polygon(point, opening.outline)
+                           for opening in spec.slab_openings_for(floor.id)):
+                    out.append((slab_bottom, f"slab of floor '{floor.id}'"))
+            covered_from_above = False
+            for upper in spec.floors:
+                if upper.elevation <= floor.elevation + 1e-9:
+                    continue
+                if abs(upper.elevation - upper.slab_thickness - ceiling) > 1e-6:
+                    continue
+                if any(spec_mod.polygons_overlap(room.polygon, other.polygon)
+                       for other in spec.floor_rooms(upper.id)):
+                    covered_from_above = True
+                    break
+            if not covered_from_above and ceiling >= z - 1e-9:
+                out.append((ceiling, f"ceiling of room '{room.id}'"))
+    return out
+
+
+def stair_report(spec: "spec_mod.SceneSpec") -> dict:
+    """Acceptance numbers for every stair: steps, width, landing, opening, headroom."""
+    stairs: List[dict] = []
+    geometry_violations: List[str] = []
+    opening_violations: List[str] = []
+    headroom_violations: List[str] = []
+
+    for plan in spec.stair_plans():
+        label = f"stair {plan.connector.from_room}->{plan.connector.to_room}"
+        entry: dict = {
+            "from_room": plan.connector.from_room,
+            "to_room": plan.connector.to_room,
+            "from_floor": plan.connector.from_floor,
+            "to_floor": plan.connector.to_floor,
+            "switchback": plan.switchback,
+            "risers": plan.risers,
+            "riser_m": round(plan.riser_m, 4),
+            "tread_m": round(plan.tread_m, 4),
+            "pitch_deg": round(plan.pitch_deg, 2),
+            "width_m": round(plan.width, 3),
+            "run_m": round(plan.run, 3),
+            "landing_m": round(plan.landing_m, 3),
+            "rise_m": round(plan.rise_total, 3),
+            "footprint": [[round(float(p[0]), 3), round(float(p[1]), 3)] for p in plan.footprint],
+            "violations": [],
+        }
+        if plan.riser_m > spec_mod.STAIR_RISER_MAX_M + 1e-9:
+            geometry_violations.append(f"{label}: riser {plan.riser_m:.3f} m > "
+                                       f"{spec_mod.STAIR_RISER_MAX_M} m")
+        if plan.tread_m < spec_mod.STAIR_TREAD_MIN_M - 1e-9:
+            geometry_violations.append(f"{label}: tread {plan.tread_m:.3f} m < "
+                                       f"{spec_mod.STAIR_TREAD_MIN_M} m")
+        if plan.width < spec_mod.STAIR_WIDTH_MIN_M - 1e-9:
+            geometry_violations.append(f"{label}: width {plan.width:.3f} m < "
+                                       f"{spec_mod.STAIR_WIDTH_MIN_M} m")
+        if plan.switchback and plan.landing_m < spec_mod.STAIR_LANDING_MIN_M - 1e-9:
+            geometry_violations.append(f"{label}: landing {plan.landing_m:.3f} m < "
+                                       f"{spec_mod.STAIR_LANDING_MIN_M} m")
+
+        coverage = _footprint_opening_coverage(spec, plan)
+        entry["opening_coverage"] = round(coverage["fraction"], 3)
+        if coverage["fraction"] < 0.98:
+            opening_violations.append(
+                f"{label}: only {coverage['fraction'] * 100:.1f}% of the stair footprint is under a "
+                f"slab opening of floor '{plan.connector.to_floor}' ({coverage['openings']} openings)"
+            )
+
+        clearances = []
+        for box in plan.boxes:
+            centre = _centroid(box["polygon"])
+            for bottom, what in _obstruction_bottoms(spec, centre, box["z1"]):
+                clearance = bottom - box["z1"]
+                clearances.append(clearance)
+                if clearance < spec_mod.STAIR_HEADROOM_MIN_M - 1e-9:
+                    headroom_violations.append(
+                        f"{label}: {clearance:.2f} m headroom over the {box['role']} surface at "
+                        f"{box['z1']:.2f} m ({what})"
+                    )
+        entry["min_headroom_m"] = round(min(clearances), 3) if clearances else None
+        entry["violations"] = [item for item in
+                               geometry_violations + opening_violations + headroom_violations
+                               if label in item]
+        stairs.append(entry)
+
+    return {
+        "stairs": stairs,
+        "geometry_ok": not geometry_violations,
+        "openings_ok": not opening_violations,
+        "headroom_ok": not headroom_violations,
+        "geometry_violations": geometry_violations,
+        "opening_violations": opening_violations,
+        "headroom_violations": headroom_violations,
+    }
+
+
+def _centroid(polygon: Sequence[Sequence[float]]) -> Tuple[float, float]:
+    n = len(polygon)
+    area = 0.0
+    cx = cy = 0.0
+    for i in range(n):
+        x0, y0 = float(polygon[i][0]), float(polygon[i][1])
+        x1, y1 = float(polygon[(i + 1) % n][0]), float(polygon[(i + 1) % n][1])
+        cross = x0 * y1 - x1 * y0
+        area += cross
+        cx += (x0 + x1) * cross
+        cy += (y0 + y1) * cross
+    area /= 2.0
+    if abs(area) < 1e-12:
+        points = [(float(p[0]), float(p[1])) for p in polygon]
+        return (sum(p[0] for p in points) / n, sum(p[1] for p in points) / n)
+    return (cx / (6.0 * area), cy / (6.0 * area))
+
+
+def stair_clearance(spec: "spec_mod.SceneSpec", boxes: Sequence[ItemBox]) -> List[str]:
+    """No furniture on the stair, in front of its first riser or its top step."""
+    violations: List[str] = []
+    plans = list(spec.stair_plans()) + list(spec.ramp_plans())
+    for plan in plans:
+        label = f"{plan.connector.kind} {plan.connector.from_room}->{plan.connector.to_room}"
+        xs = [float(p[0]) for p in plan.footprint]
+        ys = [float(p[1]) for p in plan.footprint]
+        footprint = (min(xs), min(ys), max(xs), max(ys))
+        for box in boxes:
+            if box.floor_id not in (plan.connector.from_floor, plan.connector.to_floor) \
+                    and spec.floors:
+                continue
+            if box.z[0] > plan.to_elevation + 1e-9 or box.z[1] < plan.from_elevation - 1e-9:
+                continue
+            if rect_distance(box.aabb, footprint) <= 0.0:
+                violations.append(f"{box.name} ({box.room}) stands on the {label} footprint")
+        for end, rect in (("bottom", plan.base_rect), ("top", plan.head_rect)):
+            for box in boxes:
+                if not box.blocks_walking:
+                    continue
+                if box.z[0] > plan.to_elevation + 1e-9 or box.z[1] < plan.from_elevation - 1e-9:
+                    continue
+                distance = rect_distance(box.aabb, rect)
+                if distance < DOOR_CLEARANCE_M - 1e-9:
+                    violations.append(
+                        f"{box.name} ({box.room}) is {distance:.3f} m from the {end} of the {label} "
+                        f"(min {DOOR_CLEARANCE_M} m)"
+                    )
+    return violations
 
 
 def check_file(spec_path: str, assets_index: Optional[Dict[str, dict]] = None,

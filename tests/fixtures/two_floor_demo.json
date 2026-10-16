@@ -1,0 +1,131 @@
+{
+  "_comment": [
+    "Hand-written two-storey demo (schema_version 2): the acceptance scene for the",
+    "multi-floor contract.  Ground floor: hall (with the switchback stair), living,",
+    "kitchen, dining; upper floor: landing, bedroom, study, bath above the same",
+    "footprint.  One switchback stair (16 risers, half landing) connects hall ->",
+    "landing through a slab opening; the two floors share their walls in XY, so the",
+    "same door positions on both storeys prove the per-storey cutters.",
+    "z of furniture and cameras is a WORLD height: the upper floor walking surface",
+    "is at 2.85 m (2.7 m storey + 0.15 m slab), so upper cameras sit at 4.35 m and",
+    "the tables/lamps quote their world heights.  window sill/height stay relative",
+    "to the room floor.  See blender_agent/spec.py for the frozen contract."
+  ],
+  "schema_version": 2,
+  "unit": "meter",
+  "wall_height": 2.7,
+  "wall_thickness": 0.12,
+  "floors": [
+    {"id": "f0", "elevation": 0.0, "height": 2.7, "slab_thickness": 0.15},
+    {"id": "f1", "elevation": 2.85, "height": 2.7, "slab_thickness": 0.15}
+  ],
+  "rooms": [
+    {"id": "hall", "type": "hall", "floor_id": "f0", "floor_color": [0.62, 0.58, 0.52],
+     "polygon": [[0, 0], [3.0, 0], [3.0, 6.0], [0, 6.0]]},
+    {"id": "living", "type": "living_room", "floor_id": "f0", "floor_color": [0.55, 0.38, 0.22],
+     "polygon": [[3.0, 3.0], [8.0, 3.0], [8.0, 6.0], [3.0, 6.0]]},
+    {"id": "kitchen", "type": "kitchen", "floor_id": "f0", "floor_color": [0.72, 0.70, 0.66],
+     "polygon": [[3.0, 0], [5.8, 0], [5.8, 3.0], [3.0, 3.0]]},
+    {"id": "dining", "type": "dining_room", "floor_id": "f0", "floor_color": [0.60, 0.45, 0.30],
+     "polygon": [[5.8, 0], [8.0, 0], [8.0, 3.0], [5.8, 3.0]]},
+
+    {"id": "landing", "type": "hall", "floor_id": "f1", "floor_color": [0.62, 0.58, 0.52],
+     "polygon": [[0, 0], [3.0, 0], [3.0, 6.0], [0, 6.0]]},
+    {"id": "bedroom", "type": "bedroom", "floor_id": "f1", "floor_color": [0.60, 0.50, 0.40],
+     "polygon": [[3.0, 3.0], [8.0, 3.0], [8.0, 6.0], [3.0, 6.0]]},
+    {"id": "study", "type": "study", "floor_id": "f1", "floor_color": [0.58, 0.46, 0.34],
+     "polygon": [[3.0, 0], [5.8, 0], [5.8, 3.0], [3.0, 3.0]]},
+    {"id": "bath", "type": "bathroom", "floor_id": "f1", "floor_color": [0.78, 0.80, 0.80],
+     "polygon": [[5.8, 0], [8.0, 0], [8.0, 3.0], [5.8, 3.0]]}
+  ],
+  "connectors": [
+    {"kind": "door", "from_room": "hall", "to_room": "living", "from_floor": "f0", "to_floor": "f0",
+     "center": [3.0, 5.5], "width": 0.9, "height": 2.05},
+    {"kind": "door", "from_room": "hall", "to_room": "kitchen", "from_floor": "f0", "to_floor": "f0",
+     "center": [3.0, 1.6], "width": 0.9, "height": 2.05},
+    {"kind": "open_passage", "from_room": "living", "to_room": "dining", "from_floor": "f0",
+     "to_floor": "f0", "center": [6.9, 3.0], "width": 1.2, "height": 2.25},
+
+    {"kind": "door", "from_room": "landing", "to_room": "bedroom", "from_floor": "f1", "to_floor": "f1",
+     "center": [3.0, 4.0], "width": 0.9, "height": 2.05},
+    {"kind": "door", "from_room": "landing", "to_room": "study", "from_floor": "f1", "to_floor": "f1",
+     "center": [3.0, 1.0], "width": 0.9, "height": 2.05},
+    {"kind": "door", "from_room": "study", "to_room": "bath", "from_floor": "f1", "to_floor": "f1",
+     "center": [5.8, 1.5], "width": 0.9, "height": 2.05},
+
+    {"kind": "stair", "from_room": "hall", "to_room": "landing", "from_floor": "f0", "to_floor": "f1",
+     "width": 0.85, "run": 2.6, "rise": 2.85, "steps": 16, "landing_m": 1.0,
+     "center": [1.5, 3.0], "direction_deg": 90}
+  ],
+  "slab_openings": [
+    {"outline": [[0.65, 1.2], [2.35, 1.2], [2.35, 4.95], [0.65, 4.95]], "floors": ["f1"]}
+  ],
+  "windows": [
+    {"room": "hall", "wall": [[0, 5.0], [0, 5.9]], "sill": 0.9, "height": 1.4},
+    {"room": "living", "wall": [[3.6, 6.0], [5.0, 6.0]], "sill": 0.9, "height": 1.4},
+    {"room": "kitchen", "wall": [[3.6, 0.0], [4.9, 0.0]], "sill": 1.2, "height": 1.1},
+    {"room": "dining", "wall": [[5.9, 0.0], [7.3, 0.0]], "sill": 0.9, "height": 1.4},
+
+    {"room": "landing", "wall": [[0, 5.0], [0, 5.9]], "sill": 0.9, "height": 1.4},
+    {"room": "bedroom", "wall": [[6.0, 6.0], [7.6, 6.0]], "sill": 0.9, "height": 1.4},
+    {"room": "study", "wall": [[4.0, 0.0], [5.4, 0.0]], "sill": 0.9, "height": 1.4},
+    {"room": "bath", "wall": [[8.0, 0.8], [8.0, 2.0]], "sill": 0.9, "height": 1.4}
+  ],
+  "cameras": [
+    {"name": "0000", "room": "hall", "pos": [0.8, 5.5, 1.5]},
+    {"name": "0001", "room": "living", "pos": [6.3, 4.2, 1.5]},
+    {"name": "0002", "room": "kitchen", "pos": [4.4, 1.9, 1.5]},
+    {"name": "0003", "room": "dining", "pos": [7.6, 2.5, 1.5]},
+
+    {"name": "0100", "room": "landing", "pos": [0.8, 5.5, 4.35]},
+    {"name": "0101", "room": "bedroom", "pos": [6.4, 4.4, 4.35]},
+    {"name": "0102", "room": "study", "pos": [3.3, 1.5, 4.35]},
+    {"name": "0103", "room": "bath", "pos": [6.2, 2.4, 4.35]}
+  ],
+  "style": {
+    "sun_elevation_deg": 35,
+    "sun_azimuth_deg": 210,
+    "sky_strength": 1.0,
+    "sun_energy": 3.0,
+    "view_transform": "AgX",
+    "exposure": 1.4
+  },
+  "lighting": {
+    "lamp_w": 8.0,
+    "lamp_radius": 0.08
+  },
+  "furniture": [
+    {"asset": "builtin:kitchen_cabinet", "room": "kitchen", "pos": [3.37, 0.385], "rot_z_deg": 0, "name": "kitchen_cabinet_a"},
+    {"asset": "builtin:kitchen_stove", "room": "kitchen", "pos": [4.03, 0.385], "rot_z_deg": 0, "name": "kitchen_stove"},
+    {"asset": "builtin:kitchen_sink", "room": "kitchen", "pos": [4.69, 0.385], "rot_z_deg": 0, "name": "kitchen_sink"},
+    {"asset": "builtin:kitchen_fridge", "room": "kitchen", "pos": [5.38, 0.4], "rot_z_deg": 270, "name": "kitchen_fridge"},
+    {"asset": "builtin:kitchen_upper", "room": "kitchen", "pos": [4.03, 0.255], "rot_z_deg": 0, "z": 1.62, "name": "kitchen_upper"},
+
+    {"asset": "builtin:dining_table", "room": "dining", "pos": [6.6, 1.0], "rot_z_deg": 0, "name": "dining_table"},
+    {"asset": "builtin:dining_chair", "room": "dining", "pos": [6.2, 0.3125], "rot_z_deg": 180, "name": "dining_chair_a"},
+    {"asset": "builtin:dining_chair", "room": "dining", "pos": [6.9, 0.3125], "rot_z_deg": 180, "name": "dining_chair_b"},
+
+    {"asset": "ph:sofa_02", "room": "living", "pos": [5.0, 5.531], "rot_z_deg": 0, "name": "sofa"},
+    {"asset": "ph:modern_coffee_table_01", "room": "living", "pos": [5.0, 4.4], "rot_z_deg": 0, "name": "coffee_table"},
+    {"asset": "builtin:rug", "room": "living", "pos": [5.0, 4.6], "rot_z_deg": 0, "size": [2.6, 1.5], "name": "rug"},
+    {"asset": "ph:modern_arm_chair_01", "room": "living", "pos": [6.6, 5.4465], "rot_z_deg": 0, "name": "armchair"},
+    {"asset": "ph:wooden_bookshelf_worn", "room": "living", "pos": [7.65, 4.75], "rot_z_deg": 270, "name": "bookshelf"},
+    {"asset": "ph:potted_plant_02", "room": "living", "pos": [3.42, 3.4], "rot_z_deg": 0, "name": "plant_living"},
+    {"asset": "ph:hanging_picture_frame_01", "room": "living", "pos": [5.0, 5.94], "rot_z_deg": 0, "z": 1.62, "name": "art_living"},
+    {"asset": "ph:modern_ceiling_lamp_01", "room": "living", "pos": [5.0, 4.6], "rot_z_deg": 0, "mount": "ceiling", "name": "ceiling_lamp_living"},
+
+    {"asset": "ph:GothicBed_01", "room": "bedroom", "pos": [4.9, 4.92], "rot_z_deg": 180, "name": "bed"},
+    {"asset": "ph:painted_wooden_nightstand", "room": "bedroom", "pos": [3.3125, 5.4], "rot_z_deg": 0, "name": "nightstand"},
+    {"asset": "builtin:table_lamp", "room": "bedroom", "pos": [3.3125, 5.4], "rot_z_deg": 0, "z": 3.466, "name": "bedside_lamp"},
+    {"asset": "builtin:wardrobe", "room": "bedroom", "pos": [7.6175, 4.4], "rot_z_deg": 270, "name": "wardrobe"},
+    {"asset": "ph:modern_ceiling_lamp_01", "room": "bedroom", "pos": [5.6, 4.5], "rot_z_deg": 0, "mount": "ceiling", "name": "ceiling_lamp_bed"},
+
+    {"asset": "builtin:study_desk", "room": "study", "pos": [4.7, 0.365], "rot_z_deg": 0, "name": "study_desk"},
+    {"asset": "builtin:study_chair", "room": "study", "pos": [4.45, 0.975], "rot_z_deg": 0, "name": "study_chair"},
+    {"asset": "ph:wooden_bookshelf_worn", "room": "study", "pos": [3.9, 2.6495], "rot_z_deg": 180, "name": "study_shelf"},
+
+    {"asset": "builtin:bath_shower", "room": "bath", "pos": [7.4, 0.5325], "rot_z_deg": 0, "name": "bath_shower"},
+    {"asset": "builtin:bath_toilet", "room": "bath", "pos": [7.605, 1.5], "rot_z_deg": 270, "name": "bath_toilet"},
+    {"asset": "builtin:bath_basin", "room": "bath", "pos": [7.695, 2.6], "rot_z_deg": 270, "name": "bath_basin"}
+  ]
+}

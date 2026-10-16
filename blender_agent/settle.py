@@ -59,9 +59,12 @@ A placement is **held** -- its authored transform is kept exactly -- whenever
 gravity is not its support:
 
 * ``mount: "ceiling"`` (pendant lamps) and ``mount: "wall"``;
-* an authored ``z`` above ``lift_tolerance_m`` (default 2 cm): pictures hung on a
-  wall, the book stacks on the shelf, the bedside lamp on the nightstand -- the
-  mounted / stacked items the acceptance check exempts.
+* an authored ``z`` above ``lift_tolerance_m`` (default 2 cm) **relative to the
+  room's own floor**: pictures hung on a wall, the book stacks on the shelf, the
+  bedside lamp on the nightstand -- the mounted / stacked items the acceptance
+  check exempts.  ``z`` is a world height and the floor plane is the storey
+  elevation of the item's room (``spec.room_elevation``), so a second-storey
+  nightstand at ``z = 2.9`` is not held because its world z is large.
 
 Held placements still get their active (``kinematic``) rigid body, so *every*
 furniture instance takes part in the simulation, but they sit in a private
@@ -286,12 +289,15 @@ def resolve_config(spec=None, environ: Optional[dict] = None, **overrides) -> di
 # --------------------------------------------------------------------------- #
 # pure: what rests, what is held
 # --------------------------------------------------------------------------- #
-def placement_mode(item, placement: dict, config: dict) -> Tuple[str, str]:
+def placement_mode(item, placement: dict, config: dict, floor_z: float = 0.0) -> Tuple[str, str]:
     """``("rest" | "held", reason)`` for one placement.
 
     ``item`` is the spec's :class:`~blender_agent.spec.FurnitureSpec` (``None``
     for a placement the spec does not describe) and ``placement`` is the matching
-    entry of ``furniture_info["placements"]``.
+    entry of ``furniture_info["placements"]``.  ``floor_z`` is the world height of
+    the room's floor: an authored ``z`` is a world height, so "mounted / stacked"
+    is ``z`` above the *room's own floor* by more than the lift tolerance -- a
+    nightstand on the upper storey is not held just because its world z is 3 m.
     """
     mount = getattr(item, "mount", None) or placement.get("mount") or "floor"
     z = getattr(item, "z", None)
@@ -302,8 +308,10 @@ def placement_mode(item, placement: dict, config: dict) -> Tuple[str, str]:
         return "held", "mount: ceiling (the lamp hangs from the ceiling)"
     if mount == "wall":
         return "held", "mount: wall (the piece is fixed to a wall)"
-    if z is not None and float(z) > lift:
-        return "held", f"authored z={float(z):.3f} m (mounted / stacked, exempt from the floor check)"
+    if z is not None and float(z) - float(floor_z) > lift:
+        return "held", (f"authored z={float(z):.3f} m ({float(z) - float(floor_z):.3f} m above the "
+                        f"floor at {float(floor_z):.3f} m) -- mounted / stacked, exempt from the "
+                        f"floor check")
     return "rest", "rests on the floor"
 
 
@@ -313,27 +321,38 @@ def plan(spec, placements: Sequence[dict], config: dict) -> List[dict]:
     decisions = []
     for index, placement in enumerate(placements):
         item = items[index] if index < len(items) else None
-        mode, reason = placement_mode(item, placement, config)
+        floor_z = 0.0
+        room_id = getattr(item, "room", None) or placement.get("room")
+        if spec is not None and room_id is not None:
+            try:
+                floor_z = float(spec.room_elevation(room_id))
+            except Exception:  # noqa: BLE001 - an unknown room simply keeps floor 0
+                floor_z = 0.0
+        mode, reason = placement_mode(item, placement, config, floor_z=floor_z)
         decisions.append({
             "index": index,
             "name": placement.get("name") or f"item_{index}",
             "asset": placement.get("asset"),
             "mode": mode,
             "reason": reason,
+            "floor_z": floor_z,
         })
     return decisions
 
 
-def ground_check(bottom_m: float, config: dict) -> dict:
-    """Acceptance maths for one settled bottom height (metres, floor at 0)."""
+def ground_check(bottom_m: float, config: dict, floor_z: float = 0.0) -> dict:
+    """Acceptance maths for one settled bottom height (metres, its floor at ``floor_z``)."""
     ground = float(config["ground_tolerance_m"])
     penetration = float(config["penetration_tolerance_m"])
+    gap = float(bottom_m) - float(floor_z)
     return {
-        "bottom_m": round(float(bottom_m), 5),
-        "gap_m": round(float(bottom_m), 5),
-        "grounded": -penetration <= float(bottom_m) <= ground,
-        "penetrating": float(bottom_m) < -penetration,
-        "floating_m": round(max(0.0, float(bottom_m) - ground), 5),
+        "bottom_m": round(gap, 5),
+        "floor_z_m": round(float(floor_z), 5),
+        "bottom_world_m": round(float(bottom_m), 5),
+        "gap_m": round(gap, 5),
+        "grounded": -penetration <= gap <= ground,
+        "penetrating": gap < -penetration,
+        "floating_m": round(max(0.0, gap - ground), 5),
     }
 
 
@@ -976,6 +995,7 @@ def ground_furniture(spec, furniture_info: dict, build_dir: Optional[str] = None
                        else (MASK_FLAT if flat else MASK_FURNITURE)),
             "separation_m": 0.0,
             "lift_m": 0.0,
+            "floor_z": float(decision.get("floor_z", 0.0)),
         })
     if missing:
         report["notes"].append(f"no geometry found for: {', '.join(sorted(missing))}")
@@ -1012,7 +1032,8 @@ def ground_furniture(spec, furniture_info: dict, build_dir: Optional[str] = None
     # starts inside whatever it was authored into).
     for hull in hulls:
         proxy = hull["proxy"]
-        lift = max(0.0, FLOOR_EPS_M - float(hull["points"][:, 2].min()))
+        # the rest plane is the room's own floor (storey elevation), not z = 0
+        lift = max(0.0, (float(hull.get("floor_z", 0.0)) + FLOOR_EPS_M) - float(hull["points"][:, 2].min()))
         if hull["mode"] == "rest":
             lift += float(config["drop_m"])
         if lift > 0.0:
@@ -1077,9 +1098,10 @@ def ground_furniture(spec, furniture_info: dict, build_dir: Optional[str] = None
             "bbox_z_after": after,
             "moved_m": hull.get("moved_m", 0.0),
             "rotation_deg": hull.get("rotation_deg", 0.0),
+            "floor_z_m": round(float(hull.get("floor_z", 0.0)), 5),
         }
         if hull["mode"] == "rest" and after is not None:
-            entry.update(ground_check(after[0], config))
+            entry.update(ground_check(after[0], config, float(hull.get("floor_z", 0.0))))
             # a placement that came to rest *on top of another one* (a stack) is
             # not supposed to touch the floor -- the same exemption the acceptance
             # check makes for the mounted / shelved items
@@ -1265,8 +1287,11 @@ def selfcheck(build_dir: Optional[str] = None, **overrides) -> dict:
     lifted out, not fall through), an interpenetrating pair (must be separated
     without being launched), a stack (the upper box rests on the lower one), a
     thin rug-like pad with a box standing on it, a wall-flush box (must be pushed
-    out of the wall), wall-mounted boxes (must not move at all) and a collection
-    instance (the instancing path).  Returns a report with a ``pass`` flag.
+    out of the wall), wall-mounted boxes (must not move at all), a collection
+    instance (the instancing path) and a second storey: a box floating over the
+    upper slab must settle onto the storey floor at z = 2.9 (never onto the
+    ground floor) and a box sunk into that slab must be lifted out of it.
+    Returns a report with a ``pass`` flag.
     """
     bpy = _bpy()
     from blender_agent import shell as shell_mod
@@ -1281,6 +1306,12 @@ def selfcheck(build_dir: Optional[str] = None, **overrides) -> dict:
     furniture = shell_mod.ensure_collection(FURNITURE_COLLECTION)
     shell_mod.add_prism("floor_selfcheck", [(0, 0), (5, 0), (5, 4), (0, 4)], -0.05, 0.0, shell_collection)
     shell_mod.add_prism("wall_east", [(4.94, 0), (5.06, 0), (5.06, 4), (4.94, 4)], 0.0, 2.7, shell_collection)
+    # second storey slab: the upper storey of a two-floor spec, so the settle
+    # target of an upper box must be z = 2.9, never the ground floor
+    shell_mod.add_prism("slab_upper", [(3.4, 2.6), (5.0, 2.6), (5.0, 4.0), (3.4, 4.0)],
+                        2.7, 2.9, shell_collection)
+    shell_mod.add_prism("wall_upper_east", [(4.94, 2.6), (5.06, 2.6), (5.06, 4.0), (4.94, 4.0)],
+                        2.9, 5.6, shell_collection)
 
     boxes: Dict[str, object] = {}
 
@@ -1299,6 +1330,8 @@ def selfcheck(build_dir: Optional[str] = None, **overrides) -> dict:
     box("held_box", 3.50, 1.00, 3.90, 1.40, 1.200, 1.600)     # wall-hung (authored z)
     box("ceiling_box", 4.00, 1.00, 4.40, 1.40, 2.300, 2.600)  # mount: ceiling
     box("flush_box", 4.60, 2.00, 5.00, 2.40, 0.020, 0.420)    # 6 cm into the east wall
+    box("upper_drop", 4.00, 3.00, 4.40, 3.40, 2.980, 3.380)   # 8 cm above the upper floor (2.9 m)
+    box("upper_sunk", 4.50, 3.20, 4.80, 3.60, 2.875, 3.075)   # 2.5 cm into the upper slab
 
     library = bpy.data.collections.new("selfcheck_library")   # not linked: instance source only
     shell_mod.add_prism("selfcheck_src",
@@ -1311,8 +1344,15 @@ def selfcheck(build_dir: Optional[str] = None, **overrides) -> dict:
 
     furniture_spec = {
         "unit": "meter", "wall_height": 2.7, "wall_thickness": 0.12,
-        "rooms": [{"id": "room", "type": "living_room", "polygon": [[0, 0], [5, 0], [5, 4], [0, 4]]}],
-        "cameras": [{"name": "0000", "room": "room", "pos": [2.5, 2.0, 1.5]}],
+        "schema_version": 2,
+        "floors": [{"id": "f0", "elevation": 0.0, "height": 2.7, "slab_thickness": 0.05},
+                   {"id": "f1", "elevation": 2.9, "height": 2.7, "slab_thickness": 0.2}],
+        "rooms": [{"id": "room", "type": "living_room", "floor_id": "f0",
+                   "polygon": [[0, 0], [5, 0], [5, 4], [0, 4]]},
+                  {"id": "upper_room", "type": "living_room", "floor_id": "f1",
+                   "polygon": [[3.4, 2.6], [5.0, 2.6], [5.0, 4.0], [3.4, 4.0]]}],
+        "cameras": [{"name": "0000", "room": "room", "pos": [2.5, 2.0, 1.5]},
+                    {"name": "0001", "room": "upper_room", "pos": [3.8, 3.4, 4.4]}],
         "furniture": [
             {"asset": "ph:selfcheck", "room": "room", "pos": [0.75, 0.75], "name": "drop_box"},
             {"asset": "ph:selfcheck", "room": "room", "pos": [1.75, 0.75], "name": "sunk_box"},
@@ -1327,6 +1367,8 @@ def selfcheck(build_dir: Optional[str] = None, **overrides) -> dict:
              "name": "ceiling_box"},
             {"asset": "ph:selfcheck", "room": "room", "pos": [4.80, 2.20], "name": "flush_box"},
             {"asset": "ph:selfcheck", "room": "room", "pos": [4.30, 3.50], "name": "inst_box"},
+            {"asset": "ph:selfcheck", "room": "upper_room", "pos": [4.20, 3.20], "name": "upper_drop"},
+            {"asset": "ph:selfcheck", "room": "upper_room", "pos": [4.65, 3.40], "name": "upper_sunk"},
         ],
     }
     # the placements mirror what place_furniture records: ``z`` is the *authored*
@@ -1358,6 +1400,10 @@ def selfcheck(build_dir: Optional[str] = None, **overrides) -> dict:
          "pos": [4.80, 2.20], "rot_z_deg": 0.0, "z": 0.0, "mount": "floor", "bbox_z": [0.0, 0.4]},
         {"name": "inst_box", "asset": "ph:selfcheck", "kind": "model", "instance": "inst_box",
          "pos": [4.30, 3.50], "rot_z_deg": 0.0, "z": 0.0, "mount": "floor", "bbox_z": [0.0, 0.4]},
+        {"name": "upper_drop", "asset": "ph:selfcheck", "kind": "model", "instance": "upper_drop",
+         "pos": [4.20, 3.20], "rot_z_deg": 0.0, "z": 2.9, "mount": "floor", "bbox_z": [2.9, 3.3]},
+        {"name": "upper_sunk", "asset": "ph:selfcheck", "kind": "model", "instance": "upper_sunk",
+         "pos": [4.65, 3.40], "rot_z_deg": 0.0, "z": 2.9, "mount": "floor", "bbox_z": [2.9, 3.1]},
     ]
     report = ground_furniture(spec, {"placements": placements, "lamp_lights": []}, build_dir,
                               shell_info=None, **overrides)
@@ -1416,6 +1462,21 @@ def selfcheck(build_dir: Optional[str] = None, **overrides) -> dict:
           entries["inst_box"]["moved_m"] > 0.02 and after("inst_box")[0] <= ground,
           f"empty moved {entries['inst_box']['moved_m'] * 1000:.1f} mm, bottom "
           f"{after('inst_box')[0] * 1000:.1f} mm")
+    # -- second storey: the rest plane is the room's own floor, not z = 0 ---- #
+    upper = entries["upper_drop"]
+    upper_gap = after("upper_drop")[0] - 2.9
+    check("upper_drop rests on the upper floor (z = 2.9)",
+          -0.001 <= upper_gap <= ground,
+          f"bottom {after('upper_drop')[0]:.3f} m -> gap {upper_gap * 1000:.1f} mm to the storey "
+          f"floor at 2.900 m (mode {upper['mode']})")
+    check("upper_drop not held by its world z",
+          upper["mode"] == "rest" and upper.get("floor_z_m") == 2.9,
+          f"mode {upper['mode']}, floor_z {upper.get('floor_z_m')} m, authored z "
+          f"{upper['bbox_z_before'][0]:.3f} m")
+    sunk_upper = entries["upper_sunk"]
+    check("upper_sunk lifted out of the upper slab",
+          sunk_upper["bbox_z_before"][0] < 2.9 - 0.001 and after("upper_sunk")[0] >= 2.9 - 0.001,
+          f"started {sunk_upper['bbox_z_before'][0]:.3f} m, now {after('upper_sunk')[0]:.3f} m")
     check("everything came to rest", bool(report["simulation"]["at_rest"]),
           f"{report['simulation']['frames_used']} frames, peak motion "
           f"{report['simulation']['peak_motion_m']} m")
