@@ -13,6 +13,23 @@ Host side (no ``bpy``, numpy/PIL only) -- run with the host python::
     python blender_agent/assets.py check --assets ph:sofa_02
     python blender_agent/assets.py index
 
+Three libraries share this machinery, selected by the ref's scheme
+(``split_asset_ref``) and each with its own cache directory:
+
+``ph:``
+    Poly Haven (CC0) downloads, cached in ``third_party/assets/polyhaven``.
+``midi3d:``
+    3D-FUTURE glbs indexed by ``tools/index_midi3d.py`` into
+    ``third_party/assets/midi3d``.
+``gen:``
+    generated (TRELLIS / procedural) furniture glbs written by
+    ``tools/gen_assets_trellis.py`` into ``third_party/assets/generated``.
+
+A generated entry is a Poly Haven-shaped model entry whose glb is registered as
+its ``1k`` variant (``record_generated_model``), so ``ensure_library`` builds a
+``library/<id>.1k.blend`` from it exactly as it does for a ``ph:`` asset and
+``append_asset`` / ``place_asset`` need no special case.
+
 Blender side (no network): ``ensure_library`` imports + normalises one asset
 into a reusable ``library/<id>.blend``, ``append_asset`` pulls that collection
 into the current file and ``place_asset`` drops a *collection instance* of it
@@ -51,23 +68,43 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 API_ROOT = "https://api.polyhaven.com"
 USER_AGENT = "PanoWorld-blender-agent/0.2 (Poly Haven asset fetcher; CC0 assets)"
 DEFAULT_CACHE = os.path.join(REPO_ROOT, "third_party", "assets", "polyhaven")
+DEFAULT_GENERATED_CACHE = os.path.join(REPO_ROOT, "third_party", "assets", "generated")
 DEFAULT_META = os.path.join(os.path.dirname(os.path.abspath(__file__)), "asset_meta.json")
 
 TEXTURE_MAPS = ("Diffuse", "nor_gl", "Rough", "arm")
 DEFAULT_RESOLUTION = "2k"
+
+# every library a scene spec may name in a furniture ref
+ASSET_SCHEMES = ("ph", "midi3d", "gen")
 
 
 # --------------------------------------------------------------------------- #
 # shared helpers
 # --------------------------------------------------------------------------- #
 def split_asset_ref(ref: str) -> str:
-    """``ph:sofa_02`` -> ``sofa_02`` (the prefix names the library: ``ph`` or ``midi3d``)."""
+    """``ph:sofa_02`` -> ``sofa_02`` (the prefix names the library: see ``ASSET_SCHEMES``)."""
     if ":" in ref:
         scheme, _, rest = ref.partition(":")
-        if scheme not in ("ph", "midi3d"):
-            raise ValueError(f"unsupported asset scheme in '{ref}' (only 'ph:'/'midi3d:' are known)")
+        if scheme not in ASSET_SCHEMES:
+            raise ValueError(
+                f"unsupported asset scheme in '{ref}' "
+                f"(known: {', '.join(f'{name}:' for name in ASSET_SCHEMES)})"
+            )
         return rest
     return ref
+
+
+def sibling_cache(cache_dir: str, name: str) -> str:
+    """``<assets>/polyhaven`` -> ``<assets>/<name>`` (the library caches sit side by side).
+
+    A ``--cache`` that does not end in ``polyhaven`` (the tests' temporary caches)
+    keeps the library inside itself instead, ``<cache_dir>/<name>``.
+    """
+    cache_dir = os.path.abspath(cache_dir)
+    if os.path.basename(cache_dir) == "polyhaven":
+        return os.path.join(os.path.dirname(cache_dir), name)
+    return os.path.join(cache_dir, name)
+
 
 
 def load_asset_meta(path: str = DEFAULT_META) -> dict:
@@ -275,6 +312,41 @@ def fetch_assets(refs, cache_dir: str = DEFAULT_CACHE, resolution: str = DEFAULT
     return index
 
 
+# --------------------------------------------------------------------------- #
+# host side: the generated (``gen:``) library
+# --------------------------------------------------------------------------- #
+def record_generated_model(cache_dir: str, asset_id: str, glb_relpath: str, dimensions_mm,
+                           categories, name: str = None, extra: dict = None) -> dict:
+    """Write one generated glb into ``<cache_dir>/index.json`` (Poly Haven shape).
+
+    ``glb_relpath`` is relative to ``cache_dir``; the glb is registered as the
+    asset's ``1k`` variant, which is what makes the ordinary ``ensure_library``
+    path build ``library/<asset_id>.1k.blend`` from it.  ``dimensions_mm`` are
+    the measured bounding-box dims in millimetres ([width, depth, height], the
+    Poly Haven convention) and ``extra`` carries the provenance the generator
+    wants to keep (backend, prompt, seed, ...).
+    """
+    index = load_index(cache_dir)
+    previous = index["models"].get(asset_id, {})
+    entry = {
+        "id": asset_id,
+        "kind": "model",
+        "name": name or asset_id,
+        "categories": list(categories),
+        "license": "generated",
+        "api_dimensions_mm": [round(float(v), 2) for v in dimensions_mm],
+        "source": "generated",
+        "gltf": glb_relpath,
+        "gltf_variants": {**previous.get("gltf_variants", {}), "1k": glb_relpath},
+        "files": sorted(set(previous.get("files", [])) | {glb_relpath}),
+    }
+    entry.update(extra or {})
+    index["models"][asset_id] = entry
+    save_index(index, cache_dir)
+    return entry
+
+
+
 def cmd_list(args) -> int:
     query = "/assets"
     params = []
@@ -454,7 +526,7 @@ def normalise_asset(objects, asset_id: str, meta: dict = None, entry: dict = Non
 
 
 def import_gltf_asset(gltf_path: str, collection_name: str):
-    """Import a .gltf and join its meshes; returns (collection, [objects], facts)."""
+    """Import a .gltf/.glb and join its meshes; returns (collection, [objects], facts)."""
     bpy = _bpy()
     before = set(bpy.data.objects)
     bpy.ops.import_scene.gltf(filepath=gltf_path)
@@ -503,7 +575,9 @@ def ensure_library(cache_dir: str, asset_id: str, meta: dict = None, force: bool
 
     gltf_path = os.path.join(cache_dir, variants[resolution])
     if not os.path.isfile(gltf_path):
-        raise FileNotFoundError(f"{gltf_path} missing; run assets.py fetch first")
+        hint = ("run: python tools/gen_assets_trellis.py generate"
+                if entry.get("source") == "generated" else "run assets.py fetch first")
+        raise FileNotFoundError(f"{gltf_path} missing; {hint}")
 
     bpy.ops.wm.read_factory_settings(use_empty=True)
     collection, meshes, _ = import_gltf_asset(gltf_path, f"asset_{asset_id}")

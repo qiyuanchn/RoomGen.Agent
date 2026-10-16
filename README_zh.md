@@ -107,10 +107,66 @@ bash scripts/fetch_assets.sh --skip-midi3d   # 快速路径（约 200 MB）
 
 `third_party/assets/` **有意不入库**：它是批量数据，由下载脚本从源头重建（含索引）。如路径特殊，用 `PANOWORLD_BLENDER` / `PANOWORLD_HOSTPY` 覆盖工具路径。
 
+## 生成式资产（`gen:`）
+
+Poly Haven + MIDI-3D 之外，类目缺口（尤其 sofa / bed / chair）用生成式资产补齐：
+`tools/gen_assets_trellis.py` 把生成的 glb 写进 `third_party/assets/generated/`，用与
+`ph:` / `midi3d:` **完全一样**的 index + library 机制登记（`blender_agent/assets.py`），
+场景 spec 只写 `gen:<id>`：
+
+```jsonc
+"furniture": [{"asset": "gen:sofa_01", "room": "living", "pos": [3.7, 3.6], "rot_z_deg": 0}]
+```
+
+```bash
+# 一键：补库 → 生成 demo spec → 标准 6 步流水线（低分辨率快跑）
+bash scripts/gen_assets_trellis.sh outputs/gen_assets
+bash scripts/gen_assets_trellis.sh outputs/gen_assets proc        # 强制程序化后端
+
+# 分步
+python tools/gen_assets_trellis.py generate --backend proc        # 程序化兜底（trimesh）
+python tools/gen_assets_trellis.py list                           # 看缓存里有什么
+python tools/gen_assets_trellis.py emit-spec --out outputs/gen_assets/scene_spec.json
+```
+
+两个 backend（`--backend auto` 默认：找到可用 GPU 容器就走 trellis，否则 proc）：
+
+| backend | 产出 | 依赖 |
+|---|---|---|
+| `proc` | trimesh 盒体拼装（sofa/armchair/chair/stool/bed/table/cabinet/lamp） | 主机 python + trimesh，无 GPU、无网络 |
+| `trellis` | 真 TRELLIS text-to-3D（`microsoft/TRELLIS-text-xlarge`） | GPU 容器 + TRELLIS checkout + 权重 |
+
+宿主没有 GPU，`trellis` backend 用 `docker exec` 在 GPU 容器里跑，容器需把本仓库与
+TRELLIS checkout 挂在**相同的绝对路径**下：
+
+```bash
+docker run -d --name roomgen-trellis --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=1 \
+  --user $(id -u):$(id -g) -v /srv/TRELLIS:/srv/TRELLIS:ro \
+  -v /srv/conda-envs/trellis:/srv/conda-envs/trellis -v "$PWD:$PWD" -w /srv/TRELLIS \
+  <cuda-image> sleep infinity
+
+python tools/gen_assets_trellis.py fetch-weights --container roomgen-trellis   # 下载权重（可在容器内）
+python tools/gen_assets_trellis.py generate --backend trellis \
+  --container roomgen-trellis --classes sofa bed chair --variants 2
+```
+
+路径可用 `PANOWORLD_TRELLIS_REPO` / `PANOWORLD_TRELLIS_PYTHON` /
+`PANOWORLD_TRELLIS_CONTAINER` / `PANOWORLD_TRELLIS_HF` 覆盖（权重默认缓存在
+`third_party/assets/trellis_hf/`，官方源 `HF_ENDPOINT=https://hf-mirror.com` 可指定）。
+每个生成资产都会做与 Poly Haven 资产相同的归一化（等比缩放到目标尺寸、水平主轴对齐、
+包围盒底面中心归零、正面朝 -Y），因此 spec 里不需要任何额外参数；`emit-spec` 同时写出
+每个 `gen:` 资产的出处（backend / prompt / seed / 实测尺寸）到 `<spec>.assets.json`，
+`validation_report.json` 旁边还有 `checks_report.json`（`blender_agent/checks.py` 的摆放评分）。
+
+已知限制：生成资产的朝向来自启发式（TRELLIS 文生 3D 本身没有统一正面），可在
+`CATEGORIES[...]["yaw_deg"]` 或 `--yaw` 里微调；demo 户型里床与卧室相机只隔 0.25 m
+（随附的 P1 spec 是 0.30 m，同一个几何约束）。
+
 ## 资产与许可
 
 * Poly Haven 模型/贴图 —— **CC0**，通过其 API 按需下载。
 * MIDI-3D 家具 glb（3D-FRONT/3D-FUTURE 处理版）—— **CC-BY-NC-4.0**：仅限研究/评估，**不可商用**。商用请替换为官方 3D-FRONT + 3D-FUTURE（向数据集作者邮件申请）；`blender_agent/front3d.py` 已支持官方场景 JSON 格式回放。
+* `gen:` 资产在本机生成，不附带第三方资产许可：`proc` 后端是本仓库代码（Apache-2.0），`trellis` 后端使用 MIT 许可的 TRELLIS 代码与 `microsoft/TRELLIS-text-xlarge` 权重（同为 MIT）。
 * 本仓库代码：Apache-2.0。
 
 ## 测试

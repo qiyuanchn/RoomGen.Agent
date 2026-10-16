@@ -162,12 +162,16 @@ def prepare_assets(spec: spec_mod.SceneSpec, cache_dir: str, force: bool = False
     """Resolve every furniture asset: cache check + library build (wipes the file!).
 
     ``ph:<id>`` resolves in the Poly Haven cache (``cache_dir``); ``midi3d:<id>``
-    resolves in the sibling ``third_party/assets/midi3d`` cache, whose index.json
-    is written in the same shape by ``tools/make_merged_assets.py``.
+    and ``gen:<id>`` resolve in the sibling ``third_party/assets/{midi3d,generated}``
+    caches, whose index.json files are written in the same shape by
+    ``tools/make_merged_assets.py`` and ``tools/gen_assets_trellis.py``.
     """
-    midi3d_cache = os.path.join(os.path.dirname(cache_dir), "midi3d") \
-        if os.path.basename(cache_dir) == "polyhaven" else os.path.join(cache_dir, "midi3d")
-    groups = {"ph": set(), "midi3d": set()}
+    caches = {
+        "ph": cache_dir,
+        "midi3d": assets.sibling_cache(cache_dir, "midi3d"),
+        "gen": assets.sibling_cache(cache_dir, "generated"),
+    }
+    groups = {scheme: set() for scheme in caches}
     for item in spec.furniture:
         scheme, _, asset_id = item.asset.partition(":")
         if scheme in groups:
@@ -176,7 +180,7 @@ def prepare_assets(spec: spec_mod.SceneSpec, cache_dir: str, force: bool = False
     for scheme, ids in groups.items():
         if not ids:
             continue
-        group_cache = cache_dir if scheme == "ph" else midi3d_cache
+        group_cache = caches[scheme]
         index = assets.load_index(group_cache)
         missing = []
         for asset_id in sorted(ids):
@@ -190,10 +194,15 @@ def prepare_assets(spec: spec_mod.SceneSpec, cache_dir: str, force: bool = False
             elif resolution not in (entry.get("gltf_variants") or {}):
                 missing.append(f"{asset_id} (no {resolution} variant)")
         if missing:
-            hint = ("fetch them with: python blender_agent/assets.py fetch --resolution "
-                    f"{resolution} --assets " + " ".join(f"ph:{m.split(' ')[0]}" for m in sorted(missing))
-                    ) if scheme == "ph" else (
-                    "rebuild the midi3d cache index with: python tools/make_merged_assets.py")
+            if scheme == "ph":
+                hint = ("fetch them with: python blender_agent/assets.py fetch --resolution "
+                        f"{resolution} --assets " + " ".join(f"ph:{m.split(' ')[0]}" for m in sorted(missing)))
+            elif scheme == "midi3d":
+                hint = "rebuild the midi3d cache index with: python tools/make_merged_assets.py"
+            else:
+                classes = sorted({m.split(" ", 1)[0].rsplit("_", 1)[0] for m in missing})
+                hint = ("generate them with: python tools/gen_assets_trellis.py generate --classes "
+                        + " ".join(classes))
             raise SystemExit(f"[run_build] missing {scheme} assets: "
                              + ", ".join(sorted(missing)) + f"\n  {hint}")
         meta = assets.load_asset_meta() if scheme == "ph" else {}

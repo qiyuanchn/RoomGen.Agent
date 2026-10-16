@@ -270,7 +270,7 @@ def inward_normal(room_id: str, point: Sequence[float], spec: "SceneSpec", tol: 
 # --------------------------------------------------------------------------- #
 @dataclass
 class FurnitureSpec:
-    """One placed asset: ``ph:<id>`` at a floor position with a Z rotation.
+    """One placed asset: ``ph:<id>`` (or ``midi3d:``/``gen:``) on the floor with a Z rotation.
 
     ``rot_z_deg`` is measured counter-clockwise from -Y (the front convention of
     ``assets.py``): 0 faces -Y, 90 faces +X, 180 faces +Y, 270 faces -X.
@@ -491,10 +491,10 @@ def parse_spec(data: dict, source_path: Optional[str] = None) -> SceneSpec:
     for i, raw in enumerate(data.get("furniture", [])):
         label = f"furniture[{i}]"
         asset = str(raw["asset"])
-        _require(":" in asset, f"{label}.asset must be 'ph:<polyhaven id>', 'builtin:<prop>', "
-                               "'front3d:<jid>' or 'midi3d:<id>'")
+        _require(":" in asset, f"{label}.asset must be 'ph:<polyhaven id>', 'midi3d:<id>', "
+                               "'gen:<generated asset id>', 'builtin:<prop>' or 'front3d:<jid>'")
         scheme, _, asset_id = asset.partition(":")
-        _require(scheme in ("ph", "builtin", "front3d", "midi3d"),
+        _require(scheme in ("ph", "midi3d", "gen", "builtin", "front3d"),
                  f"{label}.asset scheme '{scheme}' is unknown")
         _require(bool(asset_id), f"{label}.asset is missing the asset id")
         room_id = str(raw["room"])

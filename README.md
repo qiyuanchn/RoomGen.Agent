@@ -120,6 +120,67 @@ bash scripts/fetch_assets.sh --skip-midi3d   # fast path (~200 MB)
 fetch script rebuilds from source (registries included). Override tool paths
 with `PANOWORLD_BLENDER` / `PANOWORLD_HOSTPY` if needed.
 
+## Generated assets (`gen:`)
+
+Where Poly Haven + MIDI-3D leave a gap (sofas, beds and chairs run out first),
+generated furniture fills it: `tools/gen_assets_trellis.py` writes glbs into
+`third_party/assets/generated/` and registers them through the *same* index +
+library machinery as `ph:`/`midi3d:` (`blender_agent/assets.py`), so a spec only
+says `gen:<id>`:
+
+```jsonc
+"furniture": [{"asset": "gen:sofa_01", "room": "living", "pos": [3.7, 3.6], "rot_z_deg": 0}]
+```
+
+```bash
+# one command: fill the cache -> emit a demo spec -> standard 6-stage pipeline
+bash scripts/gen_assets_trellis.sh outputs/gen_assets
+bash scripts/gen_assets_trellis.sh outputs/gen_assets proc      # force the procedural backend
+
+# stage by stage
+python tools/gen_assets_trellis.py generate --backend proc      # trimesh fallback, no GPU
+python tools/gen_assets_trellis.py list
+python tools/gen_assets_trellis.py emit-spec --out outputs/gen_assets/scene_spec.json
+```
+
+Two backends (`--backend auto`, the default, picks trellis when a usable GPU
+container is found, otherwise proc):
+
+| backend | what it produces | needs |
+|---|---|---|
+| `proc` | trimesh box assemblies (sofa/armchair/chair/stool/bed/table/cabinet/lamp) | host python + trimesh; no GPU, no network |
+| `trellis` | real TRELLIS text-to-3D (`microsoft/TRELLIS-text-xlarge`) | a GPU container + TRELLIS checkout + weights |
+
+This host has no GPU, so the `trellis` backend runs the generator inside a GPU
+container with `docker exec`; the container must mount the repo and the TRELLIS
+checkout at the **same absolute paths**:
+
+```bash
+docker run -d --name roomgen-trellis --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=1 \
+  --user $(id -u):$(id -g) -v /srv/TRELLIS:/srv/TRELLIS:ro \
+  -v /srv/conda-envs/trellis:/srv/conda-envs/trellis -v "$PWD:$PWD" -w /srv/TRELLIS \
+  <cuda-image> sleep infinity
+
+python tools/gen_assets_trellis.py fetch-weights --container roomgen-trellis
+python tools/gen_assets_trellis.py generate --backend trellis \
+  --container roomgen-trellis --classes sofa bed chair --variants 2
+```
+
+Override the paths with `PANOWORLD_TRELLIS_REPO` / `_PYTHON` / `_CONTAINER` /
+`_HF` (weights default to `third_party/assets/trellis_hf/`, downloaded through
+`HF_ENDPOINT`, `https://hf-mirror.com` by default).  Every generated asset is
+normalised exactly like a Poly Haven model (uniform scale onto the category's
+target size, horizontal principal-axis alignment, bounding-box bottom centre at
+the origin, front facing -Y), so specs need no extra parameters; `emit-spec`
+also writes each `gen:` asset's provenance (backend / prompt / seed / measured
+size) to `<spec>.assets.json`, next to a `checks_report.json` from
+`blender_agent/checks.py`.
+
+Known limits: the facing of a text-to-3D asset is a heuristic (TRELLIS has no
+canonical front) and can be turned with `CATEGORIES[...]["yaw_deg"]` or `--yaw`;
+in the demo shell the bed sits 0.25 m from the bedroom camera (the shipped P1
+spec is at 0.30 m -- the same geometric constraint).
+
 ## Assets and licensing
 
 * Poly Haven models/textures — **CC0**, fetched on demand via their API.
@@ -128,6 +189,10 @@ with `PANOWORLD_BLENDER` / `PANOWORLD_HOSTPY` if needed.
   official 3D-FRONT + 3D-FUTURE set (email application to the dataset
   authors) for production; `blender_agent/front3d.py` already replays the
   official scene JSON format.
+* `gen:` assets are produced locally and carry no third-party asset licence:
+  the `proc` geometry is code in this repository (Apache-2.0), and the
+  `trellis` backend uses the MIT-licensed TRELLIS code and
+  `microsoft/TRELLIS-text-xlarge` weights (also MIT).
 * Code in this repository: Apache-2.0.
 
 ## Tests
