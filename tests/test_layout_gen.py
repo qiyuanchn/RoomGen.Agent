@@ -14,10 +14,12 @@ that ``tools/validate_blender_agent_p0.py`` runs after the render.
 
 from __future__ import annotations
 
+import collections
 import copy
 import json
 import math
 import os
+import random
 import subprocess
 import sys
 import tempfile
@@ -655,12 +657,13 @@ class TopologyFamilyTest(unittest.TestCase):
     Every family is a different arrangement of the same functional programme
     (living room, bedroom, kitchen, bathroom, ...) on a rectangle grid: a 2x2
     block, an L, a central living room with rooms around it, one- and two-sided
-    corridors and a circulation loop.  A layout is only accepted when its door
-    graph satisfies :func:`layout_gen.door_semantics` and ``checks.py`` passes.
+    corridors, a circulation loop, a U with its notch and a terraced staircase.
+    A layout is only accepted when its door graph satisfies
+    :func:`layout_gen.door_semantics` and ``checks.py`` passes.
     """
 
-    FAMILIES = ("compact_2x2", "l_shape", "central_living",
-                "corridor_single", "corridor_double", "loop")
+    FAMILIES = ("compact_2x2", "l_shape", "central_living", "corridor_single",
+                "corridor_double", "loop", "u_shape", "terraced")
     SEEDS = (0, 1, 2)
 
     @classmethod
@@ -794,16 +797,43 @@ class TopologyFamilyTest(unittest.TestCase):
         self.assertEqual(scene.report["family"], "corridor_double")
         self.assertEqual(len(scene.spec["rooms"]), layout_gen.ROOM_FAMILIES["corridor_double"].count)
 
-    def test_functional_rooms_are_reachable(self):
-        """Entry, storage, balcony, laundry and dining appear as the flat grows."""
+    OPTIONAL_ROOMS = ("dining", "study", "storage", "entry", "laundry", "balcony")
+
+    def test_functional_rooms_are_drawn_from_the_programme_pool(self):
+        """Entry, storage, balcony, laundry and dining are in every draw's pool.
+
+        The old form of this test generated five 5-room flats and expected all
+        five optional rooms among their *last* slots -- one draw per flat out of
+        a nine-entry pool, so it only ever passed when the seed happened to
+        draw exactly the five rooms it looked for.  The pool is checked
+        directly here, over enough draws that a missing room means the pool
+        lost it, not that the sample was unlucky.
+        """
         seen: dict = {}
-        for seed in (0, 1, 8, 10, 21):
-            scene = layout_gen.generate(seed, 5, ASSETS_INDEX, attempts=80, verbose=False, shape="row")
-            for room in scene.spec["rooms"]:
-                seen[room["type"]] = seen.get(room["type"], 0) + 1
-        for room_type in ("entry", "storage", "balcony", "laundry", "dining"):
+        for seed in range(120):
+            for room_type in layout_gen.choose_room_types(random.Random(seed), 5):
+                seen[room_type] = seen.get(room_type, 0) + 1
+        for room_type in self.OPTIONAL_ROOMS:
             with self.subTest(room=room_type):
                 self.assertGreaterEqual(seen.get(room_type, 0), 1, seen)
+
+    def test_every_optional_room_builds_and_passes_checks(self):
+        """A drawn balcony / laundry / storage really becomes a furnished room."""
+        base = ["living_room", "bedroom", "kitchen", "bathroom"]
+        original = layout_gen.choose_room_types
+        for room_type in self.OPTIONAL_ROOMS:
+            programme = list(base) + [room_type]
+            layout_gen.choose_room_types = lambda rng, count, programme=programme: list(programme)
+            try:
+                scene = layout_gen.generate(3, len(programme), ASSETS_INDEX,
+                                            attempts=80, verbose=False, shape="row")
+            finally:
+                layout_gen.choose_room_types = original
+            types = [room["type"] for room in scene.spec["rooms"]]
+            with self.subTest(room=room_type):
+                self.assertIn(room_type, types)
+                report = scene.report["checks"]
+                self.assertTrue(report["pass"], report["violations"][:3])
 
     def test_windowless_service_rooms_get_a_lamp(self):
         """A bathroom, hall or storeroom is lit by its doorway alone otherwise."""
@@ -820,6 +850,238 @@ class TopologyFamilyTest(unittest.TestCase):
     def test_room_count_mismatch_is_rejected(self):
         with self.assertRaises(ValueError):
             layout_gen.generate(0, 3, ASSETS_INDEX, verbose=False, shape="compact_2x2")
+
+
+class AutoShapeBalanceTest(unittest.TestCase):
+    """``--shape auto`` draws the arrangement, not the easiest one to build.
+
+    The benchmark read before this change drew ``row`` for 66 of 100 seeds and
+    ``central_living`` for none: the family was re-drawn on *every* attempt, so
+    the retry loop around a failing layout re-rolled until an easy arrangement
+    came up, and the sweep followed the failure rate instead of the weights.
+    The draw is weighted now (:data:`layout_gen.AUTO_FAMILY_WEIGHT`) and a seed
+    keeps its family (:data:`layout_gen.AUTO_STICKY_ATTEMPTS`) for as long as it
+    is buildable, so the mix reflects the weights.
+    """
+
+    SWEEP = tuple(range(16))
+
+    def test_weights_do_not_let_row_dominate(self):
+        weights = layout_gen.AUTO_FAMILY_WEIGHT
+        total = sum(weights.values())
+        others = [weight for name, weight in weights.items() if name != "row"]
+        self.assertLessEqual(weights["row"] / total, 0.12)
+        self.assertLess(weights["row"], min(others),
+                        "row is the arrangement every room count can host and must stay the rarest")
+
+    def test_weighted_draw_covers_every_family(self):
+        counts = collections.Counter()
+        for seed in range(400):
+            rng = random.Random(seed * 1000003 + layout_gen.AUTO_PICK_SALT)
+            counts[layout_gen._pick_auto_shape(rng, None)[1]] += 1
+        self.assertEqual(set(counts), set(layout_gen.AUTO_FAMILY_WEIGHT))
+        self.assertLessEqual(counts["row"] / 400.0, 0.15, counts)
+        self.assertLessEqual(max(counts.values()) / 400.0, 0.30, counts)
+
+    def test_sweep_is_not_dominated_by_one_family(self):
+        shapes = collections.Counter()
+        for seed in self.SWEEP:
+            scene = layout_gen.generate(seed, None, ASSETS_INDEX, verbose=False, shape="auto")
+            shapes[scene.report["shape"]] += 1
+            with self.subTest(seed=seed):
+                self.assertEqual(scene.report["stats"]["family"], scene.report["shape"])
+                self.assertEqual(scene.report["stats"]["shape"], "auto")
+        self.assertGreaterEqual(len(shapes), 5, shapes)
+        self.assertLessEqual(max(shapes.values()) / len(self.SWEEP), 0.40, shapes)
+        self.assertLessEqual(shapes["row"] / len(self.SWEEP), 0.35, shapes)
+
+    def test_drawn_family_is_a_function_of_the_seed(self):
+        for seed in (0, 5, 17):
+            first = layout_gen.generate(seed, None, ASSETS_INDEX, verbose=False, shape="auto")
+            second = layout_gen.generate(seed, None, ASSETS_INDEX, verbose=False, shape="auto")
+            with self.subTest(seed=seed):
+                self.assertEqual(json.dumps(first.spec, sort_keys=True),
+                                 json.dumps(second.spec, sort_keys=True))
+                drawn = layout_gen._pick_auto_shape(
+                    random.Random(seed * 1000003 + layout_gen.AUTO_PICK_SALT), None)
+                self.assertEqual(first.report["stats"]["auto_pick"], list(drawn))
+                self.assertEqual(first.report["stats"]["family"], drawn[1])
+
+    def test_room_count_override_restricts_the_draw(self):
+        counts = collections.Counter()
+        for seed in range(60):
+            rng = random.Random(seed * 1000003 + layout_gen.AUTO_PICK_SALT)
+            count, shape = layout_gen._pick_auto_shape(rng, 5)
+            counts[shape] += 1
+            with self.subTest(seed=seed):
+                self.assertEqual(count, 5)
+                self.assertIn(shape, layout_gen._shapes_for_count(5))
+        self.assertLess(counts["row"], max(counts.values()),
+                        "a forced room count must not fall back to row either")
+
+
+def _rects_of(scene):
+    """``id -> (type, rect)`` of a scene report, in plan coordinates."""
+    return {room["id"]: (room["type"], tuple(room["rect"])) for room in scene.report["rooms"]}
+
+
+def _footprint_fill(rects):
+    """Room area over the area of their bounding box (1.0 = a plain rectangle)."""
+    area = sum((x1 - x0) * (y1 - y0) for _type, (x0, y0, x1, y1) in rects.values())
+    width = max(rect[2] for _type, rect in rects.values()) - min(rect[0] for _type, rect in rects.values())
+    depth = max(rect[3] for _type, rect in rects.values()) - min(rect[1] for _type, rect in rects.values())
+    return area / (width * depth)
+
+
+def _band_jog(rects):
+    """How far the row bands are shifted sideways -- the 错动 of the plan."""
+    bands = {}
+    for _type, (x0, y0, _x1, _y1) in rects.values():
+        bands.setdefault(round(y0, 3), []).append(x0)
+    lefts = [min(edges) for edges in bands.values()]
+    return max(lefts) - min(lefts) if len(lefts) > 1 else 0.0
+
+
+def _exterior_sides(rects):
+    """``id -> number of its four sides no other room touches``."""
+    counts = {}
+    for room_id, (_type, (x0, y0, x1, y1)) in rects.items():
+        open_sides = 0
+        for axis, value, low, high in ((0, x0, y0, y1), (0, x1, y0, y1),
+                                       (1, y0, x0, x1), (1, y1, x0, x1)):
+            touched = False
+            for other_id, (_other_type, (ox0, oy0, ox1, oy1)) in rects.items():
+                if other_id == room_id:
+                    continue
+                if axis == 0:
+                    overlap = min(high, oy1) - max(low, oy0)
+                    nearest = (abs(ox0 - value) < 1e-6) or (abs(ox1 - value) < 1e-6)
+                else:
+                    overlap = min(high, ox1) - max(low, ox0)
+                    nearest = (abs(oy0 - value) < 1e-6) or (abs(oy1 - value) < 1e-6)
+                if overlap > 1e-6 and nearest:
+                    touched = True
+                    break
+            if not touched:
+                open_sides += 1
+        counts[room_id] = open_sides
+    return counts
+
+
+class OutlineRealismTest(unittest.TestCase):
+    """The house frame of a sweep: outlines, bays and the drawn size hierarchy.
+
+    A family used to draw one grid per attempt with its row bands aligned, so a
+    plan read as a grid: bays of one size inside a rectangle, one flat per
+    shape.  These tests pin what the sweep is judged on now -- the outline is
+    not a plain rectangle (a jog, the L / U notch or a staircase), the bays of
+    one plan differ from each other and from scene to scene, and the drawn sizes
+    keep the living > bedroom > bathroom hierarchy of a real plan.
+    """
+
+    AUTO_SEEDS = tuple(range(16))
+    FAMILY_SEEDS = (0, 1, 2)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.auto = [layout_gen.generate(seed, None, ASSETS_INDEX, verbose=False, shape="auto")
+                    for seed in cls.AUTO_SEEDS]
+        cls.family = {}
+        for name in sorted(layout_gen.ROOM_FAMILIES):
+            for seed in cls.FAMILY_SEEDS:
+                cls.family[(name, seed)] = layout_gen.generate(
+                    seed, None, ASSETS_INDEX, verbose=False, shape=name)
+
+    def test_family_outlines_are_not_plain_rectangles(self):
+        fills = {key: _footprint_fill(_rects_of(scene)) for key, scene in self.family.items()}
+        jogs = {key: _band_jog(_rects_of(scene)) for key, scene in self.family.items()}
+        for name, family in layout_gen.ROOM_FAMILIES.items():
+            if not family.shiftable:
+                continue
+            with self.subTest(family=name):
+                self.assertTrue(any(jogs[(name, seed)] > 0.20 for seed in self.FAMILY_SEEDS) or
+                                any(fills[(name, seed)] < 0.99 for seed in self.FAMILY_SEEDS),
+                                f"{name} never leaves its rectangle: "
+                                f"{[(seed, round(fills[(name, seed)], 3)) for seed in self.FAMILY_SEEDS]}")
+        plain = [key for key, fill in fills.items() if fill > 0.99]
+        self.assertLessEqual(len(plain), len(fills) // 3,
+                             f"most family plans are plain rectangles: {plain}")
+
+    def test_bands_are_staggered_across_the_sweep(self):
+        jogs = [_band_jog(_rects_of(scene)) for scene in self.auto]
+        self.assertGreaterEqual(sum(1 for jog in jogs if jog > 0.20) / len(jogs), 0.5,
+                                f"band offsets: {[round(jog, 2) for jog in jogs]}")
+
+    def test_footprints_are_not_a_grid(self):
+        fills = [_footprint_fill(_rects_of(scene)) for scene in self.auto]
+        self.assertGreaterEqual(sum(1 for fill in fills if fill < 0.95) / len(fills), 0.5,
+                                f"footprint fill: {[round(fill, 3) for fill in fills]}")
+
+    def test_bays_differ_within_a_plan(self):
+        scenes = list(self.family.items()) + \
+            [((scene.report["shape"], scene.report["stats"]["seed"]), scene) for scene in self.auto]
+        for key, scene in scenes:
+            rects = _rects_of(scene)
+            if len(rects) < 3:
+                continue
+            widths = {round(rect[2] - rect[0], 1) for _type, rect in rects.values()}
+            depths = {round(rect[3] - rect[1], 1) for _type, rect in rects.values()}
+            with self.subTest(scene=key):
+                self.assertGreaterEqual(len(widths), 2, f"{key}: every bay is {widths}")
+                self.assertGreaterEqual(len(depths), 2, f"{key}: every band is {depths}")
+
+    def test_bay_aspects_and_areas_span_a_realistic_range(self):
+        aspects = []
+        areas = []
+        for scene in self.auto:
+            for _type, (x0, y0, x1, y1) in _rects_of(scene).values():
+                aspects.append((x1 - x0) / (y1 - y0))
+                areas.append((x1 - x0) * (y1 - y0))
+        flats = [sum((x1 - x0) * (y1 - y0) for _t, (x0, y0, x1, y1) in _rects_of(scene).values())
+                 for scene in self.auto]
+        self.assertLess(min(aspects), 0.80, f"no bay is drawn long and narrow: {min(aspects)}")
+        self.assertGreater(max(aspects), 2.50, f"no bay is drawn wide: {max(aspects)}")
+        self.assertGreaterEqual(len({round(aspect, 2) for aspect in aspects}), 30)
+        self.assertGreater(max(flats) - min(flats), 8.0, f"flat areas: {min(flats)}..{max(flats)}")
+
+    def test_room_sizes_keep_the_living_bedroom_bathroom_hierarchy(self):
+        def mean_area(room_type):
+            draws = [area for scene in self.auto
+                     for kind, area in [(r["type"], (r["rect"][2] - r["rect"][0]) * (r["rect"][3] - r["rect"][1]))
+                                        for r in scene.report["rooms"]] if kind == room_type]
+            return sum(draws) / len(draws)
+
+        living, bedroom, bathroom = (mean_area("living_room"), mean_area("bedroom"), mean_area("bathroom"))
+        self.assertGreater(living, bedroom * 1.15, f"living {living:.1f} vs bedroom {bedroom:.1f}")
+        self.assertGreater(bedroom, bathroom * 1.30, f"bedroom {bedroom:.1f} vs bathroom {bathroom:.1f}")
+        for scene in self.auto:
+            areas = {room["type"]: (room["rect"][2] - room["rect"][0]) * (room["rect"][3] - room["rect"][1])
+                     for room in scene.report["rooms"]}
+            if "living_room" not in areas or "bathroom" not in areas:
+                continue
+            with self.subTest(seed=scene.report["stats"]["seed"]):
+                self.assertGreater(areas["living_room"], areas["bathroom"])
+
+    def test_every_room_keeps_an_exterior_wall(self):
+        """A room nobody can put a window in would be a dark box in the render."""
+        for key, scene in self.family.items():
+            open_sides = _exterior_sides(_rects_of(scene))
+            with self.subTest(scene=key):
+                self.assertEqual([room for room, count in open_sides.items() if count == 0], [],
+                                 f"{key}: no exterior wall")
+        for scene in self.auto:
+            open_sides = _exterior_sides(_rects_of(scene))
+            with self.subTest(seed=scene.report["stats"]["seed"]):
+                self.assertEqual([room for room, count in open_sides.items() if count == 0], [])
+
+    def test_row_and_block_still_stay_a_chain(self):
+        for shape in ("row", "block"):
+            scene = layout_gen.generate(2, None, ASSETS_INDEX, verbose=False, shape=shape)
+            spec = spec_mod.parse_spec(copy.deepcopy(scene.spec))
+            with self.subTest(shape=shape):
+                self.assertEqual(len(spec.openings), len(spec.rooms) - 1)
+                report = checks_mod.check_spec(spec, ASSETS_INDEX)
+                self.assertTrue(report["pass"], report["violations"][:3])
 
 
 class FixtureFurnitureTest(unittest.TestCase):

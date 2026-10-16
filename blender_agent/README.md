@@ -208,19 +208,35 @@ same family gives a different flat for every seed:
 | `--shape` | plan |
 |---|---|
 | `row` (default) | the railroad flat: 2-7 rooms in one row along +X |
-| `block` | the same chain wrapped into two rows, an L / block outline |
+| `block` | the same chain wrapped into two rows, an L / block outline with a jog at the corner |
 | `compact_2x2` | 4 rooms in a 2x2 block (living with the kitchen beside it, bedroom and bathroom behind) |
 | `l_shape` | an L: dining and kitchen together, living below, bathroom off it, bedroom at the end |
 | `central_living` | the living room spans the middle band, rooms open off it north and south (radiating) |
 | `corridor_single` | a hall strip along one side, rooms over it, living closing the end |
 | `corridor_double` | rooms on both sides of a middle hall |
 | `loop` | a circulation ring (living -> hall -> kitchen -> dining -> living) with bedroom and bathroom as leaves |
+| `u_shape` | a U: two wings over a south band, the notch open to the outside, bathroom as the bedroom's en-suite |
+| `terraced` | three bands that step sideways one after the other -- a staircase outline out of plain rectangles |
 | `auto` | the seed draws the room count and one of the families (`PANOWORLD_LAYOUT_SHAPE=auto bash scripts/layout_gen_run.sh <seed> <out>`) |
 
-Rooms are rectangles (a family's outline can be an L); the functional programme
-covers living room, bedroom(s), kitchen, bathroom plus dining, study, entry,
-corridor, storage, laundry and balcony.  The room *type* of a cell follows the
-drawn size, so a small service cell becomes a bathroom and never a 3 m2 bedroom.
+Rooms are rectangles (a family's outline can be an L, a U or a staircase); the
+functional programme covers living room, bedroom(s), kitchen, bathroom plus
+dining, study, entry, corridor, storage, laundry and balcony.  The room *type*
+of a cell follows the drawn size, so a small service cell becomes a bathroom
+and never a 3 m2 bedroom.  The sizes themselves are drawn, not fixed: every room
+samples an area out of its type's preference slice (`ROOM_SIZE_PREFERENCE`,
+which keeps the living > bedroom > bathroom hierarchy) and an aspect out of
+`ROOM_ASPECT` (a hall runs long and narrow, a living room stays squarish), and
+the family grid is fitted to those draws -- so neighbouring bays of one plan
+differ, and whole row bands may slide sideways up to the shared wall a door
+needs (`_band_offsets`, the 错动 of the terraced / jogged outlines).
+
+`--shape auto` draws the arrangement first, from `AUTO_FAMILY_WEIGHT` (the
+railroad `row` carries the smallest weight, the two-dimensional plans the
+largest) and keeps it for the seed's first attempts (`AUTO_STICKY_ATTEMPTS`).
+Re-drawing the family on every attempt used to hand the sweep to whichever
+family failed least often: the benchmark read 66/100 `row` that way, with
+`central_living` at 0/100.
 
 **Semantics** (enforced, and reported in `layout_report.json` -> `door_semantics`):
 

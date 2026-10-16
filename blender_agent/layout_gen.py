@@ -9,16 +9,22 @@ The generator turns a random seed into a furnished, multi-room ``scene_spec``
 that the existing pipeline can build, render and validate:
 
 1. *shell*: axis-aligned rectangular rooms in a **topology family** (see
-   :data:`ROOM_FAMILIES`): a 2x2 block, an L, a central living room with rooms
-   around it, one- or two-sided corridors and a circulation loop.  ``--shape``
-   picks the arrangement (``row`` is the default railroad flat, ``block`` the
-   same chain wrapped into two rows, ``auto`` draws a family from the seed, and
-   a family name forces one).  Room areas are drawn from the realistic bands
-   (:data:`ROOM_AREA_M2`) with a minimum side per type, so a small service cell
-   becomes a bathroom and never a 3 m2 bedroom.  ``--floors 2`` builds a
-   **duplex** instead: two floors on one footprint, each a row of 2-4 rooms,
-   joined by a switchback stair through a slab opening (see the step 7 section
-   below and ``check_duplex_spec``).
+   :data:`ROOM_FAMILIES`): a 2x2 block, an L, a U, a central living room with
+   rooms around it, one- or two-sided corridors, a circulation loop and a
+   terraced staircase.  ``--shape`` picks the arrangement (``row`` is the
+   default railroad flat, ``block`` the same chain wrapped into two rows with a
+   jog at the corner, ``auto`` draws a weighted family from the seed
+   (:data:`AUTO_FAMILY_WEIGHT`), and a family name forces one).  Every room
+   draws its area out of the realistic band of its type (:data:`ROOM_AREA_M2`)
+   through :data:`ROOM_SIZE_PREFERENCE` and its width/depth ratio through
+   :data:`ROOM_ASPECT`, so a flat keeps the living > bedroom > bathroom
+   hierarchy of a real plan, its bays differ from each other, and whole row
+   bands may slide sideways into an offset / staircase outline
+   (:func:`_band_offsets`); a minimum side per type keeps a small service cell
+   a bathroom and never a 3 m2 bedroom.  ``--floors 2`` builds a **duplex**
+   instead: two floors on one footprint, each a row of 2-4 rooms, joined by a
+   switchback stair through a slab opening (see the step 7 section below and
+   ``check_duplex_spec``).
 2. *doors*: a semantic spanning tree over the shared walls -- a corridor serves
    the rooms, the kitchen opens onto the dining room, a bathroom is never
    crossed and a bedroom is never the public way through the flat
@@ -135,6 +141,25 @@ ROOM_AREA_M2 = {
 ROOM_MIN_DIM_M = {"living_room": 3.2, "bedroom": 2.7, "kitchen": 2.0, "bathroom": 1.7,
                   "study": 2.4, "dining": 2.2, "corridor": 1.1, "entry": 1.2,
                   "storage": 1.0, "balcony": 1.2, "laundry": 1.4}
+#: The size a room *wants* to be, as a slice of its type's band: the drawn area
+#: is ``low + frac * (high - low)``.  A living room draws the upper part of its
+#: band, a bedroom the middle, a bathroom the low end, so a flat keeps the
+#: living > bedroom > bathroom hierarchy of a real plan whatever the seed;
+#: ``build_family`` fits its cells to the same slices, which is why a family
+#: flat and a row flat read the same way.
+ROOM_SIZE_PREFERENCE = {
+    "living_room": (0.30, 0.80),
+    "bedroom": (0.16, 0.58),
+    "kitchen": (0.14, 0.62),
+    "bathroom": (0.06, 0.50),
+    "study": (0.14, 0.58),
+    "dining": (0.15, 0.62),
+    "corridor": (0.05, 0.40),
+    "entry": (0.10, 0.55),
+    "storage": (0.10, 0.55),
+    "balcony": (0.10, 0.60),
+    "laundry": (0.10, 0.55),
+}
 ROOM_FLOOR_COLOR = {
     "living_room": [0.55, 0.38, 0.22],
     "bedroom": [0.60, 0.50, 0.40],
@@ -165,6 +190,22 @@ MIN_SHARED_WALL_M = 1.4
 ROOM_DEPTH_MIN_M = 3.65
 ROOM_DEPTH_MAX_M = 4.80
 ROOM_AREA_HEADROOM_M = 0.30
+#: how far the upper row of a block plan may jog off the corner (see
+#: :func:`plan_rooms_block`); the effective cap is the wall the two corner rooms
+#: still have to share, so this only bounds the visible offset
+BLOCK_JOG_MAX_M = 1.6
+#: how many times one family redraws its grid (cell sizes + size targets) before
+#: the attempt is given up: the fit below lands most draws, this is the slack
+#: for the ones where two rooms of one column want incompatible sizes
+FAMILY_GRID_DRAWS = 12
+#: damped scaling iterations of the grid fit, and the residual it accepts
+FAMILY_FIT_ITERATIONS = 60
+FAMILY_FIT_DAMPING = 0.5
+FAMILY_FIT_TOLERANCE = 0.02
+#: a whole row band may be shifted sideways by up to this many metres -- the
+#: "错动" of :data:`ROOM_FAMILIES`, always further capped by the shared wall the
+#: rooms of the band keep (see :func:`_band_offsets`)
+BAND_SHIFT_MAX_M = 1.9
 ROOM_OPEN_FRACTION = 0.85
 MAX_LAYOUT_ATTEMPTS = 80
 SLOT_ATTEMPTS = 8
@@ -487,6 +528,13 @@ def choose_room_types(rng: random.Random, count: int) -> List[str]:
     return types
 
 
+def _preferred_area(rng: random.Random, room_type: str) -> float:
+    """One draw from the type's :data:`ROOM_SIZE_PREFERENCE` slice of its band."""
+    low, high = ROOM_AREA_M2[room_type]
+    frac = ROOM_SIZE_PREFERENCE.get(room_type, (0.20, 0.70))
+    return rng.uniform(low + frac[0] * (high - low), low + frac[1] * (high - low))
+
+
 def plan_rooms(rng: random.Random, types: Sequence[str]) -> List[RoomPlan]:
     """Lay the rooms out as a single row (a "railroad" flat) along +X.
 
@@ -503,20 +551,26 @@ def plan_rooms(rng: random.Random, types: Sequence[str]) -> List[RoomPlan]:
     fixed (see the module docstring).
     """
     plans: List[RoomPlan] = []
-    depth_base = rng.uniform(3.55, 4.25)
     for room_type in types:
         low, high = ROOM_AREA_M2[room_type]
         min_dim = ROOM_MIN_DIM_M[room_type]
-        depth = min(depth_base + rng.uniform(-0.30, 0.45),
-                    (high - ROOM_AREA_HEADROOM_M) / min_dim - 0.15, ROOM_DEPTH_MAX_M)
-        depth = max(depth, ROOM_DEPTH_MIN_M)
-        area_low = max(low, min_dim * depth)
-        if area_low > high - 1e-6 or depth < min_dim - 1e-9:
+        # bay depth and room area are drawn independently: the area from the
+        # type's preference slice, the depth from the type's aspect -- so the
+        # north edge of the row steps from room to room instead of every bay
+        # sharing one depth.  The depth stays inside the row band and inside
+        # what the type's area band can hold, which is what keeps a deep bay
+        # from being filled by a 3 m2 bathroom.
+        area = _preferred_area(rng, room_type)
+        aspect = rng.uniform(*ROOM_ASPECT.get(room_type, (0.90, 1.70)))
+        # a small room may take a shallower bay than the row's usual depth (a
+        # bathroom is not as deep as the living room it sits behind); the band
+        # of the type is the limit on both ends
+        depth_low = min(ROOM_DEPTH_MIN_M, math.sqrt(high - ROOM_AREA_HEADROOM_M))
+        depth_high = min(ROOM_DEPTH_MAX_M, (high - ROOM_AREA_HEADROOM_M) / min_dim)
+        depth = _clamp(math.sqrt(area / aspect), depth_low, max(depth_low, depth_high))
+        area = min(max(area, min_dim * depth), high - ROOM_AREA_HEADROOM_M)
+        if area < low - 1e-9 or area / depth < min_dim - 1e-9:
             raise _AttemptFailed(f"{room_type} does not fit a {depth:.2f} m deep row")
-        area_high = high - ROOM_AREA_HEADROOM_M
-        area = rng.uniform(area_low + 0.2 * (area_high - area_low), area_high)
-        if area_low + 0.05 > area_high:
-            raise _AttemptFailed(f"{room_type} area floor {area_low:.2f} leaves no spread below {high}")
         plans.append(RoomPlan(room_id="", room_type=room_type, rect=Rect(0, 0, 0, 0),
                               target_area=area, width=area / depth, depth=depth))
     # private rooms (bedroom / bathroom) take the ends of the chain wherever the
@@ -560,9 +614,14 @@ def plan_rooms_block(rng: random.Random, types: Sequence[str]) -> List[RoomPlan]
     *above* the first row, so consecutive rooms still share a full wall
     (:func:`plan_doors` finds every one of them) and the plan is two-dimensional
     -- an L for three rooms, a 2x2 block for four, a longer block for five.
-    Rooms keep their drawn area; each row gets one depth (the deepest room of
-    the row) and the widths are recomputed from the areas, which is what makes
-    the two rows share a straight wall.
+    Rooms keep their drawn area; each row gets one depth (the mean of the depths
+    its rooms drew, see :func:`row_depth`) and the widths are recomputed from
+    the areas, which is what makes the two rows share a straight wall.
+
+    The upper row starts a jog off the corner (``BLOCK_JOG_MAX_M``) rather than
+    exactly on it, so the outline is a Z -- an overhanging or pulled-back wing
+    -- and not always the same clean L; the jog stays small enough that the two
+    rooms at the corner keep the shared wall their door needs.
 
     This is the "no door line" shape's reason to exist: with the validator
     measuring doors per opening, a plan no longer has to put every room on one X
@@ -575,12 +634,28 @@ def plan_rooms_block(rng: random.Random, types: Sequence[str]) -> List[RoomPlan]
         return plans
 
     def row_depth(row: Sequence[RoomPlan]) -> float:
+        """The depth of one row: the mean of the depths its rooms drew.
+
+        The whole row gets one depth so the two rows share a straight wall; the
+        mean keeps the row from being stretched to the deepest draw of its rooms
+        (which used to make every block flat deep).  A room whose drawn area is
+        too small for that shared bay grows to what the bay needs -- up to the
+        end of its own band, so a bathroom with a shallow draw still becomes a
+        bathroom and not a 3 m2 box -- and a room that cannot follow caps the
+        row instead.
+        """
         low, high = ROOM_DEPTH_MIN_M, ROOM_DEPTH_MAX_M
-        depth = _clamp(max(plan.depth for plan in row), low, high)
+        depth = _clamp(sum(plan.depth for plan in row) / len(row), low, high)
         for plan in row:
-            width = plan.target_area / depth
-            if width < ROOM_MIN_DIM_M[plan.room_type] - 1e-9:
-                raise _AttemptFailed(f"{plan.room_type} cannot keep its area in a {depth:.2f} m row")
+            min_dim = ROOM_MIN_DIM_M[plan.room_type]
+            band_low, band_high = ROOM_AREA_M2[plan.room_type]
+            if plan.target_area < min_dim * depth:
+                plan.target_area = min(min_dim * depth, band_high - ROOM_AREA_HEADROOM_M)
+                if plan.target_area < band_low - 1e-9 or plan.target_area < min_dim * depth - 1e-9:
+                    high = min(high, plan.target_area / min_dim)
+        depth = min(depth, high)
+        if depth < low - 1e-9:
+            raise _AttemptFailed(f"no depth between {low:.2f} and {high:.2f} m holds the row")
         return depth
 
     placements: List[Tuple[RoomPlan, Rect]] = []
@@ -593,10 +668,18 @@ def plan_rooms_block(rng: random.Random, types: Sequence[str]) -> List[RoomPlan]
     if x < 6.0:
         raise _AttemptFailed("the ground row is too short")
     corner = placements[-1][1]
-    x, y0 = corner.x1, corner.y1
+    y0 = corner.y1
     depth = row_depth(top)
-    for plan in top:
-        width = _round(plan.target_area / depth)
+    widths = [_round(plan.target_area / depth) for plan in top]
+    # 错动: the upper row does not have to start on the corner.  A jog moves its
+    # east end off the lower row's edge -- the wing overhangs or pulls back --
+    # so the outline is a Z instead of a rectangle.  The cap keeps the two rooms
+    # at the corner sharing enough wall for a door, which is the only adjacency
+    # the wrapped chain needs.
+    cap = min(corner.w, widths[0]) - MIN_SHARED_WALL_M - 0.05
+    jog = _round(rng.uniform(-0.5, 0.5) * min(cap, BLOCK_JOG_MAX_M), 0.01) if cap > 0.0 else 0.0
+    x = corner.x1 + jog
+    for plan, width in zip(top, widths):
         placements.append((plan, Rect(x - width, y0, x, _round(y0 + depth, 0.01))))
         x -= width
 
@@ -618,11 +701,14 @@ def plan_rooms_block(rng: random.Random, types: Sequence[str]) -> List[RoomPlan]
 # --------------------------------------------------------------------------- #
 # A room is always a rectangle; a family builds the *arrangement* -- a 2x2
 # block, an L, a middle living room, one- or two-sided corridors, a circulation
-# loop -- as a small grid of cells (columns x rows) with one room per span of
-# cells.  The pattern is fixed, the cell sizes are drawn per attempt, so the
-# same family gives a different flat for every seed; the room bands of
-# ``ROOM_AREA_M2`` are the envelope a draw has to land in or the attempt is
-# retried.
+# loop, a U, a terraced staircase -- as a small grid of cells (columns x rows)
+# with one room per span of cells.  The pattern is fixed, the cell *sizes* are
+# drawn per attempt: each slot first draws the size and the aspect its function
+# wants (:data:`ROOM_SIZE_PREFERENCE`, :data:`ROOM_ASPECT`) and the grid is then
+# scaled until every room lands on its target, so two draws of one family differ
+# in every bay and neighbouring bays differ from each other (see
+# :func:`build_family`).  The bands of ``ROOM_AREA_M2`` remain the envelope the
+# result has to land in, or the draw is repeated.
 
 #: role -> room types it can host (the first entry is the usual reading)
 ROLE_POOLS: Dict[str, Tuple[str, ...]] = {
@@ -637,6 +723,25 @@ ROLE_POOLS: Dict[str, Tuple[str, ...]] = {
     "flow": ("corridor", "entry"),
     "entry": ("entry", "storage"),
     "outdoor": ("balcony", "laundry"),
+}
+
+#: room type -> the width/depth ratio (aspect) the room draws.  The two sides
+#: of a room are sampled independently through this ratio instead of the width
+#: being derived from one fixed bay depth (and the other way round for the view
+#: along the plan), which is what makes a flat read as drawn rather than
+#: gridded: a hall runs long and narrow, a living room stays squarish.
+ROOM_ASPECT: Dict[str, Tuple[float, float]] = {
+    "living_room": (1.05, 1.55),
+    "bedroom": (0.95, 1.55),
+    "kitchen": (1.15, 1.90),
+    "bathroom": (0.95, 1.80),
+    "study": (0.95, 1.60),
+    "dining": (1.00, 1.70),
+    "corridor": (1.80, 4.20),
+    "entry": (0.95, 1.80),
+    "storage": (0.80, 1.60),
+    "balcony": (1.20, 2.60),
+    "laundry": (0.80, 1.80),
 }
 
 
@@ -657,17 +762,33 @@ class _Slot:
 
 @dataclass(frozen=True)
 class _Family:
-    """A topology template: cell size ranges plus one slot per room."""
+    """A topology template: cell size bounds plus one slot per room.
+
+    ``cols``/``rows`` are the *bounds* of the grid's cells, not the sizes: the
+    draw of :func:`build_family` starts inside them and then fits the cells to
+    the size every room wants, so two flats of one family differ in every bay.
+    ``shift`` slides whole row bands sideways (the 错动 that stops the outline
+    from being a rectangle) and ``terraced`` accumulates that shift into a
+    staircase; both are refused by :attr:`shiftable` when a room spans two rows,
+    which could not stay rectangular.
+    """
 
     name: str
     cols: Tuple[Tuple[float, float], ...]
     rows: Tuple[Tuple[float, float], ...]
     slots: Tuple[_Slot, ...]
     extra_doors: int = 0           # doors beyond the spanning tree (ring layouts)
+    shift: float = 0.0             # 0 = the row bands stay aligned in x
+    terraced: bool = False         # the shift accumulates band by band
 
     @property
     def count(self) -> int:
         return len(self.slots)
+
+    @property
+    def shiftable(self) -> bool:
+        """Can whole row bands slide without leaving a room non-rectangular?"""
+        return self.shift > 0.0 and all(slot.row_span == 1 for slot in self.slots)
 
 
 ROOM_FAMILIES: Dict[str, _Family] = {
@@ -676,39 +797,43 @@ ROOM_FAMILIES: Dict[str, _Family] = {
     # no door runs from a kitchen into a bathroom, see door_semantics)
     "compact_2x2": _Family(
         name="compact_2x2",
-        cols=((3.7, 4.3), (2.1, 2.6)),
-        rows=((3.5, 4.0), (2.9, 3.4)),
+        cols=((3.2, 4.8), (1.9, 3.1)),
+        rows=((3.1, 4.4), (2.7, 4.0)),
         slots=(_Slot("public", 0, 0), _Slot("cook", 1, 0),
                 _Slot("sleep", 0, 1), _Slot("wet", 1, 1)),
+        shift=0.55,
     ),
     # an L: a dining room and a narrow kitchen column beside it, the living room
     # below the dining room, the bathroom off the living room and the bedroom
     # closing the far end
     "l_shape": _Family(
         name="l_shape",
-        cols=((4.0, 5.0), (2.2, 2.8)),
-        rows=((3.2, 3.8), (3.0, 3.6), (3.0, 3.6)),
+        cols=((3.4, 5.6), (1.9, 3.4)),
+        rows=((3.0, 4.0), (2.8, 3.8), (2.8, 3.9)),
         slots=(_Slot("eat", 0, 0), _Slot("cook", 1, 0),
                 _Slot("public", 0, 1), _Slot("wet", 1, 1),
                 _Slot("sleep", 0, 2)),
+        shift=0.55,
     ),
     # central living room spanning the middle band, rooms north and south of it
     # -- every room opens off the living room (the "radiating" plan)
     "central_living": _Family(
         name="central_living",
-        cols=((3.4, 4.4), (2.0, 2.6)),
-        rows=((2.9, 3.6), (3.2, 4.0), (2.9, 3.6)),
+        cols=((3.0, 4.8), (1.8, 3.0)),
+        rows=((2.7, 4.0), (3.0, 4.2), (2.7, 4.0)),
         slots=(_Slot("cook", 0, 0), _Slot("eat", 1, 0),
                 _Slot("public", 0, 1, col_span=2),
                 _Slot("sleep", 0, 2), _Slot("wet", 1, 2)),
         extra_doors=1,           # kitchen <-> dining as well as via the living room
+        shift=0.60,
     ),
     # single-loaded corridor: a hall strip along the south edge, rooms over it,
-    # the living room closing the end
+    # the living room closing the end (the living room spans both rows, so this
+    # family keeps its bands aligned and varies in the cell sizes alone)
     "corridor_single": _Family(
         name="corridor_single",
-        cols=((1.9, 2.6), (3.0, 3.8), (2.5, 3.2), (4.0, 5.0)),
-        rows=((1.1, 1.6), (2.9, 3.6)),
+        cols=((1.5, 2.8), (2.6, 4.2), (2.2, 3.6), (3.4, 5.6)),
+        rows=((1.2, 2.2), (2.9, 4.0)),
         slots=(_Slot("flow", 0, 0, col_span=3),
                 _Slot("wet", 0, 1), _Slot("sleep", 1, 1), _Slot("cook", 2, 1),
                 _Slot("public", 3, 0, row_span=2)),
@@ -716,25 +841,85 @@ ROOM_FAMILIES: Dict[str, _Family] = {
     # double-loaded corridor: rooms on both sides of a middle hall
     "corridor_double": _Family(
         name="corridor_double",
-        cols=((3.4, 4.2), (2.2, 2.8)),
-        rows=((3.4, 4.2), (1.1, 1.6), (2.9, 3.6)),
+        cols=((3.0, 4.6), (2.0, 3.4)),
+        rows=((3.2, 4.4), (1.2, 2.4), (2.8, 4.0)),
         slots=(_Slot("public", 0, 0), _Slot("cook", 1, 0),
                 _Slot("flow", 0, 1, col_span=2),
                 _Slot("sleep", 0, 2), _Slot("wet", 1, 2)),
+        shift=0.50,
     ),
     # circulation loop: living -> hall -> kitchen -> dining -> living is a ring
     # (four doors) around a 2x2 block, with the bedroom off the hall and its
     # bathroom as the en-suite leaf
     "loop": _Family(
         name="loop",
-        cols=((3.4, 4.2), (2.8, 3.4), (3.0, 3.6)),
-        rows=((2.4, 2.9), (3.4, 4.0)),
+        cols=((3.0, 4.6), (2.6, 3.8), (2.6, 4.0)),
+        rows=((2.2, 3.2), (3.2, 4.4)),
         slots=(_Slot("eat", 0, 0), _Slot("cook", 1, 0),
                 _Slot("public", 0, 1), _Slot("flow", 1, 1),
                 _Slot("sleep", 2, 1), _Slot("wet", 2, 0)),
         extra_doors=1,           # the ring's fourth edge, the tree drops one
+        shift=0.45,
+    ),
+    # a U: two wings over a south band, the middle of the north band left open.
+    # The notch is the courtyard side of the plan -- the bathroom overlooks it
+    # and is entered from the bedroom (a kitchen door into a bathroom is
+    # forbidden, and the kitchen is the bathroom's only other neighbour)
+    "u_shape": _Family(
+        name="u_shape",
+        cols=((3.2, 5.4), (1.8, 4.0)),
+        rows=((3.0, 4.3), (2.5, 3.6), (2.8, 4.0)),
+        slots=(_Slot("public", 0, 0), _Slot("cook", 1, 0),
+                _Slot("flow", 0, 1),
+                _Slot("sleep", 0, 2), _Slot("wet", 1, 2)),
+        shift=0.45,
+    ),
+    # a terraced flat: three bands that step sideways one after the other, so
+    # the outline is a staircase (the 斜向 plan the plain rectangles can still
+    # make).  The hall band in the middle serves the rooms on both of its sides.
+    "terraced": _Family(
+        name="terraced",
+        cols=((3.2, 5.0), (2.6, 4.4)),
+        rows=((3.1, 4.2), (1.3, 3.2), (2.9, 3.9)),
+        slots=(_Slot("public", 0, 0), _Slot("cook", 1, 0),
+                _Slot("flow", 0, 1, col_span=2),
+                _Slot("sleep", 0, 2), _Slot("wet", 1, 2)),
+        shift=0.60, terraced=True,
     ),
 }
+
+#: How often ``--shape auto`` draws each arrangement.  The railroad ``row`` is
+#: the one every room count can host, so it carries the smallest weight and the
+#: two-dimensional plans -- and especially the ones that used to be squeezed out
+#: by the retry loop (``l_shape`` 1/100, ``central_living`` 0/100 on the
+#: benchmark) -- carry the largest.  A weight is a relative draw probability,
+#: not a promise: a family that keeps failing still falls back (see
+#: :func:`_pick_auto_shape` and :func:`generate`).
+AUTO_FAMILY_WEIGHT: Dict[str, float] = {
+    "row": 1.0,
+    "block": 2.0,
+    "compact_2x2": 2.2,
+    "l_shape": 2.4,
+    "central_living": 2.4,
+    "u_shape": 2.2,
+    "terraced": 2.0,
+    "corridor_single": 1.6,
+    "corridor_double": 1.6,
+    "loop": 1.5,
+}
+#: The room counts ``row``/``block`` draw when ``--rooms`` is not given.
+AUTO_COUNT_DRAW = (2, 3, 3, 4, 4, 4, 5, 5, 6)
+#: How many attempts a seed keeps its drawn family before ``generate`` falls
+#: back to re-drawing one per attempt.  Without this the retry loop re-draws
+#: around every failure and hands the sweep to whichever family is easiest to
+#: build (the 66/100 ``row`` share); with it the seed's family is the drawn one
+#: as long as it is buildable at all.
+AUTO_STICKY_ATTEMPTS = 16
+#: Seed salt of the ``--shape auto`` draw.  The draw runs on its own
+#: ``random.Random`` stream so the arrangement of a seed does not depend on how
+#: many attempts that seed needed -- a fixed-seed layout stays reproducible even
+#: when a retry threshold moves.
+AUTO_PICK_SALT = 7919
 
 
 def _check_room_bands(plan: RoomPlan, where: str) -> None:
@@ -757,19 +942,182 @@ def _rect_fits_type(rect: Rect, room_type: str) -> bool:
     return low - 1e-9 <= rect.area <= high + 1e-9
 
 
-def build_family(rng: random.Random, family: _Family) -> List[RoomPlan]:
-    """One draw of a family: cell sizes, an optional mirror, the room rectangles.
+def _slot_targets(rng: random.Random, family: _Family) -> List[Tuple[float, float]]:
+    """The ``(width, depth)`` each slot of a family wants for its function.
 
-    Column widths and row depths are drawn once for the family's grid and every
-    room takes the span of cells its slot covers, so neighbouring cells share
-    exactly one boundary line (the shared wall).  A random mirror in X and Y
-    varies the orientation without touching the adjacency pattern.  The room
-    *type* of a slot is drawn from its role's pool, restricted to the types
-    whose area band and minimum side the drawn rectangle satisfies -- a small
-    service cell becomes a bathroom, never a 3 m2 bedroom.
+    The area comes from the role's preferred type (:data:`ROLE_POOLS`, first
+    entry) through the same size preference a row flat draws from, the aspect
+    from :data:`ROOM_ASPECT` -- so the two sides of a bay are sampled
+    independently and a living room draws a larger bay than a bedroom and a
+    bedroom a larger one than a bathroom.  The aspect is trimmed to what the
+    type's minimum side allows at that area, which keeps every target a
+    rectangle its type can actually host.
     """
-    widths = [rng.uniform(low, high) for low, high in family.cols]
-    depths = [rng.uniform(low, high) for low, high in family.rows]
+    targets: List[Tuple[float, float]] = []
+    for slot in family.slots:
+        room_type = ROLE_POOLS[slot.role][0]
+        area = _preferred_area(rng, room_type)
+        min_dim = ROOM_MIN_DIM_M[room_type]
+        low, high = ROOM_ASPECT.get(room_type, (0.90, 1.70))
+        low, high = max(low, min_dim * min_dim / area), max(high, low)
+        high = min(high, area / (min_dim * min_dim))
+        high = max(high, low)
+        aspect = rng.uniform(low, high)
+        want_w = math.sqrt(area * aspect)
+        targets.append((want_w, area / want_w))
+    return targets
+
+
+def _band_floors(family: _Family) -> Tuple[List[float], List[float]]:
+    """The smallest a cell may become: the minimum side of the types it hosts.
+
+    A cell is shared by the rooms of its column or row, so the fit is not free
+    to shrink a band for the room that wants a small bay: the deepest minimum
+    side among the rooms covering the band wins.  Without this the living room
+    of a two-sided plan kept losing the row depth to the kitchen it shares the
+    row with and landed below its own minimum side.
+    """
+    floors_w = [0.0] * len(family.cols)
+    floors_d = [0.0] * len(family.rows)
+    for slot in family.slots:
+        need = ROOM_MIN_DIM_M[ROLE_POOLS[slot.role][0]]
+        for index in range(slot.col, slot.col + slot.col_span):
+            floors_w[index] = max(floors_w[index], need / slot.col_span)
+        for index in range(slot.row, slot.row + slot.row_span):
+            floors_d[index] = max(floors_d[index], need / slot.row_span)
+    return floors_w, floors_d
+
+
+def _fit_grid(rng: random.Random, family: _Family,
+              targets: Sequence[Tuple[float, float]]) -> Tuple[List[float], List[float]]:
+    """Draw the cell sizes and scale them until every slot lands on its target.
+
+    The columns and rows start inside the family's bounds and are then refined
+    by damped scaling passes: a slot whose rectangle is too small pushes the
+    cells it covers apart, one that is too big pulls them together.  Every cell
+    collects the *mean* error of the rooms covering it, so no room wins by being
+    looked at last -- a bay shared by two rooms of different sizes settles
+    between them, which is where the asymmetry of a drawn plan comes from (the
+    bays of one flat are never equal) -- and the clamps keep every cell inside
+    its bounds and every room at its minimum side.
+
+    A room over several bays (or several bands) is fitted by the one side that
+    is still free: its bays dictate the other one, so only its depth (width)
+    is matched, clamped to the depth (width) that keeps its *area* in band.
+    """
+    floors_w, floors_d = _band_floors(family)
+    lows_w = [max(bound[0], floor) for bound, floor in zip(family.cols, floors_w)]
+    lows_d = [max(bound[0], floor) for bound, floor in zip(family.rows, floors_d)]
+    highs_w = [max(bound[1], low) for bound, low in zip(family.cols, lows_w)]
+    highs_d = [max(bound[1], low) for bound, low in zip(family.rows, lows_d)]
+    widths = [rng.uniform(low, high) for low, high in zip(lows_w, highs_w)]
+    depths = [rng.uniform(low, high) for low, high in zip(lows_d, highs_d)]
+    for _iteration in range(FAMILY_FIT_ITERATIONS):
+        err_w = [0.0] * len(widths)
+        err_d = [0.0] * len(depths)
+        seen_w = [0] * len(widths)
+        seen_d = [0] * len(depths)
+        worst = 0.0
+        for slot, (want_w, want_d) in zip(family.slots, targets):
+            have_w = sum(widths[slot.col:slot.col + slot.col_span])
+            have_d = sum(depths[slot.row:slot.row + slot.row_span])
+            if slot.col_span == 1 and slot.row_span == 1:
+                e_w, e_d = math.log(have_w / want_w), math.log(have_d / want_d)
+            else:
+                # a room over several bays (bands) is fitted by the side that is
+                # still free: its bays dictate the other one, so only its depth
+                # (width) is matched -- clamped to the depth (width) that keeps
+                # its area inside the band
+                low, high = ROOM_AREA_M2[ROLE_POOLS[slot.role][0]]
+                if slot.col_span > 1:
+                    target = _clamp(want_d, (low + 0.05) / have_w,
+                                    (high - ROOM_AREA_HEADROOM_M) / have_w)
+                    e_w, e_d = 0.0, math.log(have_d / target)
+                else:
+                    target = _clamp(want_w, (low + 0.05) / have_d,
+                                    (high - ROOM_AREA_HEADROOM_M) / have_d)
+                    e_w, e_d = math.log(have_w / target), 0.0
+            worst = max(worst, abs(e_w), abs(e_d))
+            if e_w:
+                for index in range(slot.col, slot.col + slot.col_span):
+                    err_w[index] += e_w
+                    seen_w[index] += 1
+            if e_d:
+                for index in range(slot.row, slot.row + slot.row_span):
+                    err_d[index] += e_d
+                    seen_d[index] += 1
+        for index in range(len(widths)):
+            if seen_w[index]:
+                widths[index] = _clamp(widths[index] * math.exp(
+                    -FAMILY_FIT_DAMPING * err_w[index] / seen_w[index]), lows_w[index], highs_w[index])
+        for index in range(len(depths)):
+            if seen_d[index]:
+                depths[index] = _clamp(depths[index] * math.exp(
+                    -FAMILY_FIT_DAMPING * err_d[index] / seen_d[index]), lows_d[index], highs_d[index])
+        if worst <= FAMILY_FIT_TOLERANCE:
+            break
+    return widths, depths
+
+
+def _band_offsets(rng: random.Random, family: _Family, widths: Sequence[float]) -> List[float]:
+    """The sideways offset of every row band -- the 错动 of the plan.
+
+    The first band anchors the plan and each further band slides relative to the
+    one below it, capped by the shared wall the rooms of the narrowest column
+    have to keep, so a door (``DOOR_W`` plus jambs) still fits across the step
+    and the shifted outline stays connected.  A terraced family steps in one
+    direction only, which turns the outline into a staircase; the others jog
+    back and forth.  Families whose rooms span two rows keep their bands aligned
+    (:attr:`_Family.shiftable`), because such a room would stop being a
+    rectangle.
+    """
+    offsets = [0.0] * len(family.rows)
+    if not family.shiftable:
+        return offsets
+    narrow = min(widths)
+    limit = min(BAND_SHIFT_MAX_M, family.shift * narrow, narrow - MIN_SHARED_WALL_M - 0.05)
+    if limit <= 0.05:
+        return offsets
+    sign = 1.0 if rng.random() < 0.5 else -1.0
+    for row in range(1, len(offsets)):
+        if family.terraced:
+            step = sign * rng.uniform(0.45, 1.0) * limit
+            offsets[row] = offsets[row - 1] + step
+        else:
+            offsets[row] = rng.uniform(-1.0, 1.0) * limit
+        offsets[row] = _clamp(offsets[row], offsets[row - 1] - limit, offsets[row - 1] + limit)
+    return [_round(offset, 0.01) for offset in offsets]
+
+
+def build_family(rng: random.Random, family: _Family) -> List[RoomPlan]:
+    """One draw of a family: cell sizes, a mirror, the band offsets, the rooms.
+
+    Every slot draws the size and the aspect its function wants, the grid is
+    fitted to those targets (:func:`_fit_grid`), whole row bands may slide
+    sideways (:func:`_band_offsets`) and a random mirror in X and Y varies the
+    orientation without touching the adjacency pattern.  Rooms of one column or
+    row share their cells, so neighbours abut on exactly one boundary line --
+    the shared wall every door is measured on.  The room *type* of a slot is
+    drawn from its role's pool, restricted to the types whose band and minimum
+    side the fitted rectangle satisfies -- a small service cell becomes a
+    bathroom, never a 3 m2 bedroom.  A draw whose fit misses the bands is
+    repeated before the attempt is given up, so one unlucky combination of
+    targets does not cost the caller a whole attempt.
+    """
+    failure = "no grid draw"
+    for _draw in range(FAMILY_GRID_DRAWS):
+        try:
+            return _draw_family(rng, family)
+        except _AttemptFailed as error:
+            failure = str(error)
+    raise _AttemptFailed(f"{failure} ({FAMILY_GRID_DRAWS} grid draws)")
+
+
+def _draw_family(rng: random.Random, family: _Family) -> List[RoomPlan]:
+    """One grid draw: targets, fit, band offsets, mirror, rectangles."""
+    targets = _slot_targets(rng, family)
+    widths, depths = _fit_grid(rng, family, targets)
+    offsets = _band_offsets(rng, family, widths)
     mirror_x, mirror_y = rng.random() < 0.5, rng.random() < 0.5
     n_cols, n_rows = len(widths), len(depths)
     if mirror_x:
@@ -788,7 +1136,9 @@ def build_family(rng: random.Random, family: _Family) -> List[RoomPlan]:
     for slot in family.slots:
         col = (n_cols - slot.col - slot.col_span) if mirror_x else slot.col
         row = (n_rows - slot.row - slot.row_span) if mirror_y else slot.row
-        rect = Rect(xs[col], ys[row], xs[col + slot.col_span], ys[row + slot.row_span])
+        shift = offsets[row]
+        rect = Rect(_round(xs[col] + shift), ys[row],
+                    _round(xs[col + slot.col_span] + shift), ys[row + slot.row_span])
         fitting = [room_type for room_type in ROLE_POOLS[slot.role] if _rect_fits_type(rect, room_type)]
         if not fitting:
             raise _AttemptFailed(f"no {slot.role} room fits {rect.w:.2f}x{rect.h:.2f} m "
@@ -818,11 +1168,39 @@ def _shapes_for_count(count: int) -> Tuple[str, ...]:
     return tuple(names)
 
 
+def _weighted_choice(rng: random.Random, names: Sequence[str], weights: Sequence[float]) -> str:
+    """One draw from ``names`` with an explicit weight per name."""
+    total = float(sum(weights))
+    target = rng.random() * total
+    acc = 0.0
+    for name, weight in zip(names, weights):
+        acc += weight
+        if target <= acc:
+            return name
+    return names[-1]
+
+
 def _pick_auto_shape(rng: random.Random, room_count: Optional[int]) -> Tuple[int, str]:
-    """Draw a room count and one of its families from the seed ("--shape auto")."""
-    draw = [2, 3, 3, 4, 4, 4, 5, 5, 6]
-    count = int(_clamp(room_count if room_count is not None else rng.choice(draw), 2, 7))
-    return count, rng.choice(_shapes_for_count(count))
+    """Draw a room count and one of its families from the seed ("--shape auto").
+
+    The arrangement is drawn *first* and carries its own weight
+    (:data:`AUTO_FAMILY_WEIGHT`), so the sweep is not dominated by the one
+    arrangement every room count can host: a plain ``rng.choice`` over the
+    shapes of a count used to draw ``row`` for 66 of 100 seeds of the benchmark,
+    because the retry loop then kept re-drawing around whatever failed.  With no
+    room count requested, a fixed-size family brings its own count and only
+    ``row``/``block`` draw one (from :data:`AUTO_COUNT_DRAW`, as before).
+    """
+    if room_count is None:
+        names = list(AUTO_FAMILY_WEIGHT)
+        shape = _weighted_choice(rng, names, [AUTO_FAMILY_WEIGHT[name] for name in names])
+        family = ROOM_FAMILIES.get(shape)
+        if family is not None:
+            return family.count, shape
+        return int(rng.choice(AUTO_COUNT_DRAW)), shape
+    count = int(_clamp(room_count, 2, 7))
+    names = _shapes_for_count(count)
+    return count, _weighted_choice(rng, names, [AUTO_FAMILY_WEIGHT.get(name, 1.0) for name in names])
 
 
 # --------------------------------------------------------------------------- #
@@ -4175,9 +4553,17 @@ class Scene:
 
 
 def _build_attempt(rng: random.Random, room_count: Optional[int], index: Dict[str, dict],
-                   attempt: int, seed: int = 0, shape: str = "row") -> Tuple[dict, dict]:
+                   attempt: int, seed: int = 0, shape: str = "row",
+                   auto_pick: Optional[Tuple[int, str]] = None) -> Tuple[dict, dict]:
+    auto_fallback = False
     if shape == "auto":
-        room_count, shape = _pick_auto_shape(rng, room_count)
+        if auto_pick is not None and attempt < AUTO_STICKY_ATTEMPTS:
+            # the seed's own draw, kept for its first attempts: re-drawing per
+            # attempt would hand the sweep to the family that fails least often
+            room_count, shape = auto_pick
+        else:
+            auto_fallback = auto_pick is not None
+            room_count, shape = _pick_auto_shape(rng, room_count)
     family = ROOM_FAMILIES.get(shape)
     if family is not None:
         count = family.count if room_count is None else int(room_count)
@@ -4233,6 +4619,7 @@ def _build_attempt(rng: random.Random, room_count: Optional[int], index: Dict[st
         "furniture_slots": slot_report,
         "opening_0": opening0.key() if opening0 is not None else None,
         "door_visual_forecast": forecast,
+        "auto_fallback": auto_fallback,
     }
     return spec, report
 
@@ -4244,10 +4631,11 @@ def generate(seed: int, room_count: Optional[int] = None,
     """Generate one layout; returns the spec dict plus the layout report.
 
     ``shape`` is ``"row"`` (the default single row), ``"block"`` (the same chain
-    of rooms wrapped into two rows, see :func:`plan_rooms_block`), ``"auto"``
-    (the seed draws the room count and one of :data:`ROOM_FAMILIES`), or any
-    family name -- ``compact_2x2``, ``l_shape``, ``central_living``,
-    ``corridor_single``, ``corridor_double``, ``loop``.
+    of rooms wrapped into two rows, with a jog at the corner, see
+    :func:`plan_rooms_block`), ``"auto"`` (the seed draws the room count and one
+    of :data:`ROOM_FAMILIES`), or any family name -- ``compact_2x2``, ``l_shape``,
+    ``central_living``, ``corridor_single``, ``corridor_double``, ``loop``,
+    ``u_shape``, ``terraced``.
 
     ``floors=2`` builds a **duplex** instead: two floors over one footprint,
     each a row of 2-4 rooms (floor 1 = living/kitchen/entry/dining/bathroom,
@@ -4276,13 +4664,19 @@ def generate(seed: int, room_count: Optional[int] = None,
     index = assets_index if assets_index is not None else checks_mod.load_assets_index()
     started = time.time()
     last_error = "unknown"
+    # "--shape auto" draws the arrangement once per seed (its own rng stream, so
+    # the draw does not depend on how many attempts the seed needs) and keeps it
+    # for the first AUTO_STICKY_ATTEMPTS attempts; see _build_attempt.
+    auto_pick = _pick_auto_shape(random.Random(seed * 1000003 + AUTO_PICK_SALT), room_count) \
+        if shape == "auto" and floors < 2 else None
     for attempt in range(attempts):
         rng = random.Random(seed * 1000003 + attempt)
         try:
             if floors >= 2:
                 spec_dict, report = _build_duplex_attempt(rng, room_count, index, attempt, seed)
             else:
-                spec_dict, report = _build_attempt(rng, room_count, index, attempt, seed, shape)
+                spec_dict, report = _build_attempt(rng, room_count, index, attempt, seed, shape,
+                                                   auto_pick)
                 spec = spec_mod.parse_spec(spec_dict)
         except (_AttemptFailed, spec_mod.SpecError) as error:
             last_error = f"{type(error).__name__}: {error}"
@@ -4316,6 +4710,13 @@ def generate(seed: int, room_count: Optional[int] = None,
             "cameras": len(spec_dict["cameras"]),
             "furniture": len(spec_dict.get("furniture", [])),
         }
+        # the arrangement the attempt actually built, next to the requested
+        # ``shape`` (which stays "auto" for a sweep): the batch summaries read
+        # this to count the mix of a run
+        report["stats"]["family"] = report.get("family") or report.get("shape")
+        if auto_pick is not None:
+            report["stats"]["auto_pick"] = list(auto_pick)
+            report["stats"]["auto_fallback"] = bool(report.get("auto_fallback"))
         if verbose:
             print(f"[layout_gen] seed {seed}: {report['stats']} (last rejected attempt: {last_error})"
                   if attempt else f"[layout_gen] seed {seed}: {report['stats']}")

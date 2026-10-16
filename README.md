@@ -77,10 +77,12 @@ builder is the only code that touches Blender, and validators close the loop.
 `blender_agent/layout_gen.py --seed N --out spec.json` turns a seed into a
 furnished spec that passes `checks.py` and the render validator: 2–7 rooms,
 arranged by a **topology family** — `row` (the default railroad flat), `block`
-(the same chain wrapped into two rows), `compact_2x2`, `l_shape`,
-`central_living` (a radiating plan), `corridor_single` / `corridor_double` and
-`loop` (a circulation ring), or `auto` to let the seed draw the room count and
-the family — doors from a semantic spanning tree over the shared walls
+(the same chain wrapped into two rows with a jog at the corner), `compact_2x2`,
+`l_shape`, `central_living` (a radiating plan), `corridor_single` /
+`corridor_double`, `loop` (a circulation ring), `u_shape` (two wings over a
+band, the notch open) and `terraced` (three bands that step sideways into a
+staircase), or `auto` to let the seed draw the room count and the family —
+doors from a semantic spanning tree over the shared walls
 (kitchen next to dining, bathroom private, bedroom never a public way through),
 windows on exterior spans allocated by room function, furniture from the asset
 index **plus the functional `builtin:` fixtures** (kitchen counter run with
@@ -92,6 +94,20 @@ furniture clearance, distance to the doorways, and whether a doorway is on a
 clear sight line).  Small flats get a second living-room camera at least 1.2 m
 away whose bearing differs by ≥ 45°; stands stay ≥ 0.6 m off the furniture.
 See `blender_agent/README.md` for the family table and the semantics rules.
+
+No two bays are alike, and a plan is rarely a plain rectangle.  Each room draws
+the size and the aspect its function wants (`ROOM_SIZE_PREFERENCE`,
+`ROOM_ASPECT`: the living room takes the upper part of its area band, a bedroom
+the middle, a bathroom the low end) and the family grid is then *fitted* to
+those draws, so neighbouring bays of one plan differ, and every room of a flat
+differs from the same room in the next seed.  Whole row bands may slide sideways
+(the 错动 of `_band_offsets`), which turns an L into a jogged wing and the
+terraced family into a staircase; the shift is capped by the shared wall a door
+needs, so a shifted plan stays connected.  `auto` draws the arrangement first,
+weighted per family (`AUTO_FAMILY_WEIGHT`) and sticky for the seed for the first
+attempts (`AUTO_STICKY_ATTEMPTS`), so a sweep is not taken over by whichever
+family fails least often — the benchmark read 66/100 `row` before that, with
+`central_living` at 0/100.
 
 Nothing pins doors or cameras to a line any more.  The validator used to locate
 its door sample column with `atan2(dy, dx)`, which under the `R0` convention is
