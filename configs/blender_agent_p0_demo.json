@@ -1,0 +1,21 @@
+{
+  "unit": "meter",
+  "wall_height": 2.7,
+  "wall_thickness": 0.12,
+  "rooms": [
+    {"id": "living",  "type": "living_room", "polygon": [[0,0],[5.2,0],[5.2,4.1],[0,4.1]], "floor_color": [0.55,0.38,0.22]},
+    {"id": "bedroom", "type": "bedroom",     "polygon": [[5.2,0.35],[9.2,0.35],[9.2,3.75],[5.2,3.75]], "floor_color": [0.6,0.5,0.4]}
+  ],
+  "openings": [
+    {"kind": "door", "between": ["living","bedroom"], "center": [5.2, 2.05], "width": 0.9, "height": 2.1}
+  ],
+  "windows": [
+    {"room": "living",  "wall": [[2.0,0.0],[3.8,0.0]],   "sill": 0.9, "height": 1.4},
+    {"room": "bedroom", "wall": [[6.7,3.75],[8.5,3.75]], "sill": 0.9, "height": 1.4}
+  ],
+  "cameras": [
+    {"name": "0000", "room": "living",  "pos": [2.6, 2.05, 1.5]},
+    {"name": "0001", "room": "bedroom", "pos": [7.2, 2.05, 1.5]}
+  ],
+  "style": {"sun_elevation_deg": 35, "sun_azimuth_deg": 210, "sky_strength": 1.0}
+}
