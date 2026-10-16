@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local toolchain / data (installed by setup scripts, see README)
+third_party/blender-*/
+third_party/assets/*.tar.gz
+
+# Build outputs
+outputs/
+*.log
+
+# Editor
+.idea/
+.vscode/
