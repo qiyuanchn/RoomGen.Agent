@@ -76,6 +76,35 @@ bash scripts/layout_gen_run.sh 7 outputs/layout_gen/seed7   # 生成 → 校验 
 bash scripts/batch_generate.sh 0 20 outputs/layout_gen/sweep20
 ```
 
+### 批次分级、退出码与断点续跑
+
+每个场景的 `run_summary.json` 与 `batch_summary.json` 都按四个层级记账，不再用一个
+"通过"数把只跑布局和内存跳过渲染混在一起：
+
+| 层级 | 含义 |
+|---|---|
+| `layout_ok` | spec 已生成且 `checks.py` 通过 |
+| `render_ok` | 构建 + 渲染 + 导出产出了完整视点集 |
+| `validation_ok` | `validation_report.json` 在请求分辨率下通过（低于标准 2048x1024 时只允许 `canonical_resolution` 失败） |
+| `bundle_ok` | 本次请求的产物完整：只跑布局时为 `layout_ok`；`PANOWORLD_BATCH_RENDER=1` 时要求上面三层全过 |
+
+请求了渲染但没跑完的场景记为 `pending_retry`（内存不足）或 `failed`，**不计入
+passed**；`failure_reasons` / `failed_checks` 给出失败原因分布。`layout_gen_run.sh`
+按失败阶段退出（`0` 成功、`2` 布局、`3` 检查、`4` 渲染、`5` 验证），并把 `run_id`
+写进 `run_summary.json`，批次据此拒绝复用旧报告；内存失败会降参重跑一次（分辨率减
+半、`min(samples, 16)`，可用 `PANOWORLD_RETRY_RES` / `PANOWORLD_RETRY_SAMPLES`
+覆盖）。`batch_generate.sh` 只有在所有场景都 `bundle_ok` 时才退出 0；批量中断后可以
+跳过已完成种子继续跑：
+
+```bash
+PANOWORLD_BATCH_RENDER=1 bash scripts/batch_generate.sh 0 100 outputs/stream
+PANOWORLD_BATCH_RENDER=1 PANOWORLD_BATCH_RESUME=1 \
+  bash scripts/batch_generate.sh 0 100 outputs/stream     # 跳过 bundle_ok 场景
+PANOWORLD_BATCH_SUMMARY_ONLY=1 \
+  bash scripts/batch_generate.sh 0 100 outputs/stream     # 只重建汇总表
+```
+
+
 ## 目录结构
 
 ```
@@ -216,6 +245,7 @@ python tests/test_front3d_math.py                       # 变换顺序单元测�
 bash  tests/test_front3d_replay.sh                      # 回放端到端
 python tests/test_layout_gen.py                         # 布局生成单元测试
 python tests/test_settle.py                             # 家具物理沉降：单元测试 + 盒子自检
+python tests/test_batch_stats.py                        # 批次分级、退出码、重试与断点续跑
 bash  scripts/blender_agent_run.sh configs/blender_agent_p0_demo.json outputs/p0
 ```
 

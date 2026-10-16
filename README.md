@@ -87,6 +87,37 @@ bash scripts/layout_gen_run.sh 7 outputs/layout_gen/seed7   # spec -> checks -> 
 bash scripts/batch_generate.sh 0 20 outputs/layout_gen/sweep20
 ```
 
+### Batch grading, exit codes and resume
+
+Every scene summary and `batch_summary.json` grade four levels instead of one
+pass count:
+
+| level | means |
+|---|---|
+| `layout_ok` | spec written and `checks.py` passed |
+| `render_ok` | build + render + export produced the complete viewpoint set |
+| `validation_ok` | `validation_report.json` passed at the requested resolution (below the canonical 2048x1024 only `canonical_resolution` may fail) |
+| `bundle_ok` | the run produced what it was asked for: `layout_ok` for a layout-only sweep, all three levels when `PANOWORLD_BATCH_RENDER=1` |
+
+A render that was requested but did not complete is `pending_retry` (out of
+memory) or `failed` — never a pass — and `failure_reasons` / `failed_checks`
+carry the distribution.  `layout_gen_run.sh` exits with the failing stage
+(`0` ok, `2` layout, `3` checks, `4` render, `5` validation) and stamps a
+`run_id` into `run_summary.json` so a batch can refuse a stale report; a memory
+failure is retried once at a reduced profile (half resolution, `min(samples,
+16)`; override with `PANOWORLD_RETRY_RES` / `PANOWORLD_RETRY_SAMPLES`).
+`batch_generate.sh` exits 0 only when every scene reached `bundle_ok`, and an
+interrupted run can be finished without repeating completed seeds:
+
+```bash
+PANOWORLD_BATCH_RENDER=1 bash scripts/batch_generate.sh 0 100 outputs/stream
+PANOWORLD_BATCH_RENDER=1 PANOWORLD_BATCH_RESUME=1 \
+  bash scripts/batch_generate.sh 0 100 outputs/stream     # skip bundle_ok scenes
+PANOWORLD_BATCH_SUMMARY_ONLY=1 \
+  bash scripts/batch_generate.sh 0 100 outputs/stream     # rebuild the table only
+```
+
+
 ## Layout
 
 ```
@@ -245,6 +276,7 @@ python tests/test_front3d_math.py                       # transform-order units
 bash  tests/test_front3d_replay.sh                      # replay end-to-end
 python tests/test_layout_gen.py                         # layout generator units
 python tests/test_settle.py                             # furniture settling units + box self-check
+python tests/test_batch_stats.py                        # batch grading, exit codes, retry, resume
 bash  scripts/blender_agent_run.sh configs/blender_agent_p0_demo.json outputs/p0
 ```
 
