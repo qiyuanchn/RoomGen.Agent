@@ -1,0 +1,83 @@
+{
+  "kind": "gen_assets_spec_assets",
+  "created_utc": "2026-10-16T11:20:29+00:00",
+  "spec": "/home/dataset-assist-0/zqyws/RoomGen.Agent/outputs/gen_assets/scene_spec.json",
+  "generated": {
+    "bed_01": {
+      "backend": "trellis",
+      "category": "bed",
+      "prompt": "a modern double bed with a wooden frame, a thick mattress and a fabric headboard",
+      "seed": 1,
+      "api_dimensions_mm": [
+        1620.61,
+        2050.0,
+        966.91
+      ],
+      "gltf": "models/bed_01/bed_01.glb",
+      "generated_utc": "2026-10-16T07:38:55+00:00",
+      "plausible": true,
+      "aspect_ratio_error": 1.048
+    },
+    "cabinet_01": {
+      "backend": "trellis",
+      "category": "cabinet",
+      "prompt": "a modern wooden sideboard cabinet with two doors and a flat top",
+      "seed": 1,
+      "api_dimensions_mm": [
+        1200.0,
+        441.3,
+        1035.88
+      ],
+      "gltf": "models/cabinet_01/cabinet_01.glb",
+      "generated_utc": "2026-10-16T11:20:08+00:00",
+      "plausible": true,
+      "aspect_ratio_error": 1.243
+    },
+    "chair_02": {
+      "backend": "trellis",
+      "category": "chair",
+      "prompt": "a modern dining chair with a wooden frame and a padded seat",
+      "seed": 2,
+      "api_dimensions_mm": [
+        596.12,
+        470.68,
+        950.0
+      ],
+      "gltf": "models/chair_02/chair_02.glb",
+      "generated_utc": "2026-10-16T07:36:14+00:00",
+      "plausible": true,
+      "aspect_ratio_error": 1.372
+    },
+    "sofa_01": {
+      "backend": "trellis",
+      "category": "sofa",
+      "prompt": "a modern three-seat fabric sofa with a low back and short wooden legs",
+      "seed": 1,
+      "api_dimensions_mm": [
+        2100.0,
+        941.15,
+        940.69
+      ],
+      "gltf": "models/sofa_01/sofa_01.glb",
+      "generated_utc": "2026-10-16T07:34:11+00:00",
+      "plausible": true,
+      "aspect_ratio_error": 1.176
+    },
+    "table_01": {
+      "backend": "trellis",
+      "category": "table",
+      "prompt": "a modern rectangular coffee table with a wooden top and slim legs",
+      "seed": 1,
+      "api_dimensions_mm": [
+        1100.0,
+        759.79,
+        385.89
+      ],
+      "gltf": "models/table_01/table_01.glb",
+      "generated_utc": "2026-10-16T11:19:42+00:00",
+      "plausible": true,
+      "aspect_ratio_error": 1.477
+    }
+  },
+  "notes": []
+}

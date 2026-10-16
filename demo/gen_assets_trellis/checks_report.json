@@ -1,0 +1,349 @@
+{
+  "kind": "blender_agent_layout_checks",
+  "pass": false,
+  "checks": [
+    {
+      "name": "assets_resolved",
+      "pass": true,
+      "unknown": []
+    },
+    {
+      "name": "furniture_inside_rooms",
+      "pass": true,
+      "violations": [],
+      "placements": {
+        "sofa": "wall_hug",
+        "rug": "floor_flat",
+        "coffee_table": "free_stand",
+        "chair_east": "free_stand",
+        "chair_west": "free_stand",
+        "cabinet": "wall_hug",
+        "bed": "wall_hug",
+        "nightstand": "wall_hug",
+        "ceiling_lamp": "ceiling",
+        "ceiling_lamp_bed": "ceiling",
+        "plant_tall": "wall_hug",
+        "plant_bedroom": "wall_hug"
+      },
+      "wall_gap_m": {
+        "sofa": 0.06,
+        "rug": 0.5,
+        "coffee_table": 1.1,
+        "chair_east": 0.7147,
+        "chair_west": 0.9647,
+        "cabinet": 0.06,
+        "bed": 0.055,
+        "nightstand": 0.1456,
+        "ceiling_lamp": 1.0342,
+        "ceiling_lamp_bed": 0.9842,
+        "plant_tall": 0.2317,
+        "plant_bedroom": 0.2713
+      }
+    },
+    {
+      "name": "furniture_wall_clearance",
+      "pass": true,
+      "violations": []
+    },
+    {
+      "name": "furniture_rotation_on_grid",
+      "pass": true,
+      "violations": []
+    },
+    {
+      "name": "furniture_no_collision",
+      "pass": true,
+      "violations": [],
+      "exempt": [
+        {
+          "a": "sofa",
+          "b": "rug",
+          "reason": "floor_flat"
+        },
+        {
+          "a": "rug",
+          "b": "coffee_table",
+          "reason": "floor_flat"
+        }
+      ]
+    },
+    {
+      "name": "doors_clear",
+      "pass": true,
+      "violations": [],
+      "doors": {
+        "living|bedroom": {
+          "center": [
+            5.2,
+            2.05
+          ],
+          "width": 0.9,
+          "height": 2.1
+        }
+      }
+    },
+    {
+      "name": "cameras_clear",
+      "pass": false,
+      "violations": [
+        "camera '0001' is 0.240 m from 'bed' (min 0.5 m)"
+      ],
+      "cameras": {
+        "0000": {
+          "room": "living",
+          "pos": [
+            2.6,
+            2.05,
+            1.5
+          ],
+          "wall_gap_m": 2.05,
+          "nearest_furniture": "coffee_table",
+          "furniture_gap_m": 0.62
+        },
+        "0001": {
+          "room": "bedroom",
+          "pos": [
+            7.2,
+            2.05,
+            1.5
+          ],
+          "wall_gap_m": 1.7,
+          "nearest_furniture": "bed",
+          "furniture_gap_m": 0.24
+        }
+      }
+    },
+    {
+      "name": "circulation_reachable",
+      "pass": true,
+      "violations": [],
+      "rooms": {
+        "living": {
+          "free_cells": 4835,
+          "reachable_cells": 4835,
+          "reachable_fraction": 1.0
+        },
+        "bedroom": {
+          "free_cells": 2659,
+          "reachable_cells": 2659,
+          "reachable_fraction": 1.0
+        }
+      },
+      "cameras": {
+        "0000": {
+          "cell": [
+            53,
+            42
+          ],
+          "free": true,
+          "blocked": false,
+          "reachable": true
+        },
+        "0001": {
+          "cell": [
+            145,
+            42
+          ],
+          "free": true,
+          "blocked": false,
+          "reachable": true
+        }
+      },
+      "start": [
+        5.2,
+        2.05
+      ],
+      "grid": {
+        "step_m": 0.05,
+        "free_cells": 13035,
+        "reachable_cells": 7545
+      }
+    }
+  ],
+  "violations": [
+    "camera '0001' is 0.240 m from 'bed' (min 0.5 m)"
+  ],
+  "furniture": {
+    "sofa": {
+      "asset": "gen:sofa_01",
+      "room": "living",
+      "placement": "wall_hug",
+      "aabb": [
+        2.65,
+        3.099,
+        4.75,
+        4.04
+      ],
+      "z": [
+        0.0,
+        0.941
+      ]
+    },
+    "rug": {
+      "asset": "builtin:rug",
+      "room": "living",
+      "placement": "floor_flat",
+      "aabb": [
+        2.1,
+        1.7,
+        4.7,
+        3.2
+      ],
+      "z": [
+        0.0,
+        0.04
+      ]
+    },
+    "coffee_table": {
+      "asset": "gen:table_01",
+      "room": "living",
+      "placement": "free_stand",
+      "aabb": [
+        3.22,
+        1.9,
+        3.98,
+        3.0
+      ],
+      "z": [
+        0.0,
+        0.386
+      ]
+    },
+    "chair_east": {
+      "asset": "gen:chair_02",
+      "room": "living",
+      "placement": "free_stand",
+      "aabb": [
+        3.552,
+        0.715,
+        4.148,
+        1.185
+      ],
+      "z": [
+        0.0,
+        0.95
+      ]
+    },
+    "chair_west": {
+      "asset": "gen:chair_02",
+      "room": "living",
+      "placement": "free_stand",
+      "aabb": [
+        1.052,
+        0.965,
+        1.648,
+        1.435
+      ],
+      "z": [
+        0.0,
+        0.95
+      ]
+    },
+    "cabinet": {
+      "asset": "gen:cabinet_01",
+      "room": "living",
+      "placement": "wall_hug",
+      "aabb": [
+        0.06,
+        1.45,
+        0.501,
+        2.65
+      ],
+      "z": [
+        0.0,
+        1.036
+      ]
+    },
+    "bed": {
+      "asset": "gen:bed_01",
+      "room": "bedroom",
+      "placement": "wall_hug",
+      "aabb": [
+        7.44,
+        0.405,
+        9.06,
+        2.455
+      ],
+      "z": [
+        0.0,
+        0.967
+      ]
+    },
+    "nightstand": {
+      "asset": "ph:painted_wooden_nightstand",
+      "room": "bedroom",
+      "placement": "wall_hug",
+      "aabb": [
+        6.898,
+        0.496,
+        7.402,
+        1.004
+      ],
+      "z": [
+        0.0,
+        0.616
+      ]
+    },
+    "ceiling_lamp": {
+      "asset": "ph:modern_ceiling_lamp_01",
+      "room": "living",
+      "placement": "ceiling",
+      "aabb": [
+        3.484,
+        2.634,
+        3.916,
+        3.066
+      ],
+      "z": [
+        1.748,
+        2.7
+      ]
+    },
+    "ceiling_lamp_bed": {
+      "asset": "ph:modern_ceiling_lamp_01",
+      "room": "bedroom",
+      "placement": "ceiling",
+      "aabb": [
+        7.284,
+        1.334,
+        7.716,
+        1.766
+      ],
+      "z": [
+        1.748,
+        2.7
+      ]
+    },
+    "plant_tall": {
+      "asset": "ph:potted_plant_01",
+      "room": "living",
+      "placement": "wall_hug",
+      "aabb": [
+        0.256,
+        3.232,
+        0.844,
+        3.868
+      ],
+      "z": [
+        0.0,
+        1.351
+      ]
+    },
+    "plant_bedroom": {
+      "asset": "ph:potted_plant_02",
+      "room": "bedroom",
+      "placement": "wall_hug",
+      "aabb": [
+        8.199,
+        2.821,
+        8.901,
+        3.479
+      ],
+      "z": [
+        0.0,
+        0.841
+      ]
+    }
+  },
+  "spec": "/home/dataset-assist-0/zqyws/RoomGen.Agent/outputs/gen_assets/scene_spec.json"
+}

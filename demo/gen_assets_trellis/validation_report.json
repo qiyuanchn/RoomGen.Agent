@@ -1,0 +1,275 @@
+{
+  "kind": "blender_agent_p0_validation",
+  "spec": "outputs/gen_assets/scene_spec.json",
+  "build": "/home/dataset-assist-0/zqyws/RoomGen.Agent/outputs/gen_assets/build",
+  "scene": "/home/dataset-assist-0/zqyws/RoomGen.Agent/outputs/gen_assets/scene",
+  "pass": false,
+  "checks": [
+    {
+      "name": "canonical_resolution",
+      "pass": false,
+      "render_size": [
+        1024,
+        512
+      ],
+      "expected": [
+        2048,
+        1024
+      ]
+    },
+    {
+      "name": "files_present",
+      "pass": true,
+      "missing": []
+    },
+    {
+      "name": "pano_format",
+      "pass": true
+    },
+    {
+      "name": "depth_format",
+      "pass": true
+    },
+    {
+      "name": "extrinsics_valid",
+      "pass": true
+    },
+    {
+      "name": "camera_pose_matches_spec",
+      "pass": true
+    },
+    {
+      "name": "depth_matches_geometry",
+      "pass": true,
+      "thresholds": {
+        "valid_fraction_min": 0.995,
+        "median_error_max_m": 0.005,
+        "p95_error_max_m": 0.02
+      },
+      "cameras": [
+        {
+          "camera": "0000",
+          "valid_fraction": 1.0,
+          "pixels": 524288,
+          "valid_pixels": 524288,
+          "invalid_in_render": 0,
+          "no_geometry_hit": 0,
+          "median_error_m": 0.00025128555297859734,
+          "p95_error_m": 0.0004709339141846236,
+          "max_error_m": 0.43230698966979997,
+          "cast_seconds": 18.5,
+          "door_spot_check": {
+            "role": "informational",
+            "pass": true,
+            "doors": [
+              {
+                "between": [
+                  "living",
+                  "bedroom"
+                ],
+                "opening": 0,
+                "column": 512,
+                "row": 283,
+                "door_distance_m": 2.639,
+                "rendered_depth_m": 6.232,
+                "ratio": 2.362,
+                "visible": true
+              }
+            ],
+            "visible": 1,
+            "of": 1,
+            "visible_fraction": 1.0,
+            "ratio": 2.362,
+            "note": "occlusion is a coverage number here; the scene gate is door_openings_geometry"
+          },
+          "pass": true
+        },
+        {
+          "camera": "0001",
+          "valid_fraction": 1.0,
+          "pixels": 524288,
+          "valid_pixels": 524288,
+          "invalid_in_render": 0,
+          "no_geometry_hit": 0,
+          "median_error_m": 0.0002485616207124064,
+          "p95_error_m": 0.0004704008102416335,
+          "max_error_m": 2.177581356048584,
+          "cast_seconds": 18.3,
+          "door_spot_check": {
+            "role": "informational",
+            "pass": true,
+            "doors": [
+              {
+                "between": [
+                  "living",
+                  "bedroom"
+                ],
+                "opening": 0,
+                "column": 2,
+                "row": 292,
+                "door_distance_m": 2.05,
+                "rendered_depth_m": 6.754,
+                "ratio": 3.295,
+                "visible": true
+              }
+            ],
+            "visible": 1,
+            "of": 1,
+            "visible_fraction": 1.0,
+            "ratio": 3.295,
+            "note": "occlusion is a coverage number here; the scene gate is door_openings_geometry"
+          },
+          "pass": true
+        }
+      ],
+      "ply": "outputs/gen_assets/build/furnished.ply"
+    },
+    {
+      "name": "door_openings_geometry",
+      "pass": true,
+      "ply": "outputs/gen_assets/build/shell.ply",
+      "openings": 1,
+      "probe_m": 0.35,
+      "wall_half_thickness_m": 0.06,
+      "doors": [
+        {
+          "index": 0,
+          "between": [
+            "living",
+            "bedroom"
+          ],
+          "center": [
+            5.2,
+            2.05
+          ],
+          "spec_width_m": 0.9,
+          "spec_height_m": 2.1,
+          "sides": {
+            "living": {
+              "probe_sign": 1.0,
+              "open_fraction": 1.0,
+              "wall_solid_fraction": 1.0,
+              "open_width_m": 0.88,
+              "open_height_m": 2.09,
+              "width_centre_offset_m": 0.0
+            },
+            "bedroom": {
+              "probe_sign": -1.0,
+              "open_fraction": 1.0,
+              "wall_solid_fraction": 1.0,
+              "open_width_m": 0.88,
+              "open_height_m": 2.09,
+              "width_centre_offset_m": 0.0
+            }
+          },
+          "measured_width_m": 0.88,
+          "measured_height_m": 2.09,
+          "pass": true,
+          "failures": []
+        }
+      ]
+    },
+    {
+      "name": "door_visibility_coverage",
+      "pass": true,
+      "role": "informational",
+      "cameras": {
+        "0000": {
+          "role": "informational",
+          "pass": true,
+          "doors": [
+            {
+              "between": [
+                "living",
+                "bedroom"
+              ],
+              "opening": 0,
+              "column": 512,
+              "row": 283,
+              "door_distance_m": 2.639,
+              "rendered_depth_m": 6.232,
+              "ratio": 2.362,
+              "visible": true
+            }
+          ],
+          "visible": 1,
+          "of": 1,
+          "visible_fraction": 1.0,
+          "ratio": 2.362,
+          "note": "occlusion is a coverage number here; the scene gate is door_openings_geometry"
+        },
+        "0001": {
+          "role": "informational",
+          "pass": true,
+          "doors": [
+            {
+              "between": [
+                "living",
+                "bedroom"
+              ],
+              "opening": 0,
+              "column": 2,
+              "row": 292,
+              "door_distance_m": 2.05,
+              "rendered_depth_m": 6.754,
+              "ratio": 3.295,
+              "visible": true
+            }
+          ],
+          "visible": 1,
+          "of": 1,
+          "visible_fraction": 1.0,
+          "ratio": 3.295,
+          "note": "occlusion is a coverage number here; the scene gate is door_openings_geometry"
+        }
+      },
+      "doors_visible": 2,
+      "doors_checked": 2,
+      "visible_fraction": 1.0,
+      "note": "per-camera door visibility; reasonable occlusion is a number here, not a failure"
+    },
+    {
+      "name": "caster_cross_check",
+      "pass": true,
+      "available": true,
+      "sample_rays": 904,
+      "triangles": 331672,
+      "brute_force_seconds": 49.97,
+      "max_abs_delta_m": 9.378821310690455e-07,
+      "hit_mask_mismatches": 0,
+      "brute_force_pass": true,
+      "delta_note": "float32 BVH vs float64 brute force",
+      "trimesh_rtree_available": false,
+      "trimesh_rtree_note": "rtree not installed; trimesh's RayMeshIntersector was unavailable"
+    },
+    {
+      "name": "map_json_reachable",
+      "pass": true,
+      "graph": {
+        "0000": [
+          "0001"
+        ],
+        "0001": [
+          "0000"
+        ]
+      },
+      "expected": {
+        "0000": [
+          "0001"
+        ],
+        "0001": [
+          "0000"
+        ]
+      }
+    },
+    {
+      "name": "topdown_non_empty",
+      "pass": true,
+      "shape": [
+        715,
+        1276
+      ],
+      "std": 66.1438695607961
+    }
+  ]
+}
