@@ -19,14 +19,15 @@
 #   4  render requested but not completed: pipeline failure, or still short of
 #      memory after the one reduced-profile retry (pending_retry)
 #   5  render ok but validation failed at the requested resolution
+#   6  the visual/rule review (PANOWORLD_REVIEW=1) failed
 #
 # The summary grades the stages separately so a batch can tell a usable scene
 # package from a layout-only run:
-#   stages: layout / checks / render / validation
-#   ok:     layout_ok, render_ok, validation_ok, bundle_ok
+#   stages: layout / checks / render / validation [/ review]
+#   ok:     layout_ok, render_ok, validation_ok, bundle_ok [, review_ok]
 # bundle_ok = layout_ok when the render was not requested, layout_ok +
 # render_ok + validation_ok when it was -- i.e. "this run produced what it
-# was asked for".
+# was asked for" -- plus review_ok whenever the review was enabled.
 #
 # Environment:
 #   PANOWORLD_RES / PANOWORLD_SAMPLES   render settings (default 1024x512, 32)
@@ -42,6 +43,19 @@
 #                                       and height, min(samples, 16))
 #   PANOWORLD_RUN_ID                    run id recorded in run_summary.json
 #                                       (batch_generate.sh mints one per seed)
+#   PANOWORLD_REVIEW=1                  run blender_agent/review.py: a spec
+#                                       review before the render and a full
+#                                       review (build + panoramas) after it;
+#                                       the summary gains stages.review and
+#                                       ok.review_ok, bundle_ok needs it, and a
+#                                       failing review exits 6
+#   PANOWORLD_REVIEW_REPAIR=1           when the review fails, apply its spec
+#                                       tweaks once (furnish an empty room,
+#                                       move a camera) and re-run the stages
+#                                       that depend on the spec
+#   PANOWORLD_REVIEW_STRICT=1           warnings fail the review as well
+#   REVIEW_CMD                          external reviewer handed the panorama
+#                                       paths (prints a JSON verdict)
 #   PANOWORLD_PIPELINE_SH               pipeline script to run (default
 #                                       scripts/blender_agent_run.sh; tests
 #                                       substitute a fake)
@@ -62,6 +76,8 @@ STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 START_EPOCH="${SECONDS}"
 RENDER_REQUESTED=1
 [[ "${SKIP_RENDER}" == "1" ]] && RENDER_REQUESTED=0
+REVIEW="${PANOWORLD_REVIEW:-0}"
+REVIEW_REPAIR="${PANOWORLD_REVIEW_REPAIR:-0}"
 
 # render defaults come from configs/layout_gen_demo.json unless the environment
 # overrides them; the helper prints an empty line when the key or file is absent
@@ -99,7 +115,10 @@ VALIDATION="${OUT}/validation_report.json"
 # A new run into an existing directory must not let an old report masquerade
 # as this run's result: remove the reports this run is about to write and let
 # the stage statuses below decide what is regenerated.
-rm -f "${SPEC}" "${REPORT}" "${CHECKS}" "${VALIDATION}" "${OUT}/run_summary.json"
+rm -f "${SPEC}" "${REPORT}" "${CHECKS}" "${VALIDATION}" "${OUT}/run_summary.json" \
+      "${OUT}/spec.pre_review.json" \
+      "${OUT}/review_report.json" "${OUT}/review_prerender.json" "${OUT}/review_repair.json" \
+      "${OUT}/review_pre.log" "${OUT}/review_post.log" "${OUT}/review_repair.log"
 
 # Headroom of this container's cgroup, in MB.
 #
@@ -150,9 +169,10 @@ echo "   out     : ${OUT}"
 echo "   run id  : ${RUN_ID}"
 echo "   rooms   : ${ROOMS:-<seed>}"
 echo "   render  : ${RES}, ${SAMPLES} samples (skip=${SKIP_RENDER})"
+echo "   review  : ${REVIEW} (repair=${REVIEW_REPAIR})"
 
 echo
-echo "--- [1/3] generate the layout ---"
+echo "--- [1/4] generate the layout ---"
 GEN_ARGS=(--seed "${SEED}" --out "${SPEC}" --report "${REPORT}")
 [[ -n "${ROOMS}" ]] && GEN_ARGS+=(--rooms "${ROOMS}")
 set +e
@@ -163,11 +183,105 @@ set -e
 CHECKS_STATUS="not_run"
 if [[ ${GEN_STATUS} -eq 0 ]]; then
   echo
-  echo "--- [2/3] placement checks ---"
+  echo "--- [2/4] placement checks ---"
   set +e
   "${HOSTPY}" "${REPO}/blender_agent/checks.py" "${SPEC}" --report "${CHECKS}"
   CHECKS_STATUS=$?
   set -e
+fi
+
+# --------------------------------------------------------------------------- #
+# review (blender_agent/review.py)
+#
+# `pre` reviews the spec alone, so an empty room or a stand in a wall is caught
+# *before* a render is paid for; `post` reviews the built package (settled
+# manifest, panoramas) and is the one the summary grades.  When the review
+# fails and PANOWORLD_REVIEW_REPAIR=1, review.py patches spec.json (furnish an
+# empty room, move a camera) -- the patch is validated by checks.py before it is
+# written -- and the stages that depend on the spec run again, once.
+# --------------------------------------------------------------------------- #
+REVIEW_RC=0
+REVIEW_PRE_RC=0
+REVIEW_STATUS="not_run"
+REVIEW_PRE_STATUS="not_run"
+REVIEW_REPAIR_STATUS="not_attempted"
+REVIEW_REPAIR_USED=0
+REPAIR_ATTEMPT=0
+
+review_stage() { # <pre|post>
+  local phase="$1"
+  local report="${OUT}/review_report.json"
+  local args=()
+  if [[ "${phase}" == "pre" ]]; then
+    report="${OUT}/review_prerender.json"
+    args+=(--spec-only)
+  fi
+  [[ "${PANOWORLD_REVIEW_STRICT:-0}" == "1" ]] && args+=(--strict)
+  echo
+  echo "--- review (${phase}): blender_agent/review.py ---"
+  set +e
+  "${HOSTPY}" "${REPO}/blender_agent/review.py" "${OUT}" --json "${report}" "${args[@]}" \
+      > "${OUT}/review_${phase}.log" 2>&1
+  local status=$?
+  set -e
+  sed 's/^/    /' "${OUT}/review_${phase}.log" || true
+  if [[ "${phase}" == "pre" ]]; then
+    REVIEW_PRE_RC=${status}
+    if (( status == 0 )); then REVIEW_PRE_STATUS="ok"
+    elif (( status == 2 )); then REVIEW_PRE_STATUS="error"
+    else REVIEW_PRE_STATUS="failed"; fi
+  else
+    REVIEW_RC=${status}
+    if (( status == 0 )); then REVIEW_STATUS="ok"
+    elif (( status == 2 )); then REVIEW_STATUS="error"
+    else REVIEW_STATUS="failed"; fi
+  fi
+  return 0
+}
+
+# Applies the review's spec tweaks; sets REVIEW_REPAIR_STATUS ("applied" when
+# spec.json changed).  Never fails the script.
+review_repair_stage() { # <pre|post>
+  [[ -f "${SPEC}" ]] || return 0
+  local report="${OUT}/review_report.json"
+  [[ "$1" == "pre" ]] && report="${OUT}/review_prerender.json"
+  echo
+  echo "--- review repair (${1}): review.py --apply-repair ---"
+  set +e
+  "${HOSTPY}" "${REPO}/blender_agent/review.py" "${OUT}" --apply-repair --report "${report}" \
+      > "${OUT}/review_repair.log" 2>&1
+  local status=$?
+  set -e
+  sed 's/^/    /' "${OUT}/review_repair.log" || true
+  if (( status == 0 )); then
+    REVIEW_REPAIR_STATUS="applied"
+  else
+    REVIEW_REPAIR_STATUS="nothing_to_do"
+  fi
+  return 0
+}
+
+# The checks a repaired spec must pass before it is rendered again.
+rerun_checks() {
+  set +e
+  "${HOSTPY}" "${REPO}/blender_agent/checks.py" "${SPEC}" --report "${CHECKS}"
+  CHECKS_STATUS=$?
+  set -e
+  echo "    checks after repair: ${CHECKS_STATUS}"
+  return 0
+}
+
+if [[ "${REVIEW}" == "1" && ${GEN_STATUS} -eq 0 && "${CHECKS_STATUS}" == "0" ]]; then
+  review_stage pre
+  if [[ "${REVIEW_PRE_STATUS}" == "failed" && "${REVIEW_REPAIR}" == "1" ]]; then
+    review_repair_stage pre
+    if [[ "${REVIEW_REPAIR_STATUS}" == "applied" ]]; then
+      REVIEW_REPAIR_USED=1
+      REPAIR_ATTEMPT=$(( REPAIR_ATTEMPT + 1 ))
+      rerun_checks
+      review_stage pre
+    fi
+  fi
 fi
 
 # Render phase.  Each attempt appends a row to ATTEMPTS_TSV:
@@ -235,7 +349,7 @@ elif [[ ${GEN_STATUS} -ne 0 || "${CHECKS_STATUS}" != "0" ]]; then
 else
   RENDER_PHASE="attempts"
   echo
-  echo "--- [3/3] blender pipeline (need ${MIN_FREE_MB} MB free) ---"
+  echo "--- [3/4] blender pipeline (need ${MIN_FREE_MB} MB free) ---"
   attempt_render 1 "${RES}" "${SAMPLES}" "${MIN_FREE_MB}"
   RETRY_RES="${PANOWORLD_RETRY_RES:-$(half_res "${RES}")}"
   RETRY_SAMPLES="${PANOWORLD_RETRY_SAMPLES:-$(default_retry_samples "${SAMPLES}")}"
@@ -250,6 +364,25 @@ else
   fi
 fi
 
+# Post-render review of the built package, and the one repair retry: when the
+# review fails on something review.py can patch, the spec changes and the render
+# that produced the old build is repeated with the same profile.
+if [[ "${REVIEW}" == "1" && -f "${SPEC}" ]]; then
+  review_stage post
+  if [[ "${REVIEW_STATUS}" == "failed" && "${REVIEW_REPAIR}" == "1" && ${REVIEW_REPAIR_USED} -eq 0 ]]; then
+    review_repair_stage post
+    if [[ "${REVIEW_REPAIR_STATUS}" == "applied" ]]; then
+      REVIEW_REPAIR_USED=1
+      rerun_checks
+      if [[ "${RENDER_PHASE}" == "attempts" && "${CHECKS_STATUS}" == "0" ]]; then
+        echo "layout_gen_run.sh: re-rendering the repaired spec (attempt 3)"
+        attempt_render 3 "${RES}" "${SAMPLES}" "${MIN_FREE_MB}"
+      fi
+      review_stage post
+    fi
+  fi
+fi
+
 FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 export LGR_OUT="${OUT}" LGR_SEED="${SEED}" LGR_RUN_ID="${RUN_ID}"
 export LGR_RENDER_REQUESTED="${RENDER_REQUESTED}" LGR_RENDER_PHASE="${RENDER_PHASE}"
@@ -259,6 +392,9 @@ export LGR_LAST_EXIT="${LAST_EXIT}" LGR_LAST_STATUS="${LAST_STATUS}"
 export LGR_RETRY_USED="${RETRY_USED}" LGR_ATTEMPTS_TSV="${ATTEMPTS_TSV}"
 export LGR_STARTED_AT="${STARTED_AT}" LGR_FINISHED_AT="${FINISHED_AT}"
 export LGR_ELAPSED="$(( SECONDS - START_EPOCH ))"
+export LGR_REVIEW="${REVIEW}" LGR_REVIEW_STATUS="${REVIEW_STATUS}"
+export LGR_REVIEW_PRE_STATUS="${REVIEW_PRE_STATUS}" LGR_REVIEW_RC="${REVIEW_RC}"
+export LGR_REVIEW_REPAIR_STATUS="${REVIEW_REPAIR_STATUS}" LGR_REVIEW_REPAIR_USED="${REVIEW_REPAIR_USED}"
 
 set +e
 "${HOSTPY}" - <<'PY'
@@ -276,6 +412,12 @@ samples = int(os.environ["LGR_SAMPLES"])
 last_exit = int(os.environ["LGR_LAST_EXIT"])
 last_status = os.environ["LGR_LAST_STATUS"]
 retry_used = os.environ["LGR_RETRY_USED"] == "1"
+review_enabled = os.environ.get("LGR_REVIEW", "0") == "1"
+review_status = os.environ.get("LGR_REVIEW_STATUS", "not_run")
+review_pre_status = os.environ.get("LGR_REVIEW_PRE_STATUS", "not_run")
+review_rc = int(os.environ.get("LGR_REVIEW_RC", "0"))
+review_repair_status = os.environ.get("LGR_REVIEW_REPAIR_STATUS", "not_attempted")
+review_repair_used = os.environ.get("LGR_REVIEW_REPAIR_USED", "0") == "1"
 
 attempts = []
 for line in os.environ.get("LGR_ATTEMPTS_TSV", "").splitlines():
@@ -396,6 +538,33 @@ if render_requested:
 else:
     bundle_ok = layout_ok
 
+# --- review ---------------------------------------------------------------- #
+review = None
+review_ok = None
+if review_enabled:
+    report_path = os.path.join(out, "review_report.json")
+    if os.path.isfile(report_path):
+        with open(report_path, encoding="utf-8") as handle:
+            review = json.load(handle)
+    review_ok = bool(review.get("pass")) if review is not None else False
+    summary["review"] = {
+        "status": review_status,
+        "pass": review_ok,
+        "pre_render_status": review_pre_status,
+        "exit_code": review_rc,
+        "report": report_path if review is not None else None,
+        "scopes": (review or {}).get("scopes"),
+        "score": (review or {}).get("score"),
+        "issues": {"fail": ((review or {}).get("stats") or {}).get("issues_fail"),
+                   "warn": ((review or {}).get("stats") or {}).get("issues_warn")},
+        "failed_checks": sorted({issue["check"] for issue in (review or {}).get("issues", [])
+                                 if issue.get("severity") == "fail"}),
+        "issue_kinds": sorted({issue.get("kind") for issue in (review or {}).get("issues", [])
+                               if issue.get("severity") == "fail" and issue.get("kind")}),
+        "repair": {"used": review_repair_used, "status": review_repair_status},
+    }
+    bundle_ok = bool(bundle_ok and review_ok)
+
 # --- failure / exit code --------------------------------------------------- #
 failure = None
 if not gen_ok:
@@ -430,6 +599,12 @@ elif render_requested and validation_ok is False:
     failure = {"stage": "validation", "kind": "validation_failed",
                "detail": ", ".join(failed_validation_checks) or "validation failed",
                "checks": failed_validation_checks}
+elif review_enabled and review_ok is False:
+    kinds = ((summary.get("review") or {}).get("issue_kinds") or [])
+    failure = {"stage": "review",
+               "kind": "review_error" if review_status == "error" else "review_failed",
+               "detail": ", ".join(kinds) or "the review reported failures",
+               "checks": (summary.get("review") or {}).get("failed_checks") or []}
 
 if failure is None:
     exit_code = 0
@@ -439,8 +614,10 @@ elif failure["stage"] == "checks":
     exit_code = 3
 elif failure["stage"] == "render":
     exit_code = 4
-else:
+elif failure["stage"] == "validation":
     exit_code = 5
+else:
+    exit_code = 6
 
 summary["failure"] = failure
 summary["exit_code"] = exit_code
@@ -467,6 +644,9 @@ summary["ok"] = {
     "validation_ok": validation_ok,
     "bundle_ok": bool(bundle_ok),
 }
+if review_enabled:
+    summary["stages"]["review"] = review_status
+    summary["ok"]["review_ok"] = review_ok
 
 with open(os.path.join(out, "run_summary.json"), "w", encoding="utf-8") as handle:
     json.dump(summary, handle, indent=2)
@@ -479,11 +659,19 @@ else:
                        % (validation.get("pass"), res,
                           "PASS" if validation.get("pass_at_resolution") else "FAIL",
                           (", failed %s" % validation["failed"]) if validation.get("failed") else ""))
+review_note = ""
+if review_enabled:
+    review_block = summary.get("review") or {}
+    review_note = (" review=%s (%s fail / %s warn) "
+                   % ("PASS" if review_block.get("pass") else review_block.get("status", "FAIL"),
+                      (review_block.get("issues") or {}).get("fail"),
+                      (review_block.get("issues") or {}).get("warn")))
 print()
 print(f"layout_gen: seed {seed}: "
       f"layout={'PASS' if layout_ok else 'FAIL'} "
       f"render={render_status} "
       f"{validation_note} "
+      f"{review_note}"
       f"bundle={'PASS' if bundle_ok else 'FAIL'} "
       f"run_id={run_id}")
 if failure is not None:

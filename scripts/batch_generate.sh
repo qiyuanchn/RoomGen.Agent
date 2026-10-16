@@ -10,11 +10,13 @@
 #
 # batch_summary.json (schema_version 2) grades every scene on four levels --
 # layout_ok / render_ok / validation_ok / bundle_ok -- instead of folding
-# layout-only runs and memory-skipped renders into one pass count.  "passed"
-# counts bundle_ok only: a render that was requested but did not complete is
-# pending_retry (or failed), never a pass; failure_reasons / failed_checks
-# carry the distribution.  A failing scene never stops the batch, but the
-# script exits 0 only when every scene reached bundle_ok (1 otherwise).
+# layout-only runs and memory-skipped renders into one pass count.  With
+# PANOWORLD_REVIEW=1 the child runs also review every scene and the levels gain
+# a fifth line, review_ok.  "passed" counts bundle_ok only: a render that was
+# requested but did not complete is pending_retry (or failed), never a pass;
+# failure_reasons / failed_checks / review_issues carry the distribution.  A
+# failing scene never stops the batch, but the script exits 0 only when every
+# scene reached bundle_ok (1 otherwise).
 #
 # Environment:
 #   PANOWORLD_BATCH_RENDER=1        also run the Blender pipeline for every
@@ -26,6 +28,9 @@
 #   PANOWORLD_BATCH_SUMMARY_ONLY=1  rebuild batch_summary.json from the
 #                                   existing scene dirs and run nothing
 #   PANOWORLD_BATCH_SEEDS=0,7,13    explicit seed list (START/COUNT ignored)
+#   PANOWORLD_REVIEW=1              forward the visual/rule review to the
+#                                   per-scene runs and grade review_ok
+#   PANOWORLD_REVIEW_REPAIR=1       let a failing review patch its spec once
 #   PANOWORLD_RES / PANOWORLD_SAMPLES / PANOWORLD_MIN_FREE_MB / PANOWORLD_ROOMS
 #                                   forwarded to layout_gen_run.sh
 set -euo pipefail
@@ -41,6 +46,7 @@ ROOMS="${PANOWORLD_ROOMS:-}"
 SEED_LIST="${PANOWORLD_BATCH_SEEDS:-}"
 RESUME="${PANOWORLD_BATCH_RESUME:-0}"
 SUMMARY_ONLY="${PANOWORLD_BATCH_SUMMARY_ONLY:-0}"
+REVIEW="${PANOWORLD_REVIEW:-0}"
 BATCH_ID="${PANOWORLD_BATCH_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -51,6 +57,7 @@ echo "   batch id: ${BATCH_ID}"
 echo "   seeds   : ${START} .. $(( START + COUNT - 1 ))"
 echo "   out     : ${ROOT}"
 echo "   render  : ${RENDER} (resume=${RESUME}, summary_only=${SUMMARY_ONLY})"
+echo "   review  : ${REVIEW}"
 
 SEEDS=()
 if [[ -n "${SEED_LIST}" ]]; then
@@ -65,11 +72,12 @@ RESUMED_SEEDS=()
 
 # Prints "resume" when an existing scene holds a complete bundle of the
 # requested mode (and the artifacts are still on disk), "rerun" otherwise.
-resume_decision() { # <seed> <render_requested>
-  "${HOSTPY}" - "${ROOT}" "$1" "$2" <<'PY'
+resume_decision() { # <seed> <render_requested> <review_requested>
+  "${HOSTPY}" - "${ROOT}" "$1" "$2" "$3" <<'PY'
 import json, os, sys
 
-root, seed, render_expected = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "1"
+root, seed = sys.argv[1], int(sys.argv[2])
+render_expected, review_expected = sys.argv[3] == "1", sys.argv[4] == "1"
 scene_dir = os.path.join(root, "scene_%04d" % seed)
 summary_path = os.path.join(scene_dir, "run_summary.json")
 if not os.path.isfile(summary_path):
@@ -82,9 +90,13 @@ except Exception:
 ok = summary.get("ok") or {}
 if not ok.get("bundle_ok") or bool(summary.get("render_requested")) != render_expected:
     print("rerun"); raise SystemExit
+if review_expected and ok.get("review_ok") is not True:
+    print("rerun"); raise SystemExit
 needed = ["spec.json", "checks_report.json"]
 if render_expected:
     needed.append("validation_report.json")
+if review_expected:
+    needed.append("review_report.json")
 missing = [name for name in needed if not os.path.isfile(os.path.join(scene_dir, name))]
 if render_expected:
     viewpoints = os.path.join(scene_dir, "scene", "viewpoints")
@@ -96,13 +108,15 @@ PY
 
 RENDER_REQUESTED=1
 [[ "${RENDER}" == "1" ]] || RENDER_REQUESTED=0
+REVIEW_REQUESTED=1
+[[ "${REVIEW}" == "1" ]] || REVIEW_REQUESTED=0
 
 if [[ "${SUMMARY_ONLY}" != "1" ]]; then
   for seed in "${SEEDS[@]}"; do
     scene_dir="${ROOT}/scene_$(printf '%04d' "${seed}")"
     mkdir -p "${scene_dir}"
     echo
-    if [[ "${RESUME}" == "1" ]] && [[ "$(resume_decision "${seed}" "${RENDER_REQUESTED}")" == "resume" ]]; then
+    if [[ "${RESUME}" == "1" ]] && [[ "$(resume_decision "${seed}" "${RENDER_REQUESTED}" "${REVIEW_REQUESTED}")" == "resume" ]]; then
       RESUMED_SEEDS+=("${seed}")
       echo "--- seed ${seed} -> ${scene_dir} --- (resumed: existing bundle kept)"
       continue
@@ -137,29 +151,35 @@ fi
 
 set +e
 "${HOSTPY}" - "${ROOT}" "${START}" "${RENDER}" "${BATCH_ID}" "${STARTED_AT}" \
-  "${RESUME}" "${SUMMARY_ONLY}" "${RESUMED_CSV}" "${SEEDS[@]}" <<'PY'
+  "${RESUME}" "${SUMMARY_ONLY}" "${RESUMED_CSV}" "${REVIEW}" "${SEEDS[@]}" <<'PY'
 import datetime, json, os, sys
 
 root, start, render, batch_id, started_at = sys.argv[1:6]
 resume, summary_only = sys.argv[6] == "1", sys.argv[7] == "1"
 resumed = {int(value) for value in sys.argv[8].split(",") if value}
-seeds = [int(value) for value in sys.argv[9:]]
+review_requested = sys.argv[9] == "1"
+seeds = [int(value) for value in sys.argv[10:]]
 render_requested = render == "1"
 
 levels = {"layout_ok": 0, "render_ok": 0, "validation_ok": 0, "bundle_ok": 0}
 if not render_requested:
     levels["render_ok"] = None
     levels["validation_ok"] = None
+if review_requested:
+    levels["review_ok"] = 0
 failure_reasons = {}
 failed_checks = {}
+review_issues = {}
 rows = []
 
 
-def bundle_problems(scene_dir, render_expected):
+def bundle_problems(scene_dir, render_expected, review_expected):
     """Final artifacts a bundle_ok row must still have on disk."""
     needed = ["spec.json", "checks_report.json"]
     if render_expected:
         needed.append("validation_report.json")
+    if review_expected:
+        needed.append("review_report.json")
     missing = [name for name in needed if not os.path.isfile(os.path.join(scene_dir, name))]
     if render_expected:
         viewpoints = os.path.join(scene_dir, "scene", "viewpoints")
@@ -254,7 +274,7 @@ for seed in seeds:
             row["ok"] = ok
             row["failure"] = failure
             if ok.get("bundle_ok"):
-                problems = bundle_problems(scene_dir, render_requested)
+                problems = bundle_problems(scene_dir, render_requested, review_requested)
                 if problems:
                     row["ok"] = dict(ok, bundle_ok=False)
                     row["failure"] = {"stage": "bundle", "kind": "bundle_artifacts_missing",
@@ -273,6 +293,13 @@ for seed in seeds:
         row["validation_pass"] = None if validation is None else bool(validation.get("pass"))
         row["validation_pass_at_resolution"] = None if validation is None \
             else bool(validation.get("pass_at_resolution", validation.get("pass")))
+        if review_requested:
+            review = summary.get("review") or {}
+            row["review_pass"] = row["ok"].get("review_ok")
+            row["review_score"] = review.get("score")
+            row["review_issues"] = review.get("issues") or {}
+            row["review_failed_checks"] = review.get("failed_checks") or []
+            row["review_repair"] = (review.get("repair") or {}).get("status")
 
     ok = row["ok"]
     if ok.get("bundle_ok"):
@@ -289,6 +316,8 @@ for seed in seeds:
             levels["render_ok"] += 1
         if ok.get("validation_ok") is True:
             levels["validation_ok"] += 1
+    if review_requested and ok.get("review_ok") is True:
+        levels["review_ok"] += 1
     if ok.get("bundle_ok"):
         levels["bundle_ok"] += 1
 
@@ -298,6 +327,9 @@ for seed in seeds:
         failure_reasons[key] = failure_reasons.get(key, 0) + 1
         for name in failure.get("checks", []) or []:
             failed_checks[name] = failed_checks.get(name, 0) + 1
+    if review_requested and row["status"] != "bundle_ok":
+        for name in row.get("review_failed_checks") or []:
+            review_issues[name] = review_issues.get(name, 0) + 1
     rows.append(row)
 
 pending_retry = sum(1 for row in rows if row["status"] == "pending_retry")
@@ -312,16 +344,19 @@ summary = {
     "count": len(seeds),
     "seeds": seeds,
     "render_requested": render_requested,
+    "review_requested": review_requested,
     "resume": resume,
     "summary_only": summary_only,
     "bundle_definition": "layout_ok when the render was not requested; "
-                         "layout_ok + render_ok + validation_ok when it was",
+                         "layout_ok + render_ok + validation_ok when it was"
+                         + ("; plus review_ok when the review was requested" if review_requested else ""),
     "levels": levels,
     "passed": levels["bundle_ok"],
     "pending_retry": pending_retry,
     "failed": failed,
     "failure_reasons": failure_reasons,
     "failed_checks": failed_checks,
+    "review_issues": review_issues,
     "scenes": rows,
 }
 summary["finished_at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -336,27 +371,42 @@ for row in rows:
     if ok.get("validation_ok") and row.get("validation_pass_at_resolution") is not None \
             and row.get("validation_pass") is False and row.get("validation_pass_at_resolution"):
         render_note = " [canonical_resolution]"
+    review_note = ""
+    if review_requested:
+        if row.get("review_pass"):
+            issues = row.get("review_issues") or {}
+            review_note = " review=PASS(%sw)" % (issues.get("warn") or 0)
+        elif row.get("review_pass") is False:
+            review_note = " review=FAIL(%s)" % ",".join(row.get("review_failed_checks") or [])[:40]
+        else:
+            review_note = " review=not_run"
     detail = ""
     if row["status"] != "bundle_ok" and row.get("failure"):
         detail = "  <- %s: %s" % (("%s:%s" % (row['failure'].get('stage'), row['failure'].get('kind'))),
                                   row["failure"].get("detail", ""))
-    print("  seed %-4d %-13s%s layout=%s render=%s validation=%s rooms=%s cams=%s furniture=%s attempts=%s%s%s"
+    print("  seed %-4d %-13s%s layout=%s render=%s validation=%s%s rooms=%s cams=%s furniture=%s attempts=%s%s%s"
           % (row["seed"], row["status"], " (resumed)" if row["resumed"] else "",
              row["stages"].get("layout"), row["stages"].get("render"),
-             row["stages"].get("validation"),
+             row["stages"].get("validation"), review_note,
              len(row.get("rooms") or []), row.get("cameras"), row.get("furniture"),
              row.get("generation_attempts"), render_note, detail))
 if render_requested:
-    print("  levels: layout_ok %d/%d, render_ok %d/%d, validation_ok %d/%d, bundle_ok %d/%d "
+    review_level = ", review_ok %d/%d" % (levels.get("review_ok"), len(rows)) if review_requested else ""
+    print("  levels: layout_ok %d/%d, render_ok %d/%d, validation_ok %d/%d%s, bundle_ok %d/%d "
           "(pending_retry %d, failed %d)"
           % (levels["layout_ok"], len(rows), levels["render_ok"], len(rows),
-             levels["validation_ok"], len(rows), levels["bundle_ok"], len(rows),
+             levels["validation_ok"], len(rows), review_level, levels["bundle_ok"], len(rows),
              pending_retry, failed))
 else:
-    print("  levels: layout_ok %d/%d, bundle_ok %d/%d (render not requested; pending_retry %d, failed %d)"
-          % (levels["layout_ok"], len(rows), levels["bundle_ok"], len(rows), pending_retry, failed))
+    review_level = ", review_ok %d/%d" % (levels.get("review_ok"), len(rows)) if review_requested else ""
+    print("  levels: layout_ok %d/%d%s, bundle_ok %d/%d (render not requested; pending_retry %d, failed %d)"
+          % (levels["layout_ok"], len(rows), review_level, levels["bundle_ok"], len(rows),
+             pending_retry, failed))
 for key in sorted(failure_reasons):
     print("  failure %-40s %d" % (key, failure_reasons[key]))
+if review_requested:
+    for key in sorted(review_issues):
+        print("  review issue %-33s %d" % (key, review_issues[key]))
 print("  passed(bundle_ok) %d/%d" % (levels["bundle_ok"], len(rows)))
 raise SystemExit(0 if levels["bundle_ok"] == len(rows) else 1)
 PY
