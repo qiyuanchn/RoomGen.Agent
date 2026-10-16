@@ -9,7 +9,8 @@ Everything after ``--`` is parsed by this script; Blender itself ignores it.
 Outputs (inside ``--out``): ``pano_<cam>.png``, ``depth_<cam>.npy``,
 ``position_<cam>*.exr``, ``raw_<cam>*.exr``, ``shell.ply`` (room shell only),
 ``furnished.ply`` (everything the cameras can see), ``selftest_report.json``,
-``build_manifest.json``.
+``build_manifest.json``, and with ``--export-glb``: ``scene.glb`` +
+``scene3d_manifest.json`` for the browser 3D viewer (see ``tools/scene3d_viewer``).
 
 P1 additions (all optional in the spec; a P0 spec keeps working unchanged):
 ``furniture`` (Poly Haven models and ``builtin:`` props), ``materials`` (PBR
@@ -32,7 +33,7 @@ if REPO_ROOT not in sys.path:
 
 import bpy  # noqa: E402  (must come after the sys.path fix)
 
-from blender_agent import assets, details, front3d, materials, panorama, render_selftest, settle, shell  # noqa: E402
+from blender_agent import assets, details, export_glb, front3d, materials, panorama, render_selftest, settle, shell  # noqa: E402
 from blender_agent import spec as spec_mod, stage  # noqa: E402
 
 DEFAULT_CACHE = os.path.join(REPO_ROOT, "third_party", "assets", "polyhaven")
@@ -72,6 +73,12 @@ def parse_args(argv):
     parser.add_argument("--prepare-assets-only", action="store_true",
                         help="only build the .blend asset libraries, then exit (keeps the render process lean)")
     parser.add_argument("--skip-render", action="store_true", help="build geometry only (fast smoke test)")
+    parser.add_argument("--export-glb", action="store_true",
+                        help="also write scene.glb + scene3d_manifest.json for the browser 3D viewer")
+    parser.add_argument("--export-glb-path", default=None,
+                        help="scene.glb destination (default: <out>/scene.glb)")
+    parser.add_argument("--export-glb-include-environment", action="store_true",
+                        help="keep the render-only sky dome in the GLB (off by default)")
     return parser.parse_args(argv)
 
 
@@ -555,6 +562,16 @@ def main(argv) -> int:
     )
     camera_objects = {camera.name: panorama.create_pano_camera(camera) for camera in spec.cameras}
 
+    glb_report = None
+    if args.export_glb:
+        print("[run_build] exporting scene.glb for the browser 3D viewer ...")
+        glb_report = export_glb.export_scene_glb(
+            build_dir,
+            spec,
+            filepath=args.export_glb_path,
+            include_environment=args.export_glb_include_environment,
+        )
+
     camera_stats = []
     if not args.skip_render:
         for camera in spec.cameras:
@@ -652,6 +669,7 @@ def main(argv) -> int:
         "camera_adjacency": spec.camera_adjacency(),
         "orientation_selftest": selftest_report,
         "orientation_selftest_inline": bool(args.selftest),
+        "scene3d_glb": glb_report,
     }
     if front3d_ctx is not None:
         shell_report = front3d_ctx.get("shell", {})

@@ -11,6 +11,8 @@
 #   PANOWORLD_SAMPLES                     Cycles samples (default 128)
 #   PANOWORLD_RES                         WxH, e.g. 1024x512 for a fast look (default 2048x1024)
 #   PANOWORLD_CACHE                       Poly Haven asset cache (default third_party/assets/polyhaven)
+#   PANOWORLD_TEXRES                      furniture texture variant (1k/2k/4k)
+#   PANOWORLD_EXPORT_GLB                  1 = also write build/scene.glb (browser 3D viewer)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,6 +28,12 @@ WIDTH="${RES%x*}"
 HEIGHT="${RES#*x}"
 CACHE="${PANOWORLD_CACHE:-${REPO}/third_party/assets/polyhaven}"
 TEXRES="${PANOWORLD_TEXRES:-1k}"
+# PANOWORLD_EXPORT_GLB=1 also writes scene.glb for the browser 3D viewer
+# (scripts/scene3d_view.sh); it adds ~1 minute and a few dozen MB per scene.
+GLB_ARGS=()
+if [[ "${PANOWORLD_EXPORT_GLB:-0}" == "1" ]]; then
+  GLB_ARGS=(--export-glb)
+fi
 
 for tool in "${BLENDER}" "${HOSTPY}"; do
   if [[ ! -x "${tool}" ]]; then
@@ -42,6 +50,7 @@ echo "   render  : ${WIDTH}x${HEIGHT}, ${SAMPLES} samples (AgX, OIDN post-pass)"
 echo "   blender : ${BLENDER}"
 echo "   host py : ${HOSTPY}"
 echo "   cache   : ${CACHE}"
+echo "   glb     : ${PANOWORLD_EXPORT_GLB:-0} (1 = write build/scene.glb for the 3D viewer)"
 
 echo
 echo "--- [1/6] ERP orientation self-test ---"
@@ -68,7 +77,7 @@ set +e
 "${BLENDER}" --background --factory-startup \
   --python "${REPO}/blender_agent/run_build.py" \
   -- --spec "${SPEC}" --out "${OUT}/build" --no-denoise --cache "${CACHE}" \
-     --width "${WIDTH}" --height "${HEIGHT}" --samples "${SAMPLES}"
+     --width "${WIDTH}" --height "${HEIGHT}" --samples "${SAMPLES}" "${GLB_ARGS[@]}"
 STATUS=$?
 set -e
 if [[ ${STATUS} -ne 0 ]]; then
@@ -76,7 +85,7 @@ if [[ ${STATUS} -ne 0 ]]; then
   "${BLENDER}" --background --factory-startup \
     --python "${REPO}/blender_agent/run_build.py" \
     -- --spec "${SPEC}" --out "${OUT}/build" --no-denoise --cache "${CACHE}" \
-       --width "${WIDTH}" --height "${HEIGHT}" --samples "${SAMPLES}"
+       --width "${WIDTH}" --height "${HEIGHT}" --samples "${SAMPLES}" "${GLB_ARGS[@]}"
 fi
 
 echo

@@ -29,7 +29,8 @@ Default output is `outputs/blender_agent/demo_house`; the P1 run writes
 Useful environment overrides: `PANOWORLD_SAMPLES` (default 128),
 `PANOWORLD_RES` (default `2048x1024`, e.g. `1024x512` for a fast look),
 `PANOWORLD_CACHE`, `PANOWORLD_TEXRES` (`1k`/`2k` furniture textures),
-`PANOWORLD_BLENDER`, `PANOWORLD_HOSTPY`.
+`PANOWORLD_BLENDER`, `PANOWORLD_HOSTPY`, and `PANOWORLD_EXPORT_GLB=1` to also
+write `build/scene.glb` for the browser 3D viewer.
 
 ## 3D-FRONT replay (P3)
 
@@ -99,7 +100,8 @@ PANOWORLD_RES=2048x1024 bash tests/test_front3d_replay.sh   # canonical size
 | `panorama.py` | equirect camera, Position-pass depth, strip/binary PLY export, OIDN pass |
 | `render_selftest.py` | renders emissive markers along known world axes and checks the ERP mapping |
 | `settle.py` | physics settling: rigid bodies + drop-to-rest, bakes the settled transforms (see below) |
-| `run_build.py` | Blender entry point (build, render, denoise, asset prep, 3D-FRONT replay) |
+| `export_glb.py` | Blender-side GLB export for the browser 3D viewer (`run_build.py --export-glb`): `scene.glb` + `scene3d_manifest.json` |
+| `run_build.py` | Blender entry point (build, render, denoise, asset prep, 3D-FRONT replay, GLB export) |
 | `export_scene.py` | host: build output → `scene/viewpoints/<cam>/*`, `map.json`, `topdown.png` |
 
 ## Output layout
@@ -109,12 +111,20 @@ PANOWORLD_RES=2048x1024 bash tests/test_front3d_replay.sh   # canonical size
                            raw_*.exr (linear, for the denoise pass),
                            shell.ply (shell only), furnished.ply (all visible
                            geometry: shell + details + furniture + sky dome),
+                           scene.glb + scene3d_manifest.json (with
+                           --export-glb, for tools/scene3d_viewer/),
                            build_manifest.json, selftest_report.json
 <outdir>/scene/viewpoints/<cam>/{panoImage_2048.png, place_depth.png,
                            place_depth_scale.txt, extrinsics.txt}
 <outdir>/scene/{map.json, topdown.png, export_report.json}
 <outdir>/validation_report.json
 ```
+
+`scene.glb` holds the shell, details and furniture with their PBR materials in
+glTF's +Y-up metres; the render-only sky dome and the cameras/lights are left
+out. `--skip-render --export-glb` is the fast (geometry only) path, and
+`bash scripts/scene3d_view.sh <outdir>` serves the result in the browser - see
+"Viewing scenes in the browser" in the top-level README.
 
 `furnished.ply` is the ground truth for the depth check: the validator raycasts
 every ERP ray against it and compares with `place_depth.png / scale`

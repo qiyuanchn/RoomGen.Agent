@@ -182,6 +182,48 @@ canonical front) and can be turned with `CATEGORIES[...]["yaw_deg"]` or `--yaw`;
 in the demo shell the bed sits 0.25 m from the bedroom camera (the shipped P1
 spec is at 0.30 m -- the same geometric constraint).
 
+## Viewing scenes in the browser
+
+Two viewers answer two different questions:
+
+| viewer | shows | start it with |
+|---|---|---|
+| panorama tour (PanoWorld, port 8003) | the *rendered* ERP panoramas - Cycles lighting, sky, denoising - with hotspot jumps between viewpoints | `panoworld_viewer_server.py --viewpoints <outdir>/scene/viewpoints` |
+| 3D scene viewer (this repo, port 8004) | the *geometry* itself - shell, furniture, PBR materials at 1:1 scale, from any angle | `bash scripts/scene3d_view.sh <outdir>` |
+
+The 3D viewer is a static page under `tools/scene3d_viewer/` (three.js r180
+vendored locally, no build step, no CDN); it loads the `scene.glb` written by
+`run_build.py --export-glb`:
+
+```bash
+# full pipeline + GLB, or the geometry-only fast path used for the demo scenes
+PANOWORLD_EXPORT_GLB=1 bash scripts/blender_agent_run.sh configs/blender_agent_p1_furnished.json outputs/p1
+third_party/blender-4.5.14-linux-x64/blender --background --factory-startup \
+  --python blender_agent/run_build.py -- --spec configs/blender_agent_p1_furnished.json \
+  --out outputs/blender_agent/p1_settled/build --skip-render --export-glb
+
+# serve one scene, then open http://<host>:8004/
+bash scripts/scene3d_view.sh outputs/blender_agent/p1_settled   # Poly Haven furnished home
+bash scripts/scene3d_view.sh outputs/gen_assets                 # TRELLIS-generated furniture
+
+# re-read the GLB without Blender (meshes, materials, bounds, cameras-inside check)
+/opt/conda/envs/diffaero/bin/python tools/check_scene_glb.py outputs/blender_agent/p1_settled
+```
+
+What the page offers: Orbit (drag / wheel / right-drag), Fly and Walk (WASD +
+mouse look under pointer lock, Shift sprints; Walk is pinned to the 1.5 m eye
+height, Fly adds Space/C for up/down), a viewpoint picker that jumps to every
+panorama camera pose and room, a load-progress bar, and hemisphere + directional
++ IBL lighting over the GLB's own materials.
+
+What the GLB holds: what the panoramas see, minus the render-only sky dome and
+minus cameras/lights (the page brings its own). For the P1 demo home that is 53
+meshes in 61 nodes, 743,627 triangles, 27 materials, 61 textures/images, 52.5 MB,
+in glTF's +Y-up metres. `build/scene3d_manifest.json` carries the camera poses
+and room boxes already converted to glTF axes, so the page never guesses, and
+`tools/check_scene_glb.py` re-checks those numbers against the geometry (bounds
+within millimetres, every camera inside the room).
+
 ## Assets and licensing
 
 * Poly Haven models/textures — **CC0**, fetched on demand via their API.

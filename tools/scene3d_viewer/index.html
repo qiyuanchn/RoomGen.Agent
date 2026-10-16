@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="RoomGen.Agent scene viewer: walk through the built Blender room in the browser.">
+  <title>RoomGen.Agent 3D scene viewer</title>
+  <link rel="stylesheet" href="/viewer.css">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "/vendor/three.module.min.js",
+        "three/addons/": "/vendor/"
+      }
+    }
+  </script>
+  <script type="module" src="/viewer.js"></script>
+</head>
+<body>
+  <canvas id="scene-canvas"></canvas>
+
+  <header id="hud" class="hud">
+    <div class="hud-row">
+      <h1 class="hud-title" id="scene-title">RoomGen.Agent scene</h1>
+      <span class="hud-badge" id="scene-stats">loading…</span>
+    </div>
+    <div class="hud-row hud-controls">
+      <label class="hud-field" for="viewpoint-select">
+        Viewpoint
+        <select id="viewpoint-select" disabled>
+          <option value="">loading…</option>
+        </select>
+      </label>
+      <div class="hud-modes" role="group" aria-label="Camera mode">
+        <button id="mode-orbit" class="mode-button is-active" type="button" title="Orbit around the scene (1)">Orbit</button>
+        <button id="mode-fly" class="mode-button" type="button" title="Free flight, WASD + mouse look (2)">Fly</button>
+        <button id="mode-walk" class="mode-button" type="button" title="Walk at 1.5 m eye height, WASD + mouse look (3)">Walk</button>
+      </div>
+      <button id="reset-view" class="mode-button" type="button" title="Back to the overview (R)">Reset</button>
+    </div>
+  </header>
+
+  <div id="loading" class="loading">
+    <span class="spinner" aria-hidden="true"></span>
+    <span id="loading-label">Loading scene…</span>
+    <div class="progress"><div id="progress-bar" class="progress-bar"></div></div>
+  </div>
+
+  <div id="pointer-hint" class="pointer-hint" hidden>Click the scene to look around · Esc releases the mouse</div>
+  <div id="error-box" class="error-box" hidden></div>
+
+  <footer class="hint">
+    <span id="hint-text">Orbit: drag to rotate, wheel to zoom, right-drag to pan</span>
+    <span id="pose-readout" class="pose-readout"></span>
+  </footer>
+</body>
+</html>

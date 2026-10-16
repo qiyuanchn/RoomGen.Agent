@@ -163,6 +163,45 @@ python tools/gen_assets_trellis.py generate --backend trellis \
 `CATEGORIES[...]["yaw_deg"]` 或 `--yaw` 里微调；demo 户型里床与卧室相机只隔 0.25 m
 （随附的 P1 spec 是 0.30 m，同一个几何约束）。
 
+## 在浏览器里查看场景
+
+两个查看器回答两个不同的问题：
+
+| 查看器 | 看什么 | 启动方式 |
+|---|---|---|
+| 全景漫游（PanoWorld，8003） | *渲染结果*：Cycles 光照/天空/降噪后的 ERP 全景，点位之间有热点跳转 | `panoworld_viewer_server.py --viewpoints <outdir>/scene/viewpoints` |
+| 3D 场景查看器（本仓库，8004） | *几何本体*：墙体、家具、PBR 材质，1:1 米制尺度，任意角度 | `bash scripts/scene3d_view.sh <outdir>` |
+
+3D 查看器是 `tools/scene3d_viewer/` 下的静态页面（three.js r180 已本地 vendor，
+无需打包、不依赖 CDN），加载 `run_build.py --export-glb` 写出的 `scene.glb`：
+
+```bash
+# 完整流水线顺带出 GLB；或只建模的快速路径（随附 demo 场景即此路径）
+PANOWORLD_EXPORT_GLB=1 bash scripts/blender_agent_run.sh configs/blender_agent_p1_furnished.json outputs/p1
+third_party/blender-4.5.14-linux-x64/blender --background --factory-startup \
+  --python blender_agent/run_build.py -- --spec configs/blender_agent_p1_furnished.json \
+  --out outputs/blender_agent/p1_settled/build --skip-render --export-glb
+
+# 起服务，浏览器打开 http://<host>:8004/
+bash scripts/scene3d_view.sh outputs/blender_agent/p1_settled   # Poly Haven 家具之家
+bash scripts/scene3d_view.sh outputs/gen_assets                 # TRELLIS 生成家具
+
+# 不依赖 Blender 复读校验 GLB（网格/材质/包围盒/相机是否在房间内）
+/opt/conda/envs/diffaero/bin/python tools/check_scene_glb.py outputs/blender_agent/p1_settled
+```
+
+页面能力：Orbit（拖拽旋转 / 滚轮缩放 / 右键平移）、Fly 与 Walk（指针锁定后
+WASD + 鼠标视角，Shift 加速；Walk 固定 1.5 m 眼高，Fly 用 Space/C 升降）、
+视角下拉框可直接跳到每个全景相机位姿与房间、加载进度条，以及
+半球光 + 平行光 + IBL 补光叠加 GLB 自带材质。
+
+GLB 内容：全景相机能看到的一切，减去仅用于渲染的天空球，并去掉相机与灯光
+（页面自带光照）。P1 demo 之家为 53 个网格 / 61 个节点、743,627 三角面、
+27 个材质、61 张贴图，52.5 MB，glTF 惯例 +Y 向上、单位米。
+`build/scene3d_manifest.json` 里已把相机位姿与房间范围换算到 glTF 坐标系，
+页面无需猜测；`tools/check_scene_glb.py` 会用几何反查这些数值（包围盒毫米级一致、
+每个相机都落在房间内部）。
+
 ## 资产与许可
 
 * Poly Haven 模型/贴图 —— **CC0**，通过其 API 按需下载。
