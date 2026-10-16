@@ -1,5 +1,7 @@
 # RoomGen.Agent
 
+English | [简体中文](README_zh.md)
+
 Autonomous Blender agent for realistic, multi-room connected indoor scenes.
 
 A seed (or a 3D-FRONT house JSON) becomes a validated, rendered, metric-exact
@@ -17,6 +19,8 @@ PANOWORLD_BATCH_RENDER=1 bash scripts/batch_generate.sh 0 100 outputs/stream
 PANOWORLD_RES=2048x1024 PANOWORLD_SAMPLES=128 \
   bash scripts/blender_agent_run.sh <spec.json> <outdir>
 ```
+
+Rendered examples with validation reports live in [`demo/`](demo/README.md).
 
 ## Why build the scene in 3D first
 
@@ -66,13 +70,14 @@ builder is the only code that touches Blender, and validators close the loop.
 
 ```
 blender_agent/    spec, builder, render, export, layout generation, checks
-scripts/          one-command entry points (see above)
+scripts/          one-command entry points (incl. fetch_assets.sh)
 tools/            asset indexing/merging, numeric validation
 configs/          demo specs (hand-authored and generated)
 tests/            unit + end-to-end tests (incl. 3D-FRONT replay fixture)
-third_party/
-  assets/         asset registry + caches  [git submodule]
-  blender-*/      Blender 4.5 LTS binary   [installed locally, gitignored]
+demo/             rendered scenes + validation reports
+third_party/      local toolchain and asset data (not tracked)
+  blender-*/      Blender 4.5 LTS binary
+  assets/         model/texture caches + registries, built by fetch_assets.sh
 ```
 
 ## Setup
@@ -84,14 +89,16 @@ curl -L -o blender.tar.xz \
   https://mirrors.tuna.tsinghua.edu.cn/blender/release/Blender4.5/blender-4.5.14-linux-x64.tar.xz
 tar xf blender.tar.xz && cd ..
 
-# 2. asset registry submodule (indices + fetch scripts)
-git submodule update --init third_party/assets
-bash third_party/assets/fetch.sh          # Poly Haven (CC0) + MIDI-3D extract
+# 2. asset library (downloaded + indexed, kept out of git)
+bash scripts/fetch_assets.sh                 # Poly Haven + MIDI-3D (~13.3 GB)
+bash scripts/fetch_assets.sh --skip-midi3d   # fast path (~200 MB)
 
 # 3. host python with numpy/PIL (validation + indexing)
 ```
 
-Override tool paths with `PANOWORLD_BLENDER` / `PANOWORLD_HOSTPY` if needed.
+`third_party/assets/` is intentionally **not** tracked: it is bulk data the
+fetch script rebuilds from source (registries included). Override tool paths
+with `PANOWORLD_BLENDER` / `PANOWORLD_HOSTPY` if needed.
 
 ## Assets and licensing
 
