@@ -106,6 +106,55 @@ def semantic_category(raw_cat: str) -> str:
     return CATEGORY_ALIASES.get(raw_cat, "misc")
 
 
+# House-shell meshes shipped alongside furniture in the MIDI-3D extract.
+SHELL_STEMS = ("floor", "wall", "ceil", "others")
+
+# Per-category physical plausibility (metres, on the largest instance per jid).
+# MIDI-3D GLBs are per-instance exports with baked scene scales, so sizes span
+# orders of magnitude; the largest instance is the best estimate of natural size.
+PLAUSIBILITY = {
+    "bed":     lambda w, d, h: 1.5 <= max(w, d) <= 2.4 and min(w, d) >= 0.8 and h <= 1.6,
+    "sofa":    lambda w, d, h: max(w, d) >= 1.3 and 0.45 <= h <= 1.2 and min(w, d) >= 0.45,
+    "chair":   lambda w, d, h: max(w, d) <= 1.05 and 0.5 <= h <= 1.3 and min(w, d) >= 0.25,
+    "table":   lambda w, d, h: 0.5 <= max(w, d) <= 2.4 and 0.25 <= h <= 1.15,
+    "cabinet": lambda w, d, h: 0.55 <= h <= 2.5 and max(w, d) >= 0.3,
+    "stool":   lambda w, d, h: max(w, d) <= 1.0 and h <= 1.2,
+    "lamp":    lambda w, d, h: max(w, d, h) <= 2.2,
+    "misc":    lambda w, d, h: max(w, d) <= 3.0,
+}
+
+
+def curate_index(index: dict, verbose: bool = True) -> dict:
+    """Deduplicate to jid level and drop implausible / shell entries."""
+    def jid_of(name: str) -> str:
+        m = NAME_RE.match(name)
+        return m.group("jid") if m else name
+
+    best: dict = {}
+    for name, entry in index.items():
+        if name.split("_")[0].lower() in SHELL_STEMS or name.lower() in SHELL_STEMS:
+            continue
+        vol = 1.0
+        for d in entry["api_dimensions_mm"]:
+            vol *= d
+        j = jid_of(name)
+        if j not in best or vol > best[j][0]:
+            best[j] = (vol, name)
+
+    out = {}
+    for _, name in best.values():
+        entry = index[name]
+        cat = entry["categories"][0]
+        w, d, h = (v / 1000.0 for v in entry["api_dimensions_mm"])
+        rule = PLAUSIBILITY.get(cat)
+        if rule and not rule(w, d, h):
+            continue
+        out[name] = entry
+    if verbose:
+        print(f"[index_midi3d] curated {len(out)} of {len(index)} models")
+    return out
+
+
 def index_tree(root: Path, out_path: Path, verbose: bool = True) -> dict:
     index: dict = {}
     skipped = 0
@@ -143,6 +192,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", type=Path, help="extracted MIDI-3D scene tree")
     ap.add_argument("--out", type=Path, help="output index.json path")
+    ap.add_argument("--curate-out", type=Path,
+                    help="also write the curated index (shell/jid-dedupe/plausibility)")
     ap.add_argument("--probe", type=Path, help="read one glb/gltf bbox and exit")
     args = ap.parse_args()
 
@@ -151,7 +202,11 @@ def main() -> int:
         return 0
     if not args.root or not args.out:
         ap.error("--root and --out are required (or use --probe)")
-    index_tree(args.root, args.out)
+    index = index_tree(args.root, args.out)
+    if args.curate_out:
+        curated = curate_index(index)
+        args.curate_out.write_text(json.dumps(curated, indent=1, sort_keys=True))
+        print(f"[index_midi3d] curated index -> {args.curate_out}")
     return 0
 
 
