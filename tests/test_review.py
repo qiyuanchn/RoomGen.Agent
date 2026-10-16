@@ -294,8 +294,13 @@ def write_exr(path: str, rgb) -> None:
 
 def synthetic_frames(height: int = 32, width: int = 64, blown_rows=None, blown: float = 1.6,
                      base: float = 0.25, dome_rows: int = 0, dome: float = 1.6,
-                     room_depth: float = 2.5, dome_depth: float = 25.0):
-    """``(linear rgb, depth)`` of a fake ERP: a lit room plus an optional hot band."""
+                     room_depth: float = 2.5, dome_depth: float = 25.0, ramp: float = 0.0):
+    """``(linear rgb, depth)`` of a fake ERP: a lit room plus an optional hot band.
+
+    ``ramp`` spreads the radiance over ``[1, 1 + ramp]`` across the frame, which
+    a measured display curve needs: a piecewise-constant frame only ever samples
+    three radiances.
+    """
     import numpy as np
 
     linear = np.full((height, width, 3), base, dtype="float32")
@@ -305,15 +310,20 @@ def synthetic_frames(height: int = 32, width: int = 64, blown_rows=None, blown: 
     if dome_rows:
         linear[:dome_rows] = dome
         depth[:dome_rows] = dome_depth
+    if ramp:
+        linear = linear * (1.0 + ramp * np.linspace(0.0, 1.0, width, dtype="float32"))[None, :, None]
     return linear, depth
 
 
-def synthetic_render(root: str, spec: dict, cameras: int = 2, **frames_kwargs) -> dict:
+def synthetic_render(root: str, spec: dict, cameras: int = 2, display=None,
+                     **frames_kwargs) -> dict:
     """Add a linear-EXR build to ``root``: the inputs ``--fix-exposure`` reads.
 
     The delivered PNGs are the ``Standard`` display transform of the linear
     data at exposure 0 -- what ``run_build.py --no-denoise`` plus the denoise
     pass write -- while the manifest still claims the render's AgX/exposure.
+    ``display`` replaces that colour management with a callable (a foreign view
+    transform: the manifest then records it as the render's own).
     """
     import numpy as np
 
@@ -321,6 +331,9 @@ def synthetic_render(root: str, spec: dict, cameras: int = 2, **frames_kwargs) -
     render = {"width": 64, "height": 32, "samples": 8, "view_transform": "AgX",
               "exposure": 1.4, "post_denoise": {"denoiser": "OPENIMAGEDENOISE",
                                                 "prefilter": "ACCURATE", "quality": "FAST"}}
+    if display is not None:
+        render = {"width": 64, "height": 32, "samples": 8, "view_transform": "AgX",
+                  "exposure": 0.0}
     os.makedirs(os.path.join(root, "build"), exist_ok=True)
     entries = []
     for camera in spec["cameras"][:cameras]:
@@ -330,9 +343,12 @@ def synthetic_render(root: str, spec: dict, cameras: int = 2, **frames_kwargs) -
         np.save(os.path.join(root, "build", f"depth_{camera['name']}.npy"), depth)
         view = os.path.join(root, "scene", "viewpoints", camera["name"])
         os.makedirs(view, exist_ok=True)
-        display = review_mod._display_rgb(linear, 0.0, "Standard")
+        if display is None:
+            rendered = review_mod._display_rgb(linear, 0.0, "Standard")
+        else:
+            rendered = np.clip(np.asarray(display(linear), dtype="float32"), 0.0, 1.0)
         png = os.path.join(root, "build", f"pano_{camera['name']}.png")
-        Image.fromarray((display * 255.0 + 0.5).astype("uint8")).save(png)
+        Image.fromarray((rendered * 255.0 + 0.5).astype("uint8")).save(png)
         Image.open(png).save(os.path.join(view, "panoImage_2048.png"))
         entries.append({"camera": camera["name"], "raw_exr": raw,
                         "pano": f"pano_{camera['name']}.png", "pos": camera["pos"] + [1.5]})
@@ -754,6 +770,29 @@ class ExposureTest(unittest.TestCase):
             self.assertLess(float(np.mean(np.abs(predicted - truth))), 0.03)
 
     @unittest.skipUnless(HAVE_IMAGES, "numpy/PIL not available")
+    def test_a_foreign_view_transform_is_measured_from_the_delivered_panoramas(self):
+        """AgX and friends: the estimate reads the response off the images."""
+        import numpy as np
+
+        def filmic(linear):
+            return 1.0 - np.exp(-np.asarray(linear, dtype="float32"))
+
+        package = self._package(display=filmic, blown_rows=(11, 24), blown=6.0, ramp=0.6)
+        index = checks_mod.load_assets_index()
+        report = review_mod.review(package.root, index=index)
+        self.assertEqual(report["status"], "fail", report["issues"])
+        estimate = review_mod.estimate_exposure(review_mod.Artifacts(package.root), index=index)
+        self.assertEqual(estimate["status"], "ok")
+        self.assertEqual(estimate["transform"], "AgX")
+        self.assertTrue(any("measured" in warning for warning in estimate["warnings"]))
+        for camera in estimate["predicted"].values():
+            self.assertLess(camera["interior_clip_fraction"], review_mod.CLIP_FAIL_FRACTION)
+        # the rewrite itself needs the real transform, which only Blender has
+        result = review_mod.fix_exposure(package.root, index=index, use_blender=False)
+        self.assertEqual(result["status"], "unsupported_transform")
+        self.assertFalse(result["changed"])
+
+    @unittest.skipUnless(HAVE_IMAGES, "numpy/PIL not available")
     def test_apply_repair_uses_the_measured_exposure(self):
         package = self._package(blown_rows=(11, 24), blown=2.5)
         index = checks_mod.load_assets_index()
@@ -777,6 +816,8 @@ class ExposureTest(unittest.TestCase):
         result = review_mod.fix_exposure(package.root, index=index, use_blender=True,
                                          review_after=False)
         self.assertEqual(result["status"], "applied", result)
+        self.assertTrue(result["cameras"]["0000"]["denoised"],
+                        "the Blender pass denoises, it does not fall back to the sRGB rewrite")
         blender = read_png(os.path.join(package.root, "build", "pano_0000.png"))
         source = review_mod.read_exr(os.path.join(package.root, "build",
                                                   "raw_00000012.exr"))
