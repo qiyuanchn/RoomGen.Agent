@@ -1,7 +1,7 @@
 """Autonomous apartment layout generator: seed in, scene spec out.
 
     python blender_agent/layout_gen.py --seed 0 --out spec.json \
-        [--rooms 2..7] [--shape row|block|auto|<family>] \
+        [--rooms 2..7] [--shape row|block|auto|<family>] [--floors 1|2] \
         [--assets-index third_party/assets/polyhaven/index.json] \
         [--report layout_report.json]
 
@@ -15,7 +15,10 @@ that the existing pipeline can build, render and validate:
    same chain wrapped into two rows, ``auto`` draws a family from the seed, and
    a family name forces one).  Room areas are drawn from the realistic bands
    (:data:`ROOM_AREA_M2`) with a minimum side per type, so a small service cell
-   becomes a bathroom and never a 3 m2 bedroom.
+   becomes a bathroom and never a 3 m2 bedroom.  ``--floors 2`` builds a
+   **duplex** instead: two floors on one footprint, each a row of 2-4 rooms,
+   joined by a switchback stair through a slab opening (see the step 7 section
+   below and ``check_duplex_spec``).
 2. *doors*: a semantic spanning tree over the shared walls -- a corridor serves
    the rooms, the kitchen opens onto the dining room, a bathroom is never
    crossed and a bedroom is never the public way through the flat
@@ -78,6 +81,7 @@ provenance, check results and the door forecast).
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
 import os
@@ -208,7 +212,11 @@ MATERIAL_DEFAULTS = {
     "normal_strength": {"floor": 0.45, "wall": 0.7, "rug": 0.3},
 }
 DETAIL_DEFAULTS = {"skirting": True, "casings": True, "bevels": True, "glass": True}
-LIGHTING_DEFAULTS = {"window_portal_w": 42.0, "lamp_w": 8.0, "portal_margin": 0.02}
+#: ``lamp_w`` is the point light inside every ceiling / table lamp.  8 W left the
+#: windowless service rooms (bathroom, hall, storage) visibly dark in the
+#: sample renders, so the default is 12 W -- the point the room-lighting note in
+#: ``blender_agent/README.md`` refers to.
+LIGHTING_DEFAULTS = {"window_portal_w": 42.0, "lamp_w": 12.0, "portal_margin": 0.02}
 
 # --------------------------------------------------------------------------- #
 # slot definitions: asset picked by category, fallbacks by measured name
@@ -1190,8 +1198,51 @@ def window_wish(rng: random.Random, room_type: str, candidates: Sequence) -> int
     return 0                                   # corridor / entry / storage
 
 
-def plan_windows(rng: random.Random, plans: Sequence[RoomPlan]) -> Dict[str, List[dict]]:
-    """One window per exterior span, per room function (:func:`window_wish`)."""
+def _span_intervals(low: float, high: float, blocked: Sequence[Tuple[float, float]]):
+    """``(low, high)`` minus the ``blocked`` spans, as the remaining intervals."""
+    free = [(low, high)]
+    for block_lo, block_hi in blocked:
+        out: List[Tuple[float, float]] = []
+        for a, b in free:
+            if block_hi <= a + 1e-9 or block_lo >= b - 1e-9:
+                out.append((a, b))
+                continue
+            if block_lo > a:
+                out.append((a, min(block_lo, b)))
+            if block_hi < b:
+                out.append((max(block_hi, a), b))
+        free = out
+    return [(a, b) for a, b in free if b - a > 1e-6]
+
+
+def _wall_side_of(rect: Rect, start: Sequence[float], end: Sequence[float]) -> Optional[str]:
+    """Which side of ``rect`` an axis-aligned wall span sits on (N/S/W/E)."""
+    if abs(start[1] - end[1]) < 1e-9:
+        if abs(start[1] - rect.y0) < 1e-6:
+            return "S"
+        if abs(start[1] - rect.y1) < 1e-6:
+            return "N"
+        return None
+    if abs(start[0] - end[0]) < 1e-9:
+        if abs(start[0] - rect.x0) < 1e-6:
+            return "W"
+        if abs(start[0] - rect.x1) < 1e-6:
+            return "E"
+        return None
+    return None
+
+
+def plan_windows(rng: random.Random, plans: Sequence[RoomPlan],
+                 avoid: Optional[Dict[str, List[Tuple[str, float, float]]]] = None
+                 ) -> Dict[str, List[dict]]:
+    """One window per exterior span, per room function (:func:`window_wish`).
+
+    ``avoid`` optionally lists, per room, wall spans (``side``, lo, hi, in the
+    wall's own coordinate: an X for a N/S wall, a Y for a W/E wall) that no
+    window may cover -- the duplex stair leans on the lower parts of two walls
+    of its host room, and a window behind it would be dead geometry.  Without
+    ``avoid`` the sampling is exactly the single-floor one draw per window.
+    """
     spans = exterior_spans(plans)
     windows: Dict[str, List[dict]] = {plan.room_id: [] for plan in plans}
     for plan in plans:
@@ -1216,7 +1267,31 @@ def plan_windows(rng: random.Random, plans: Sequence[RoomPlan]) -> Dict[str, Lis
                            min(WINDOW_W_RANGE[1], usable))
             low = WINDOW_MARGIN_M + width / 2.0
             high = length - WINDOW_MARGIN_M - width / 2.0
-            offset = _round(rng.uniform(low, high), 0.05)
+            bands = [band for band in (avoid or {}).get(plan.room_id, [])
+                     if band[0] == _wall_side_of(plan.rect, start, end)]
+            if not bands:
+                offset = _round(rng.uniform(low, high), 0.05)
+            else:
+                # project the forbidden wall spans into this segment's offset
+                blocked = []
+                for _side, lo, hi in bands:
+                    if abs(ux) > 0.5:
+                        blocked.append(tuple(sorted((lo - start[0], hi - start[0]))))
+                    else:
+                        blocked.append(tuple(sorted((lo - start[1], hi - start[1]))))
+                blocked = [(lo - width / 2.0, hi + width / 2.0) for lo, hi in blocked]
+                free = _span_intervals(low, high, blocked)
+                if not free:
+                    continue
+                total = sum(b - a for a, b in free)
+                target = rng.uniform(0.0, total)
+                acc = 0.0
+                offset = free[-1][0]
+                for a, b in free:
+                    if target <= acc + (b - a) or (a, b) == free[-1]:
+                        offset = _round(rng.uniform(a, b), 0.05)
+                        break
+                    acc += b - a
             offset = _clamp(offset, low, high)
             half = width / 2.0
             wall_a = [round(start[0] + ux * (offset - half), 4), round(start[1] + uy * (offset - half), 4)]
@@ -1295,7 +1370,10 @@ class Placer:
     """Rejection sampling for one room: keeps the layout contract of checks.py."""
 
     def __init__(self, room: RoomPlan, doors: Sequence[DoorPlan], windows: Sequence[dict],
-                 index: Dict[str, dict], rng: random.Random, placed: List[Item], report: dict):
+                 index: Dict[str, dict], rng: random.Random, placed: List[Item], report: dict,
+                 reserved: Sequence[Tuple[float, float, float, float]] = (),
+                 mouths: Sequence[Tuple[float, float]] = (),
+                 shafts: Sequence[Tuple[float, float, float, float]] = ()):
         self.room = room
         self.rect = room.rect
         self.doors = [door for door in doors if room.room_id in (door.a, door.b)]
@@ -1308,6 +1386,15 @@ class Placer:
         self.rejections: Dict[str, int] = {}
         #: keep-clear zones in front of fixtures (fridge door, pulled-out chair)
         self.usages: List[dict] = []
+        #: space claimed before furnishing (a duplex stair shaft): no item may
+        #: intersect it, and circulation is measured with it blocked
+        self.reserved = [tuple(float(v) for v in rect) for rect in (reserved or ())]
+        #: points furniture must stay connected to: the stair mouth, so no bed or
+        #: wardrobe seals the walker in the stair's corner of the room
+        self.mouths = [tuple(float(v) for v in point) for point in (mouths or ())]
+        #: the stair footprints themselves: not even a ceiling lamp may hang
+        #: over them (checks.stair_clearance measures exactly this)
+        self.shafts = [tuple(float(v) for v in rect) for rect in (shafts or ())]
 
     # -- helpers --------------------------------------------------------- #
     def pick_asset(self, slot: str) -> Optional[str]:
@@ -1382,6 +1469,17 @@ class Placer:
                 if checks_mod.rect_distance(aabb, rect) < checks_mod.DOOR_CLEARANCE_M + 0.05:
                     self.reject("door_zone")
                     return False
+        for rect in self.reserved:
+            if item.placement == checks_mod.CEILING:
+                # a pendant may hang over the walk-off strip but never over the
+                # stair itself (checks.stair_clearance measures the footprint)
+                if any(checks_mod.rect_distance(aabb, shaft) < 1e-9 for shaft in self.shafts):
+                    self.reject("reserved_shaft")
+                    return False
+                continue
+            if checks_mod.rect_distance(aabb, rect) < 1e-9:
+                self.reject("reserved_space")
+                return False
         if _blocks_walking(item):
             for usage in self.usages:
                 if item.slot and item.slot in usage["allow"]:
@@ -1427,14 +1525,42 @@ class Placer:
                  for other in self.placed] + \
                 [checks_mod.ItemBox(name=item.name, asset=item.asset, room=item.room, aabb=item.aabb,
                                     z=item.z_range, dims=item.dims, placement=item.placement,
-                                    rot_z_deg=item.rot_z_deg, rotation_on_grid=True)]
+                                    rot_z_deg=item.rot_z_deg, rotation_on_grid=True)] + \
+                [checks_mod.ItemBox(name=f"stair_reserve_{index}", asset="builtin:stair",
+                                    room=self.room.room_id, aabb=rect, z=(0.0, 1.0), dims=None,
+                                    placement=checks_mod.WALL_HUG, rot_z_deg=0.0,
+                                    rotation_on_grid=True)
+                 for index, rect in enumerate(self.reserved)]
         starts = [door.center for door in self.doors] or [(self.rect.center[0], self.rect.center[1])]
         stats = checks_mod.room_connectivity(self.rect.polygon(), boxes, starts,
                                             wall_thickness=WALL_THICKNESS, grid_m=0.20)
         if stats["fraction"] < ROOM_OPEN_FRACTION:
             self.reject("seals_room")
             return False
+        if self.mouths and (item.aabb[2] - item.aabb[0]) * (item.aabb[3] - item.aabb[1]) >= 0.8 \
+                and not self.keeps_stair_mouth_open(item):
+            self.reject("seals_stair_mouth")
+            return False
         return True
+
+    def keeps_stair_mouth_open(self, item: Item) -> bool:
+        """No furniture may seal the walker's way from the stair mouth.
+
+        The stair's base/head points are at the open side of the shaft; if a bed
+        or wardrobe run fences that corner off from the room's doorways, the
+        storey behind the stair turns unreachable in ``checks.circulation_report``
+        (the only blocks there are furniture -- the shaft itself is walkable stair
+        and the reserve is empty floor).  This is the same grid rule as the
+        camera placement, with the stair reserve treated as the walkable space it
+        really is, and the mouth has to stay free and connected to the doors.
+        """
+        grid = _walkable_grid(self.room, list(self.placed) + [item])
+        for point in self.mouths:
+            cell = _grid_cell(grid, point[0], point[1])
+            if cell is None or not _grid_free(grid, cell[0], cell[1]):
+                return False
+        _mark_reachable(grid, [door.center for door in self.doors] or self.mouths)
+        return all(_walkable(grid, point[0], point[1], reachable=True) for point in self.mouths)
 
     def reject(self, reason: str) -> None:
         self.rejections[reason] = self.rejections.get(reason, 0) + 1
@@ -1924,6 +2050,9 @@ def _add_ceiling_lamp(placer: Placer, name: str) -> Optional[Item]:
     A windowless room (bathroom, hall, storage) is lit by its doorways alone and
     renders black without a lamp, so this retries a few positions instead of
     giving up when the first spot collides with something like a shower cabin.
+    A duplex host room also carries the stair shaft: its centre can be the shaft
+    itself, so a grid of further spots is tried there (only then -- the
+    single-floor rooms keep their exact random stream).
     """
     rng = placer.rng
     rect = placer.rect
@@ -1937,6 +2066,16 @@ def _add_ceiling_lamp(placer: Placer, name: str) -> Optional[Item]:
         item = placer.make("ceiling_lamp", name, lamp_asset, center, 0.0, checks_mod.CEILING)
         if item is not None and placer.fits(item, checks_mod.WALL_GAP_MIN_M, keep_doors=False):
             return placer.add(item)
+    if placer.shafts:
+        for fx in (1.0 / 6.0, 0.5, 5.0 / 6.0):
+            for fy in (0.5, 5.0 / 6.0, 1.0 / 6.0):
+                center = (rect.x0 + rect.w * fx + rng.uniform(-0.10, 0.10),
+                          rect.y0 + rect.h * fy + rng.uniform(-0.10, 0.10))
+                item = placer.make("ceiling_lamp", name, lamp_asset, center, 0.0,
+                                   checks_mod.CEILING)
+                if item is not None and placer.fits(item, checks_mod.WALL_GAP_MIN_M,
+                                                    keep_doors=False):
+                    return placer.add(item)
     return None
 
 
@@ -2208,11 +2347,19 @@ def furnish_study(placer: Placer) -> None:
 
 
 def furnish_rooms(rng: random.Random, plans: Sequence[RoomPlan], doors: Sequence[DoorPlan],
-                  windows: Dict[str, List[dict]], index: Dict[str, dict]) -> Tuple[List[Item], List[dict]]:
+                  windows: Dict[str, List[dict]], index: Dict[str, dict],
+                  reserved_by_room: Optional[Dict[str, List[Tuple[float, float, float, float]]]] = None,
+                  mouths_by_room: Optional[Dict[str, List[Tuple[float, float]]]] = None,
+                  shafts_by_room: Optional[Dict[str, List[Tuple[float, float, float, float]]]] = None
+                  ) -> Tuple[List[Item], List[dict]]:
     placed: List[Item] = []
     report: dict = {"slots": [], "rejections": {}}
     for plan in plans:
-        placer = Placer(plan, doors, windows.get(plan.room_id, []), index, rng, placed, report)
+        reserved = (reserved_by_room or {}).get(plan.room_id) or ()
+        mouths = (mouths_by_room or {}).get(plan.room_id) or ()
+        shafts = (shafts_by_room or {}).get(plan.room_id) or ()
+        placer = Placer(plan, doors, windows.get(plan.room_id, []), index, rng, placed, report,
+                        reserved=reserved, mouths=mouths, shafts=shafts)
         if plan.room_type == "living_room":
             furnish_living(placer, want_armchair=plan.rect.area >= 19.0)
         elif plan.room_type == "bedroom":
@@ -2467,7 +2614,8 @@ def _cell_span(low: float, high: float, origin: float, step: float, count: int) 
     return first, last
 
 
-def _walkable_grid(plan: RoomPlan, items: Sequence[Item], step: float = checks_mod.GRID_M) -> dict:
+def _walkable_grid(plan: RoomPlan, items: Sequence[Item], step: float = checks_mod.GRID_M,
+                   reserved: Sequence[Tuple[float, float, float, float]] = ()) -> dict:
     """One room's free-cell lattice plus the cells its doorways can reach.
 
     The rule is the one :func:`checks.circulation_report` applies to the whole
@@ -2477,6 +2625,10 @@ def _walkable_grid(plan: RoomPlan, items: Sequence[Item], step: float = checks_m
     wall art and ceiling lamps never block.  ``reachable`` is a BFS over the free
     cells from this room's doorways, so a camera standing on a reachable cell is
     walkable from the front door, which is what the circulation check requires.
+
+    ``reserved`` rectangles (a duplex stair shaft) block cells exactly like a
+    blocking footprint, so no camera stand and no coverage target is placed
+    inside the stair.
     """
     poly = checks_mod.inset_polygon(plan.rect.polygon(), WALL_THICKNESS / 2.0)
     xs = [float(point[0]) for point in poly]
@@ -2500,6 +2652,12 @@ def _walkable_grid(plan: RoomPlan, items: Sequence[Item], step: float = checks_m
                                   aabb[2] + checks_mod.FURNITURE_DILATION_M, x0, step, nx)
         iy_lo, iy_hi = _cell_span(aabb[1] - checks_mod.FURNITURE_DILATION_M,
                                   aabb[3] + checks_mod.FURNITURE_DILATION_M, y0, step, ny)
+        for ix in range(ix_lo, ix_hi + 1):
+            for iy in range(iy_lo, iy_hi + 1):
+                blocked[ix * ny + iy] = 1
+    for rect in (reserved or ()):
+        ix_lo, ix_hi = _cell_span(rect[0], rect[2], x0, step, nx)
+        iy_lo, iy_hi = _cell_span(rect[1], rect[3], y0, step, ny)
         for ix in range(ix_lo, ix_hi + 1):
             for iy in range(iy_lo, iy_hi + 1):
                 blocked[ix * ny + iy] = 1
@@ -2652,10 +2810,11 @@ def _ray_box_entry(origin, direction, aabb, z_range, t_max: float) -> Optional[f
     return t0 if t0 > 1e-6 else None
 
 
-def _room_camera_context(plan: RoomPlan, items: Sequence[Item], doors: Sequence[DoorPlan]) -> dict:
+def _room_camera_context(plan: RoomPlan, items: Sequence[Item], doors: Sequence[DoorPlan],
+                         reserved: Sequence[Tuple[float, float, float, float]] = ()) -> dict:
     """Everything a stand needs: the walkable grid, the coverage targets and the
     blocking furniture (with the probe point a visibility test aims at)."""
-    grid = _walkable_grid(plan, items)
+    grid = _walkable_grid(plan, items, reserved=reserved)
     room_doors = [door for door in doors if plan.room_id in (door.a, door.b)]
     _mark_reachable(grid, [door.center for door in room_doors] or [plan.rect.center])
     blockers = []
@@ -2774,7 +2933,9 @@ def _second_camera_entry(entry: dict, pick: dict) -> dict:
 
 def place_cameras(rng: random.Random, plans: Sequence[RoomPlan], doors: Sequence[DoorPlan],
                   items: Sequence[Item], model: ShellModel,
-                  want_second: bool) -> Tuple[List[dict], Optional[DoorPlan], dict]:
+                  want_second: bool,
+                  reserved_by_room: Optional[Dict[str, List[Tuple[float, float, float, float]]]] = None
+                  ) -> Tuple[List[dict], Optional[DoorPlan], dict]:
     """Pick 1-2 cameras per room by sampling the walkable area.
 
     Every room contributes at least one camera.  Stands come from the room's
@@ -2805,7 +2966,8 @@ def place_cameras(rng: random.Random, plans: Sequence[RoomPlan], doors: Sequence
         items_by_room[item.room].append(item)
     contexts: Dict[str, dict] = {}
     for plan in plans:
-        context = _room_camera_context(plan, items_by_room[plan.room_id], doors)
+        reserved = (reserved_by_room or {}).get(plan.room_id) or ()
+        context = _room_camera_context(plan, items_by_room[plan.room_id], doors, reserved=reserved)
         context["stands"] = _camera_stands(plan, items_by_room[plan.room_id], context["grid"])
         context["doors"] = [door for door in doors if plan.room_id in (door.a, door.b)]
         if not context["stands"]:
@@ -2957,6 +3119,1031 @@ def _spec_dict(seed: int, plans: Sequence[RoomPlan], doors: Sequence[DoorPlan],
     }
 
 
+# --------------------------------------------------------------------------- #
+# step 7: two-floor duplexes (--floors 2)
+# --------------------------------------------------------------------------- #
+# A duplex stacks two floors on ONE footprint: each floor is a row of 2-4 rooms
+# over the same building rectangle, so upper and lower walls line up.  One
+# switchback (or straight) stair connects a room of the lower floor with a room
+# of the upper floor through a hole in the upper slab.  The shaft is reserved
+# space *before* any furniture is placed (``Placer.reserved``), so nothing
+# stands in the stair's way, and the host rooms get no window behind it.
+#
+# The spec stays inside the single-floor contract and adds the multi-floor
+# block (schema frozen with the shared checks work):
+#
+#   floors:       [{id, elevation, height, slab_thickness}] -- elevation is the
+#                 top of the floor's slab (its walking surface); the slab lies
+#                 below that elevation, so stacked floor surfaces are
+#                 ``elevation + height + next slab`` apart,
+#   room:         ``floor_id`` -- XY polygons stay floor-local (the same
+#                 rectangle on both floors is what "stacked" means),
+#   openings /    same-floor doors and windows in the single-floor format (the
+#   windows:      floor follows from the room ids),
+#   connector:    [{kind: "stair", from_room, to_room, from_floor, to_floor,
+#                 width, run, rise, steps, landing_m}] -- the one element that
+#                 crosses floors,
+#   slab_opening: [{outline, floors}] -- the stair shaft cut out of the upper
+#                 slab,
+#   furniture /   ``z`` is a WORLD height whenever it is set (generator writes
+#   cameras:      ``elevation + local``); a floor-standing item with ``z = None``
+#                 rests on its own room's floor, and a camera carries its
+#                 absolute eye height.
+#
+# ``check_duplex_spec`` re-validates exactly that from the written JSON --
+# rooms, doors and windows per floor, the shaft inside both host rooms and
+# clear of their doors, the slab opening, no furniture in the reserved shaft,
+# the world-z rules and a 2.5D reachability pass (per-floor doors plus the
+# stair edge) from the entrance.  It is the generator-side acceptance until the
+# shared multi-floor API of ``blender_agent/checks.py`` lands; the layout
+# report records both when it does.
+
+FLOOR_SLAB_M = 0.20
+FLOOR_IDS = ("F1", "F2")
+DUPLEX_DEPTH_RANGE = (3.95, 4.60)
+DUPLEX_DEPTH_STEP_M = 0.05
+DUPLEX_WIDTH_MAX_M = 14.0
+STAIR_STEPS = 16
+STAIR_WIDTH_M = 0.95
+STAIR_TREAD_M = 0.25
+STAIR_LANDING_M = 0.85
+#: the outline of the slab opening is the stair footprint (twice the flight
+#: width across, run + landing along) plus this clearance on every side:
+#: spec.stair_plan builds the switchback flights inside a rectangle of exactly
+#: the footprint, and checks._footprint_opening_coverage samples the footprint's
+#: bounding box (boundary samples included), so the opening must contain the
+#: footprint strictly or the coverage number misses a whole edge
+STAIR_ACROSS_M = 2.0 * STAIR_WIDTH_M
+STAIR_HOLE_CLEARANCE_M = 0.02
+#: clear space the walker needs in front of the first riser / behind the last
+#: step; checks.stair_clearance measures 0.80 m rects plus 0.15 m furniture
+#: clearance, so the reserve has to reach 0.95 m past the shaft's open side
+STAIR_ARRIVAL_M = 1.00
+STAIR_PAD_M = 0.20
+STAIR_EDGE_M = WALL_THICKNESS / 2.0
+STAIR_MIN_WIDTH_M = 0.80
+STAIR_MAX_RISE_M = 0.21
+HOST_MIN_W_M = 3.10
+#: floor programmes: floor 1 is the public floor (entrance, living, cooking),
+#: floor 2 the sleeping floor (a hall/landing for the stair, bedroom, bathroom,
+#: study, maybe a small living room)
+FLOOR1_BASE = ("living_room", "kitchen")
+FLOOR1_EXTRA = (("entry", 3.0), ("dining", 2.0), ("bathroom", 2.0))
+FLOOR2_BASE = ("corridor", "bedroom")
+FLOOR2_EXTRA = (("bathroom", 3.0), ("study", 3.0), ("bedroom", 2.0), ("living_room", 1.0))
+#: room types a stair may land in, and the width its host room needs: the
+#: landing hall only has to keep a walkable strip beside the shaft, a bedroom /
+#: study / living room has to keep enough wall for its bed, desk or sofa
+HOST_TYPES = ("corridor", "living_room", "kitchen", "dining", "study", "bedroom")
+HOST_MIN_W = {"corridor": 3.10}
+HOST_MIN_W_M = 4.60
+#: duplex rooms also need a workable width of their own (a middle bedroom with
+#: two door approaches keeps this much floor between them)
+DUPLEX_MIN_W = {"bedroom": 3.50, "dining": 2.60, "living_room": 3.40}
+
+
+def _floor_records() -> List[dict]:
+    """The two floor entries: 0.00 m and 2.90 m (2.70 clear + 0.20 slab)."""
+    return [
+        {"id": FLOOR_IDS[0], "elevation": 0.0, "height": WALL_HEIGHT,
+         "slab_thickness": FLOOR_SLAB_M},
+        {"id": FLOOR_IDS[1], "elevation": round(WALL_HEIGHT + FLOOR_SLAB_M, 4),
+         "height": WALL_HEIGHT, "slab_thickness": FLOOR_SLAB_M},
+    ]
+
+
+def _weighted_sample(rng: random.Random, pool: Sequence[Tuple[str, float]], count: int) -> List[str]:
+    """``count`` items off ``[(item, weight)]`` without replacement."""
+    items = list(pool)
+    chosen: List[str] = []
+    for _ in range(count):
+        total = sum(weight for _item, weight in items)
+        target = rng.uniform(0.0, total)
+        acc = 0.0
+        for index, (item, weight) in enumerate(items):
+            acc += weight
+            if target <= acc or index == len(items) - 1:
+                chosen.append(item)
+                items.pop(index)
+                break
+    return chosen
+
+
+def duplex_programme(rng: random.Random, total: Optional[int] = None) -> Tuple[List[str], List[str]]:
+    """The two floor programmes of a duplex: 2-4 rooms each (see the pools).
+
+    Floor 1 always gets a living room and a kitchen, floor 2 a bedroom and a
+    bathroom; the remaining slots are drawn from the floor's extra pool.  With
+    ``total`` the per-floor counts are ``total // 2`` and the rest (4..8 rooms
+    overall, 2-4 per floor), otherwise each floor draws its count from the seed.
+    """
+    if total is None:
+        count1 = rng.choice((2, 3, 4))
+        count2 = rng.choice((2, 3, 4))
+    else:
+        if not 4 <= total <= 8:
+            raise ValueError(f"a duplex needs 4..8 rooms in total, not {total}")
+        count1 = int(_clamp(total // 2, 2, 4))
+        count2 = int(total) - count1
+    pool2 = FLOOR2_EXTRA
+    if count2 == 3:
+        # a single extra bedroom beside the base bedroom has no good chain (the
+        # hall would sit in the middle and a bedroom would host the stair)
+        pool2 = tuple((room_type, weight) for room_type, weight in FLOOR2_EXTRA
+                      if room_type != "bedroom")
+    types1 = list(FLOOR1_BASE) + _weighted_sample(rng, FLOOR1_EXTRA, count1 - len(FLOOR1_BASE))
+    types2 = list(FLOOR2_BASE) + _weighted_sample(rng, pool2, count2 - len(FLOOR2_BASE))
+    return types1, types2
+
+
+def _chain_semantics_violations(types: Sequence[str]) -> List[str]:
+    """The door rules as a pure chain: consecutive rooms exist, the rest the same.
+
+    The rooms of one duplex floor form a row, so only consecutive rooms share a
+    wall and the door graph is the chain.  This is :func:`door_semantics` reduced
+    to that graph: a bathroom is an end (never crossed), a private room never
+    splits the public rooms, the forbidden pairs (kitchen/bathroom,
+    kitchen/bedroom, bedroom/bedroom, bathroom/bathroom) never touch, and a
+    dining room is adjacent to the kitchen.
+    """
+    violations: List[str] = []
+    count = len(types)
+    if count < 2:
+        return violations
+    degrees = [0] * count
+    for index in range(count - 1):
+        pair = tuple(sorted((types[index], types[index + 1])))
+        if pair in (("bathroom", "bathroom"), ("bathroom", "kitchen"),
+                    ("bedroom", "bedroom"), ("bedroom", "kitchen")):
+            violations.append(f"forbidden door pair {types[index]}/{types[index + 1]}")
+        degrees[index] += 1
+        degrees[index + 1] += 1
+    for index, room_type in enumerate(types):
+        if room_type == "bathroom" and degrees[index] > 1:
+            violations.append(f"bathroom #{index} is crossed (degree {degrees[index]})")
+    public = [index for index, room_type in enumerate(types) if room_type not in PRIVATE_ROOM_TYPES]
+    if public and public != list(range(min(public), max(public) + 1)):
+        violations.append("a bedroom/bathroom splits the public rooms")
+    if "dining" in types:
+        kitchens = [index for index, room_type in enumerate(types) if room_type == "kitchen"]
+        if kitchens and not any(
+                abs(kitchen - index) == 1 for kitchen in kitchens
+                for index, room_type in enumerate(types) if room_type == "dining"):
+            violations.append("the kitchen is not next to the dining room")
+    return violations
+
+
+def _order_floor_chain(rng: random.Random, types: Sequence[str]) -> List[List[str]]:
+    """Every semantics-valid room order of one floor, seed-shuffled."""
+    orders = [list(order) for order in itertools.permutations(types)]
+    rng.shuffle(orders)
+    return [order for order in orders if not _chain_semantics_violations(order)]
+
+
+def _hostable(room_type: str) -> bool:
+    """May a stair land in this room type (an entry/bathroom cell is too narrow)?"""
+    return room_type in HOST_TYPES
+
+
+def _host_min_width(room_type: str) -> float:
+    """Width the stair host room needs to keep its function beside the shaft."""
+    return HOST_MIN_W.get(room_type, HOST_MIN_W_M)
+
+
+def _allocate_widths(rng: random.Random, lows: Sequence[float], highs: Sequence[float],
+                     total: float) -> Optional[List[float]]:
+    """Widths summing to ``total`` with every width in ``[low, high]``.
+
+    Randomised water-filling: the leftover width is handed out proportionally to
+    seed-drawn weights, capped per room; ``None`` when no allocation exists.
+    """
+    if total < sum(lows) - 1e-9 or total > sum(highs) + 1e-9:
+        return None
+    widths = list(lows)
+    room = total - sum(lows)
+    active = [index for index in range(len(lows)) if highs[index] - lows[index] > 1e-9]
+    guard = 0
+    while room > 1e-9 and active and guard < 80:
+        guard += 1
+        weights = [rng.random() + 0.02 for _ in active]
+        weight_sum = sum(weights)
+        progressed = False
+        for index, weight in zip(active, weights):
+            add = min(room * weight / weight_sum, highs[index] - widths[index])
+            if add <= 0.0:
+                continue
+            widths[index] += add
+            room -= add
+            progressed = True
+        active = [index for index in active if highs[index] - widths[index] > 1e-9]
+        if not progressed:
+            break
+    if room > 1e-6:
+        return None
+    return widths
+
+
+@dataclass
+class StairPlan:
+    """One stair between two floors: shaft rectangle, flights and clear space."""
+
+    kind: str
+    from_room: str
+    to_room: str
+    from_floor: str
+    to_floor: str
+    shaft: Rect
+    width: float
+    run: float
+    rise: float
+    steps: int
+    landing_m: float
+
+    def connector(self) -> dict:
+        """The connector record: fields + the anchor the shared contract needs.
+
+        ``center`` is the middle of the shaft and ``direction_deg`` the climbing
+        direction (CCW from +X): 270 means the flights run southwards along -Y,
+        so the walker boards and leaves on the shaft's north (open) side.  The
+        slab opening outline stays the same rectangle, which is why the shared
+        stair resolver can rebuild the exact flights from these four numbers.
+        """
+        shaft = self.shaft
+        return {"kind": "stair", "from_room": self.from_room, "to_room": self.to_room,
+                "from_floor": self.from_floor, "to_floor": self.to_floor,
+                "width": round(self.width, 4), "run": round(self.run, 4),
+                "rise": round(self.rise, 4), "steps": int(self.steps),
+                "landing_m": round(self.landing_m, 4),
+                "center": [round(0.5 * (shaft.x0 + shaft.x1), 4),
+                           round(0.5 * (shaft.y0 + shaft.y1), 4)],
+                "direction_deg": 270.0}
+
+    def reserve(self) -> Tuple[float, float, float, float]:
+        """Keep-clear rectangle: the shaft plus the walk-off strip at its mouth.
+
+        Both flights of the switchback board and arrive at the shaft's +Y side,
+        so that side carries the ``STAIR_ARRIVAL_M`` strip: no furniture may
+        stand on the stair, in front of its first riser or behind its top step
+        (which is exactly what ``checks.stair_clearance`` measures).
+        """
+        shaft = self.shaft
+        return (shaft.x0 - STAIR_PAD_M, shaft.y0 - STAIR_PAD_M,
+                shaft.x1 + STAIR_PAD_M, shaft.y1 + STAIR_ARRIVAL_M)
+
+    def mouth(self) -> Tuple[float, float]:
+        """The open-side point the walker boards at / arrives on (host rooms
+        must keep the floor around it free and connected to their doorways)."""
+        return (0.5 * (self.shaft.x0 + self.shaft.x1),
+                min(self.shaft.y1 + 0.40, self.shaft.y1 + STAIR_ARRIVAL_M))
+
+    def shaft_bounds(self) -> Tuple[float, float, float, float]:
+        """The shaft rectangle as a boundary tuple (the footprint checks use)."""
+        return (self.shaft.x0, self.shaft.y0, self.shaft.x1, self.shaft.y1)
+
+
+def plan_duplex_stair(rng: random.Random, side: str, host1: RoomPlan, host2: RoomPlan,
+                      doors1: Sequence[DoorPlan], doors2: Sequence[DoorPlan],
+                      width_total: float, depth: float) -> StairPlan:
+    """Place the stair shaft in the two host rooms, before any furniture.
+
+    A switchback stair: two half flights of ``STAIR_STEPS // 2`` risers side by
+    side along Y with a half landing at the far (south) end, so the walker
+    boards at the shaft's north-east corner, climbs south along the east half
+    and comes back north along the west half, one storey higher (the geometry
+    ``spec.stair_plan`` rebuilds from ``center`` + ``direction_deg`` = 270).
+    The shaft leans on the building's south wall at the end of the plan (the
+    ``side`` both hosts sit on) and must stay inside both rooms and clear of
+    their door approaches; otherwise the attempt fails and the layout is
+    redrawn with a fresh seed stream.
+    """
+    rise = round(WALL_HEIGHT + FLOOR_SLAB_M, 4)
+    run = STAIR_TREAD_M * (STAIR_STEPS // 2)
+    length, across = STAIR_ACROSS_M, run + STAIR_LANDING_M
+    if side == "W":
+        x0 = STAIR_EDGE_M
+    else:
+        x0 = width_total - STAIR_EDGE_M - length
+    shaft = Rect(x0, STAIR_EDGE_M, x0 + length, STAIR_EDGE_M + across)
+    if depth - shaft.y1 < STAIR_ARRIVAL_M:
+        raise _AttemptFailed("no walkway in front of the stair")
+    for host, doors in ((host1, doors1), (host2, doors2)):
+        host_doors = [door for door in doors if host.room_id in (door.a, door.b)]
+        if shaft.x0 < host.rect.x0 + 0.01 or shaft.x1 > host.rect.x1 - 0.01:
+            raise _AttemptFailed(f"the stair shaft leaves room {host.room_id}")
+        for door in host_doors:
+            for zone in door_rects_for(host.rect, [door]):
+                if checks_mod.rect_distance((shaft.x0, shaft.y0, shaft.x1, shaft.y1), zone) < 0.10:
+                    raise _AttemptFailed(f"the stair shaft blocks a door of room {host.room_id}")
+    return StairPlan(kind="switchback", from_room=host1.room_id, to_room=host2.room_id,
+                     from_floor=FLOOR_IDS[0], to_floor=FLOOR_IDS[1], shaft=shaft,
+                     width=STAIR_WIDTH_M, run=round(run, 4), rise=rise, steps=STAIR_STEPS,
+                     landing_m=STAIR_LANDING_M)
+
+
+def _duplex_width_candidates(rng: random.Random, order1: Sequence[str], order2: Sequence[str],
+                             side: str) -> List[Tuple[float, List[Tuple[List[float], List[float]]],
+                                                   float, float]]:
+    """Depths at which both floors' programmes share a building width.
+
+    The width is shared by the two floors, so each depth gives two per-room
+    ``[low, high]`` width windows; a depth is a candidate when the floors'
+    total-width windows overlap by at least 0.20 m (room for the randomised
+    allocation).  Returns ``(depth, bounds, span_low, span_high)`` entries.
+    """
+    candidates: List[Tuple[float, List[Tuple[List[float], List[float]]], float, float]] = []
+    depths = [round(DUPLEX_DEPTH_RANGE[0] + step * DUPLEX_DEPTH_STEP_M, 2)
+              for step in range(int(round((DUPLEX_DEPTH_RANGE[1] - DUPLEX_DEPTH_RANGE[0])
+                                          / DUPLEX_DEPTH_STEP_M)) + 1)]
+    rng.shuffle(depths)
+    for depth in depths:
+        floors_bounds = []
+        feasible = True
+        for order in (order1, order2):
+            host_end = 0 if side == "W" else len(order) - 1
+            lows, highs = [], []
+            for position, room_type in enumerate(order):
+                area_low, area_high = ROOM_AREA_M2[room_type]
+                low = max(area_low / depth, ROOM_MIN_DIM_M[room_type],
+                          DUPLEX_MIN_W.get(room_type, 0.0))
+                high = area_high / depth
+                if position == host_end:
+                    low = max(low, _host_min_width(room_type))
+                if high < low - 1e-9:
+                    feasible = False
+                    break
+                lows.append(low)
+                highs.append(high)
+            if not feasible:
+                break
+            floors_bounds.append((lows, highs))
+        if not feasible:
+            continue
+        span_low = max(sum(lows) for lows, _highs in floors_bounds)
+        span_high = min(min(sum(highs) for _lows, highs in floors_bounds), DUPLEX_WIDTH_MAX_M)
+        if span_high - span_low < 0.20:
+            continue
+        candidates.append((depth, floors_bounds, span_low, span_high))
+    return candidates
+
+
+def _build_duplex_attempt(rng: random.Random, room_count: Optional[int], index: Dict[str, dict],
+                          attempt: int, seed: int) -> Tuple[dict, dict]:
+    """One duplex attempt: programme, shared footprint, stair, furniture, cameras.
+
+    A programme pair that cannot share a building width, or a floor whose rooms
+    admit no semantics-valid chain, is redrawn (a few times) inside the attempt
+    before the attempt itself is given up: those are programme draws, not
+    geometry failures, and redrawing them keeps the per-attempt yield high.
+    """
+    chosen = None
+    for _redraw in range(8):
+        types1, types2 = duplex_programme(rng, room_count)
+        if "bathroom" not in list(types1) + list(types2):
+            continue                      # a home needs a bathroom somewhere
+        orders1 = _order_floor_chain(rng, types1)
+        orders2 = _order_floor_chain(rng, types2)
+        if not orders1 or not orders2:
+            continue
+        sides = ["W", "E"]
+        rng.shuffle(sides)
+        for side in sides:
+            end = 0 if side == "W" else -1
+            low_orders = [order for order in orders1 if _hostable(order[end])]
+            high_orders = [order for order in orders2 if _hostable(order[end])]
+            if not low_orders or not high_orders:
+                continue
+            # the upstairs hall is the natural place for the stair: prefer an
+            # ordering that ends with the corridor, fall back to any hostable end
+            for pick_hall in (True, False):
+                hall_low = [order for order in low_orders
+                            if order[end] == "corridor"] if pick_hall else low_orders
+                hall_high = [order for order in high_orders
+                             if order[end] == "corridor"] if pick_hall else high_orders
+                if not hall_low or not hall_high:
+                    continue
+                order1 = rng.choice(hall_low)
+                order2 = rng.choice(hall_high)
+                candidates = _duplex_width_candidates(rng, order1, order2, side)
+                if candidates:
+                    chosen = (side, order1, order2, candidates)
+                    break
+            if chosen is not None:
+                break
+        if chosen is not None:
+            break
+    if chosen is None:
+        raise _AttemptFailed("no duplex programme pair shares a building width")
+    side, order1, order2, candidates = chosen
+    depth, floors_bounds, span_low, span_high = rng.choice(candidates)
+    # bias the width up: larger rooms leave the furniture slots room to breathe
+    width_total = _clamp(round(span_low + (span_high - span_low) * (0.35 + 0.65 * rng.random()), 2),
+                         span_low, span_high)
+
+    plans_floor: List[List[RoomPlan]] = []
+    ids: Dict[str, int] = {}
+    for order, (lows, highs) in zip((order1, order2), floors_bounds):
+        widths = _allocate_widths(rng, lows, highs, width_total)
+        if widths is None:
+            raise _AttemptFailed("no width allocation for a floor")
+        xs = [0.0]
+        for width in widths:
+            xs.append(_round(xs[-1] + width, 0.01))
+        xs[-1] = width_total
+        plans = []
+        for position, room_type in enumerate(order):
+            rect = Rect(xs[position], 0.0, xs[position + 1], depth)
+            area_low, area_high = ROOM_AREA_M2[room_type]
+            # the 1 cm boundary snap can move an area by at most 0.01 * depth
+            if not (area_low - 0.06 <= rect.area <= area_high + 0.06):
+                raise _AttemptFailed(f"{room_type} area {rect.area:.2f} m2 outside "
+                                     f"[{area_low}, {area_high}] after the width snap")
+            if min(rect.w, rect.h) < ROOM_MIN_DIM_M[room_type] - 1e-9:
+                raise _AttemptFailed(f"{room_type} too small ({rect.w:.2f}x{rect.h:.2f} m)")
+            base = ROOM_ID_BASE[room_type]
+            ids[base] = ids.get(base, 0) + 1
+            plans.append(RoomPlan(room_id=base if ids[base] == 1 else f"{base}_{ids[base]}",
+                                  room_type=room_type, rect=rect, target_area=rect.area,
+                                  width=rect.w, depth=rect.h))
+        plans_floor.append(plans)
+
+    doors_floor = []
+    semantics_by_floor = {}
+    for floor_id, plans in zip(FLOOR_IDS, plans_floor):
+        doors = plan_doors(rng, plans, chain=plans)
+        semantics = door_semantics(plans, doors)
+        if not semantics["pass"]:
+            raise _AttemptFailed("duplex floor: " + "; ".join(semantics["violations"][:2]))
+        doors_floor.append(doors)
+        semantics_by_floor[floor_id] = semantics
+
+    host_index = 0 if side == "W" else -1
+    host1, host2 = plans_floor[0][host_index], plans_floor[1][host_index]
+    stair = plan_duplex_stair(rng, side, host1, host2, doors_floor[0], doors_floor[1],
+                              width_total, depth)
+
+    avoid = {}
+    for host in (host1, host2):
+        avoid[host.room_id] = [("S", stair.shaft.x0 - 0.35, stair.shaft.x1 + 0.35),
+                               ("W" if side == "W" else "E", -10.0, 10.0)]
+    windows_floor = [plan_windows(rng, plans_floor[0], avoid),
+                     plan_windows(rng, plans_floor[1], avoid)]
+
+    reserve = {host1.room_id: [stair.reserve()], host2.room_id: [stair.reserve()]}
+    mouths = {host1.room_id: [stair.mouth()], host2.room_id: [stair.mouth()]}
+    shafts = {host1.room_id: [stair.shaft_bounds()], host2.room_id: [stair.shaft_bounds()]}
+    items_floor = []
+    slots_floor = []
+    for plans, doors, windows in zip(plans_floor, doors_floor, windows_floor):
+        items, slots = furnish_rooms(rng, plans, doors, windows, index,
+                                     reserved_by_room=reserve, mouths_by_room=mouths,
+                                     shafts_by_room=shafts)
+        items_floor.append(items)
+        slots_floor.append(slots)
+
+    elevations = [record["elevation"] for record in _floor_records()]
+    cameras: List[dict] = []
+    forecast: Dict[str, dict] = {}
+    openings_first: List[Optional[DoorPlan]] = []
+    next_camera = 0
+    for position, plans in enumerate(plans_floor):
+        rooms_by_id = {plan.room_id: plan.rect for plan in plans}
+        model = ShellModel(rooms_by_id, doors_floor[position], items_floor[position])
+        floor_cameras, opening0, floor_forecast = place_cameras(
+            rng, plans, doors_floor[position], items_floor[position], model,
+            want_second=len(plans) <= 3, reserved_by_room=reserve)
+        for camera in floor_cameras:
+            name = f"{next_camera:04d}"
+            next_camera += 1
+            cameras.append({"name": name, "room": camera["room"],
+                            "pos": [camera["pos"][0], camera["pos"][1],
+                                    round(elevations[position] + camera["pos"][2], 4)]})
+            forecast[name] = floor_forecast[camera["name"]]
+        openings_first.append(opening0)
+
+    floors = _floor_records()
+    spec = _spec_dict_duplex(seed, floors, plans_floor, doors_floor, windows_floor, cameras,
+                             items_floor, openings_first, stair)
+    spec["_comment"].append(f"floors=2 rooms={sum(len(plans) for plans in plans_floor)} "
+                            f"attempt={attempt} furniture="
+                            f"{sum(len(items) for items in items_floor)} shape=duplex")
+    graph_edges: List[List] = [[door.a, door.b, "door"] for doors in doors_floor for door in doors]
+    graph_edges.append([stair.from_room, stair.to_room, "stair"])
+    report = {
+        "shape": "duplex",
+        "family": None,
+        "floors": [
+            {"id": floor["id"], "elevation": floor["elevation"], "height": floor["height"],
+             "slab_thickness": floor["slab_thickness"],
+             "programme": [plan.room_type for plan in plans_floor[position]],
+             "rooms": [plan.room_id for plan in plans_floor[position]]}
+            for position, floor in enumerate(floors)],
+        "stair": {
+            "kind": stair.kind, "from_room": stair.from_room, "to_room": stair.to_room,
+            "from_floor": stair.from_floor, "to_floor": stair.to_floor,
+            "shaft": [stair.shaft.x0, stair.shaft.y0, stair.shaft.x1, stair.shaft.y1],
+            "reserve": list(stair.reserve()), "width": stair.width, "run": stair.run,
+            "rise": stair.rise, "steps": stair.steps, "landing_m": stair.landing_m,
+        },
+        "slab_opening": {"outline": [[stair.shaft.x0, stair.shaft.y0],
+                                     [stair.shaft.x1, stair.shaft.y0],
+                                     [stair.shaft.x1, stair.shaft.y1],
+                                     [stair.shaft.x0, stair.shaft.y1]],
+                         "floors": [stair.to_floor]},
+        "door_semantics": semantics_by_floor,
+        "rooms": [{"id": plan.room_id, "type": plan.room_type, "floor_id": floor["id"],
+                   "rect": [plan.rect.x0, plan.rect.y0, plan.rect.x1, plan.rect.y1],
+                   "area_m2": round(plan.rect.area, 2), "polygon": plan.rect.polygon()}
+                  for floor, plans in zip(floors, plans_floor) for plan in plans],
+        "room_graph": {"nodes": [plan.room_id for plans in plans_floor for plan in plans],
+                       "edges": graph_edges},
+        "doors": [{"between": [door.a, door.b],
+                   "center": [round(door.center[0], 3), round(door.center[1], 3)],
+                   "width": DOOR_W, "height": DOOR_H, "wall_side": door.wall.side,
+                   "floor_id": floor["id"]}
+                  for floor, doors in zip(floors, doors_floor) for door in doors],
+        "windows": [{"room": entry["room"], "wall": entry["wall"], "sill": entry["sill"],
+                     "height": entry["height"], "floor_id": floor["id"]}
+                    for position, (floor, windows) in enumerate(zip(floors, windows_floor))
+                    for plan in plans_floor[position]
+                    for entry in windows.get(plan.room_id, [])],
+        "cameras": cameras,
+        "furniture": [{"name": item.name, "asset": item.asset, "room": item.room,
+                       "pos": [round(item.pos[0], 3), round(item.pos[1], 3)],
+                       "rot_z_deg": item.rot_z_deg, "z": item.z, "mount": item.mount,
+                       "size_m": [round(v, 3) for v in item.dims], "placement": item.placement,
+                       "slot": item.slot, "attached_to": item.attached_to,
+                       "floor_id": floor["id"]}
+                      for floor, items in zip(floors, items_floor) for item in items],
+        "furniture_slots": slots_floor,
+        "opening_0": openings_first[0].key() if openings_first[0] is not None else None,
+        "door_visual_forecast": forecast,
+    }
+    return spec, report
+
+
+def _spec_dict_duplex(seed: int, floors: Sequence[dict], plans_floor: Sequence[Sequence[RoomPlan]],
+                      doors_floor: Sequence[Sequence[DoorPlan]],
+                      windows_floor: Sequence[Dict[str, List[dict]]], cameras: Sequence[dict],
+                      items_floor: Sequence[Sequence[Item]],
+                      openings_first: Sequence[Optional[DoorPlan]], stair: StairPlan) -> dict:
+    """The scene spec of a duplex: single-floor format + floors/connector/slab."""
+    rooms = []
+    for floor, plans in zip(floors, plans_floor):
+        for plan in plans:
+            rooms.append({"id": plan.room_id, "type": plan.room_type, "floor_id": floor["id"],
+                          "polygon": plan.rect.polygon(),
+                          "floor_color": ROOM_FLOOR_COLOR.get(plan.room_type, ROOM_FLOOR_COLOR_DEFAULT)})
+    openings = []
+    for plans, doors, first in zip(plans_floor, doors_floor, openings_first):
+        order = ([first] if first is not None else []) + [door for door in doors if door is not first]
+        for door in order:
+            openings.append({"kind": "door", "between": [door.a, door.b],
+                             "center": [round(door.center[0], 4), round(door.center[1], 4)],
+                             "width": DOOR_W, "height": DOOR_H})
+    windows_out = []
+    for plans, windows in zip(plans_floor, windows_floor):
+        for plan in plans:
+            for entry in windows.get(plan.room_id, []):
+                windows_out.append({"room": entry["room"], "wall": entry["wall"],
+                                    "sill": entry["sill"], "height": entry["height"]})
+    furniture = []
+    for floor, items in zip(floors, items_floor):
+        for item in items:
+            entry = item.to_json()
+            if entry.get("z") is not None:
+                entry["z"] = round(float(floor["elevation"]) + float(entry["z"]), 4)
+            furniture.append(entry)
+    shaft = stair.shaft
+    hole = STAIR_HOLE_CLEARANCE_M
+    slab_opening = {"outline": [[round(shaft.x0 - hole, 4), round(shaft.y0 - hole, 4)],
+                                [round(shaft.x1 + hole, 4), round(shaft.y0 - hole, 4)],
+                                [round(shaft.x1 + hole, 4), round(shaft.y1 + hole, 4)],
+                                [round(shaft.x0 - hole, 4), round(shaft.y1 + hole, 4)]],
+                    "floors": [stair.to_floor]}
+    return {
+        "_comment": [
+            f"generated by blender_agent/layout_gen.py --seed {seed} --floors 2",
+            "duplex: two floors on one footprint, each a row of 2-4 rooms; a switchback stair",
+            "connects the two floors through a slab opening.  'floors' carries the elevations",
+            "(elevation = top of that floor's slab), room.floor_id places each room, 'connectors'",
+            "the stair (width/run/rise/steps/landing_m plus its centre and climbing direction)",
+            "and 'slab_openings' the shaft cut out of the upper slab.  Furniture/camera z is",
+            "world height; a floor-standing item with z=null rests on its own room's floor.",
+            "Doors and windows stay floor-local, in the single-floor format.",
+        ],
+        "schema_version": 2,
+        "unit": "meter",
+        "wall_height": WALL_HEIGHT,
+        "wall_thickness": WALL_THICKNESS,
+        "floors": list(floors),
+        "rooms": rooms,
+        "openings": openings,
+        "windows": windows_out,
+        "connectors": [stair.connector()],
+        "slab_openings": [slab_opening],
+        "cameras": list(cameras),
+        "style": dict(STYLE_DEFAULTS),
+        "materials": json.loads(json.dumps(MATERIAL_DEFAULTS)),
+        "details": dict(DETAIL_DEFAULTS),
+        "lighting": dict(LIGHTING_DEFAULTS),
+        "furniture": furniture,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# step 7b: the generator-side duplex validator
+# --------------------------------------------------------------------------- #
+@dataclass
+class _RoomPolygon:
+    """Minimal room record for :func:`spec.build_wall_segments` (id + polygon)."""
+
+    id: str
+    polygon: List[List[float]]
+
+
+def _floor_rooms(spec_dict: dict, floor_id: str) -> List[_RoomPolygon]:
+    return [_RoomPolygon(id=str(room["id"]),
+                         polygon=[list(map(float, point)) for point in room["polygon"]])
+            for room in spec_dict["rooms"] if str(room.get("floor_id")) == floor_id]
+
+
+def _rect_of_polygon(polygon: Sequence[Sequence[float]]) -> Tuple[float, float, float, float]:
+    xs = [float(point[0]) for point in polygon]
+    ys = [float(point[1]) for point in polygon]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _opening_zone(opening: dict, segments, wall_thickness: float):
+    """Approach rectangle of an opening on both sides of its wall (checks.py rule)."""
+    segment = spec_mod.wall_segment_for_point(segments, opening["center"], opening["between"][0])
+    if segment is None:
+        return None
+    ux, uy = segment.direction
+    half_w = float(opening["width"]) / 2.0 + checks_mod.DOOR_ZONE_EXTRA_W_M / 2.0
+    half_d = checks_mod.DOOR_ZONE_DEPTH_M + wall_thickness / 2.0
+    cx, cy = float(opening["center"][0]), float(opening["center"][1])
+    return (cx - abs(ux) * half_w - abs(uy) * half_d, cy - abs(uy) * half_w - abs(ux) * half_d,
+            cx + abs(ux) * half_w + abs(uy) * half_d, cy + abs(uy) * half_w + abs(ux) * half_d)
+
+
+def check_duplex_spec(spec_dict: dict, assets_index: Optional[Dict[str, dict]] = None) -> dict:
+    """2.5D validation of a generated two-floor spec, straight from its JSON.
+
+    The generator-side acceptance for ``--floors 2``: floor stacking, 2-4 rooms
+    per floor with same-floor doors on shared walls, windows on exterior spans,
+    the stair connector (rise/steps/width) with its shaft inside both host rooms,
+    clear of their doorways and open through the upper slab only, no furniture in
+    the reserved shaft, world-z consistency for furniture and cameras, and a
+    reachability pass from the entrance over the same-floor doors plus the stair
+    edge.  ``blender_agent/checks.py`` gains the shared multi-floor rule set in
+    parallel; once it lands this is the regression twin to keep them honest.
+    """
+    index = assets_index if assets_index is not None else checks_mod.load_assets_index()
+    violations: List[str] = []
+    checks: List[dict] = []
+
+    def record(name: str, ok: bool, **payload) -> None:
+        entry = {"name": name, "pass": bool(ok)}
+        entry.update(payload)
+        checks.append(entry)
+
+    wall_thickness = float(spec_dict.get("wall_thickness", WALL_THICKNESS))
+    wall_height = float(spec_dict.get("wall_height", WALL_HEIGHT))
+
+    # -- floors ------------------------------------------------------------ #
+    floors = spec_dict.get("floors") or []
+    floor_ids = [str(floor.get("id")) for floor in floors]
+    problems: List[str] = []
+    ok_floors = len(floors) == 2 and len(set(floor_ids)) == 2
+    if ok_floors:
+        ordered = sorted(floors, key=lambda floor: float(floor["elevation"]))
+        lower, upper = ordered
+        if abs(float(lower["elevation"])) > 1e-9:
+            problems.append("the lower floor must start at elevation 0")
+        expected = float(lower["elevation"]) + float(lower["height"]) + float(upper["slab_thickness"])
+        if abs(float(upper["elevation"]) - expected) > 1e-6:
+            problems.append(f"floor {upper['id']} elevation {upper['elevation']} does not stack "
+                            f"({lower['elevation']} + {lower['height']} + {upper['slab_thickness']})")
+        ok_floors = not problems
+    else:
+        problems.append("a duplex spec needs exactly two floors")
+    record("duplex_floors", ok_floors, violations=problems,
+           floors=[{k: floor.get(k) for k in ("id", "elevation", "height", "slab_thickness")}
+                   for floor in floors])
+    violations.extend(problems)
+
+    # -- rooms per floor --------------------------------------------------- #
+    room_problems: List[str] = []
+    rooms = spec_dict.get("rooms") or []
+    per_floor_rooms: Dict[str, List[dict]] = {floor_id: [] for floor_id in floor_ids}
+    for room in rooms:
+        floor_id = str(room.get("floor_id"))
+        if floor_id not in per_floor_rooms:
+            room_problems.append(f"room '{room.get('id')}' has unknown floor_id '{floor_id}'")
+            continue
+        per_floor_rooms[floor_id].append(room)
+    for floor_id, floor_rooms in per_floor_rooms.items():
+        if not 2 <= len(floor_rooms) <= 4:
+            room_problems.append(f"floor {floor_id} has {len(floor_rooms)} rooms (2..4 expected)")
+        rectangles = []
+        for room in floor_rooms:
+            polygon = [list(map(float, point)) for point in room["polygon"]]
+            if spec_mod.polygon_area(polygon) <= 0.0:
+                room_problems.append(f"room '{room['id']}' polygon is not counter-clockwise")
+            rectangles.append((room["id"],) + _rect_of_polygon(polygon))
+        for index_, first in enumerate(rectangles):
+            for second in rectangles[index_ + 1:]:
+                overlap_x = min(first[3], second[3]) - max(first[1], second[1])
+                overlap_y = min(first[4], second[4]) - max(first[2], second[2])
+                if overlap_x > 1e-6 and overlap_y > 1e-6:
+                    room_problems.append(f"rooms {first[0]} and {second[0]} overlap")
+    record("duplex_rooms", not room_problems, violations=room_problems,
+           counts={floor_id: len(floor_rooms) for floor_id, floor_rooms in per_floor_rooms.items()})
+    violations.extend(room_problems)
+
+    # -- doors (openings) --------------------------------------------------- #
+    door_problems: List[str] = []
+    segments_by_floor: Dict[str, list] = {}
+    for floor_id in floor_ids:
+        segments_by_floor[floor_id] = spec_mod.build_wall_segments(_floor_rooms(spec_dict, floor_id))
+    room_floor = {str(room["id"]): str(room.get("floor_id")) for room in rooms}
+    for opening in spec_dict.get("openings", []):
+        a, b = str(opening["between"][0]), str(opening["between"][1])
+        if room_floor.get(a) != room_floor.get(b):
+            door_problems.append(f"opening {opening['between']} crosses floors")
+            continue
+        if opening.get("kind", "door") != "door":
+            door_problems.append(f"opening {opening['between']} has unknown kind "
+                                 f"'{opening.get('kind')}'")
+            continue
+        segments = segments_by_floor[room_floor[a]]
+        shared = [segment for segment in segments
+                  if a in segment.owners and b in segment.owners
+                  and segment.contains_point(opening["center"])]
+        if not shared:
+            door_problems.append(f"door {opening['between']} does not sit on a shared wall")
+            continue
+        segment = shared[0]
+        half = float(opening["width"]) / 2.0
+        along = ((float(opening["center"][0]) - segment.p0[0]) * segment.direction[0]
+                 + (float(opening["center"][1]) - segment.p0[1]) * segment.direction[1])
+        if along - half < -1e-6 or along + half > segment.length + 1e-6:
+            door_problems.append(f"door {opening['between']} does not fit its shared wall span")
+    record("duplex_doors", not door_problems, violations=door_problems,
+           doors=len(spec_dict.get("openings", [])))
+    violations.extend(door_problems)
+
+    # -- windows ------------------------------------------------------------ #
+    window_problems: List[str] = []
+    for window in spec_dict.get("windows", []):
+        room_id = str(window["room"])
+        floor_id = room_floor.get(room_id)
+        if floor_id is None:
+            window_problems.append(f"window references unknown room '{room_id}'")
+            continue
+        segments = segments_by_floor[floor_id]
+        middle = [(float(window["wall"][0][0]) + float(window["wall"][1][0])) / 2.0,
+                  (float(window["wall"][0][1]) + float(window["wall"][1][1])) / 2.0]
+        segment = spec_mod.wall_segment_for_point(segments, middle, room_id)
+        if segment is None or len(segment.owners) != 1:
+            window_problems.append(f"window of room '{room_id}' is not on an exterior wall span")
+        if float(window["sill"]) + float(window["height"]) > wall_height + 1e-6:
+            window_problems.append(f"window of room '{room_id}' exceeds the floor height")
+    record("duplex_windows", not window_problems, violations=window_problems,
+           windows=len(spec_dict.get("windows", [])))
+    violations.extend(window_problems)
+
+    # -- the stair connector and its slab opening --------------------------- #
+    connector = spec_dict.get("connectors") or spec_dict.get("connector") or []
+    stairs = [entry for entry in connector if str(entry.get("kind")) == "stair"]
+    stair_problems: List[str] = []
+    stair = stairs[0] if stairs else None
+    shaft = None
+    outline_floors: List[str] = []
+    if len(stairs) != 1:
+        stair_problems.append(f"a duplex needs exactly one stair connector, found {len(stairs)}")
+    if stair is not None:
+        from_room, to_room = str(stair.get("from_room")), str(stair.get("to_room"))
+        from_floor, to_floor = str(stair.get("from_floor")), str(stair.get("to_floor"))
+        if room_floor.get(from_room) != from_floor or room_floor.get(to_room) != to_floor:
+            stair_problems.append("the stair connector must name rooms on its two floors")
+        if from_floor == to_floor:
+            stair_problems.append("the stair connector must connect two different floors")
+        steps = int(stair.get("steps", 0))
+        rise = float(stair.get("rise", 0.0))
+        width = float(stair.get("width", 0.0))
+        run = float(stair.get("run", 0.0))
+        landing = float(stair.get("landing_m", 0.0))
+        if steps < 8:
+            stair_problems.append(f"stair has {steps} steps (min 8)")
+        if not 0.15 <= (rise / steps if steps else 0.0) <= STAIR_MAX_RISE_M:
+            stair_problems.append(f"stair riser {rise / steps if steps else 0.0:.3f} m per step "
+                                  f"is outside [0.15, {STAIR_MAX_RISE_M}]")
+        if width < STAIR_MIN_WIDTH_M:
+            stair_problems.append(f"stair width {width:.2f} m < {STAIR_MIN_WIDTH_M}")
+        if run < 0.6:
+            stair_problems.append(f"stair run {run:.2f} m is degenerate")
+        if landing > 0.01 and run < 0.8:
+            stair_problems.append("switchback flight run too short")
+        if landing <= 0.01 and run < (steps - 1) * 0.18:
+            stair_problems.append("straight flight run shorter than 0.18 m per tread")
+        center = stair.get("center")
+        if center is None or stair.get("direction_deg") is None:
+            stair_problems.append("the stair connector needs 'center' and 'direction_deg' "
+                                  "(spec.stair_plan anchors the resolved flights on them)")
+        if len(floors) == 2 and abs(rise - (float(floors[1]["elevation"])
+                                            - float(floors[0]["elevation"]))) > 1e-6:
+            stair_problems.append("the stair rise must equal the floor-to-floor elevation difference")
+        openings = spec_dict.get("slab_openings") or spec_dict.get("slab_opening") or []
+        matches = [entry for entry in openings
+                   if str(to_floor) in [str(item) for item in entry.get("floors", [])]]
+        if not matches:
+            stair_problems.append("no slab_opening for the upper floor of the stair")
+        else:
+            outline = [list(map(float, point)) for point in matches[0]["outline"]]
+            outline_floors = [str(item) for item in matches[0].get("floors", [])]
+            if len(outline) < 3 or abs(spec_mod.polygon_area(outline)) < 1e-6:
+                stair_problems.append("the slab opening outline is degenerate")
+            else:
+                outline_bounds = _rect_of_polygon(outline)
+                # the opening is the stair footprint plus the well clearance;
+                # shrink it back to the footprint for the geometry rules below
+                shaft = (outline_bounds[0] + STAIR_HOLE_CLEARANCE_M,
+                         outline_bounds[1] + STAIR_HOLE_CLEARANCE_M,
+                         outline_bounds[2] - STAIR_HOLE_CLEARANCE_M,
+                         outline_bounds[3] - STAIR_HOLE_CLEARANCE_M)
+                for room_id, name in ((from_room, "lower"), (to_room, "upper")):
+                    polygon = next(([list(map(float, point)) for point in room["polygon"]]
+                                    for room in rooms if str(room["id"]) == room_id), None)
+                    if polygon is None:
+                        continue
+                    if not all(spec_mod.point_in_polygon(point, polygon) for point in outline):
+                        stair_problems.append(f"the stair shaft leaves its {name} host room "
+                                              f"'{room_id}'")
+                if center is not None and not (
+                        shaft[0] - 1e-6 <= float(center[0]) <= shaft[2] + 1e-6
+                        and shaft[1] - 1e-6 <= float(center[1]) <= shaft[3] + 1e-6):
+                    stair_problems.append("the stair centre is outside the slab opening")
+                floor_id = room_floor.get(from_room)
+                if floor_id is not None:
+                    for opening in spec_dict.get("openings", []):
+                        if from_room not in [str(item) for item in opening["between"]] and \
+                                to_room not in [str(item) for item in opening["between"]]:
+                            continue
+                        owner_floor = room_floor.get(str(opening["between"][0]))
+                        zone = _opening_zone(opening, segments_by_floor[owner_floor], wall_thickness)
+                        if zone is None:
+                            continue
+                        if checks_mod.rect_distance(
+                                (shaft[0], shaft[1], shaft[2], shaft[3]), zone) < 0.05:
+                            stair_problems.append(
+                                f"the stair shaft blocks the door {opening['between']}")
+    record("duplex_stair", not stair_problems, violations=stair_problems,
+           stair=None if stair is None else {k: stair.get(k) for k in
+                                             ("kind", "from_room", "to_room", "from_floor",
+                                              "to_floor", "width", "run", "rise", "steps",
+                                              "landing_m")},
+           slab_opening_floors=outline_floors)
+    violations.extend(stair_problems)
+
+    # -- furniture: rooms, world z, the reserved shaft ---------------------- #
+    furniture = spec_dict.get("furniture") or []
+    furniture_problems: List[str] = []
+    unknown_assets: List[str] = []
+    elevations = {str(floor["id"]): float(floor["elevation"]) for floor in floors}
+    heights = {str(floor["id"]): float(floor["height"]) for floor in floors}
+    for item in furniture:
+        room_id = str(item["room"])
+        floor_id = room_floor.get(room_id)
+        if floor_id is None:
+            furniture_problems.append(f"furniture '{item.get('name')}' references unknown room "
+                                      f"'{room_id}'")
+            continue
+        room = next(room for room in rooms if str(room["id"]) == room_id)
+        polygon = [list(map(float, point)) for point in room["polygon"]]
+        if not spec_mod.point_in_polygon(item["pos"], polygon):
+            furniture_problems.append(f"furniture '{item.get('name')}' is outside room '{room_id}'")
+        z = item.get("z")
+        if z is not None:
+            z = float(z)
+            if z < elevations[floor_id] - 0.01 or z > elevations[floor_id] + heights[floor_id]:
+                furniture_problems.append(f"furniture '{item.get('name')}' z={z} is outside its "
+                                          f"floor at {elevations[floor_id]}")
+        dims = checks_mod.item_dims(str(item["asset"]), index, item.get("size"), item.get("scale", 1.0))
+        if dims is None:
+            unknown_assets.append(f"{item.get('name')}: no measured size for '{item['asset']}'")
+            continue
+        if shaft is not None and room_id in (str(stair.get("from_room")), str(stair.get("to_room"))):
+            # world z of the item: what sits above the stair's own z band cannot
+            # stand in its way (the same rule checks.stair_clearance applies)
+            if item.get("mount") == "ceiling":
+                item_z0 = elevations[floor_id] + heights[floor_id] - dims[2]
+            else:
+                item_z0 = float(z) if z is not None else elevations[floor_id]
+            item_z1 = item_z0 + dims[2]
+            from_elevation = float(floors[0]["elevation"]) if floors else 0.0
+            to_elevation = float(floors[1]["elevation"]) if len(floors) == 2 else from_elevation
+            if item_z0 <= to_elevation + 1e-9 and item_z1 >= from_elevation - 1e-9:
+                aabb = checks_mod.rotated_aabb(item["pos"], dims, item.get("rot_z_deg", 0.0))
+                if checks_mod.rect_distance(aabb, shaft) < 1e-9:
+                    furniture_problems.append(f"furniture '{item.get('name')}' stands in the stair "
+                                              f"shaft")
+                # the arrival strip only guards walkers: a pendant lamp or wall
+                # art above it is not in anybody's way
+                blocking = item.get("mount") not in ("ceiling", "wall") \
+                    and item.get("asset") != "builtin:rug"
+                arrival = (shaft[0] - STAIR_PAD_M, shaft[3], shaft[2] + STAIR_PAD_M,
+                           shaft[3] + STAIR_ARRIVAL_M)
+                if blocking and checks_mod.rect_distance(aabb, arrival) < 1e-9:
+                    furniture_problems.append(f"furniture '{item.get('name')}' blocks the stair "
+                                              f"arrival")
+    record("duplex_furniture_placement", not furniture_problems and not unknown_assets,
+           violations=furniture_problems + unknown_assets)
+    violations.extend(furniture_problems + unknown_assets)
+
+    # -- cameras ------------------------------------------------------------ #
+    camera_problems: List[str] = []
+    cameras = spec_dict.get("cameras") or []
+    per_room_cameras: Dict[str, int] = {}
+    for camera in cameras:
+        room_id = str(camera["room"])
+        per_room_cameras[room_id] = per_room_cameras.get(room_id, 0) + 1
+        floor_id = room_floor.get(room_id)
+        room = next((room for room in rooms if str(room["id"]) == room_id), None)
+        if floor_id is None or room is None:
+            camera_problems.append(f"camera '{camera.get('name')}' references unknown room")
+            continue
+        polygon = [list(map(float, point)) for point in room["polygon"]]
+        if not spec_mod.point_in_polygon(camera["pos"], polygon):
+            camera_problems.append(f"camera '{camera.get('name')}' is outside room '{room_id}'")
+        z = float(camera["pos"][2])
+        if not elevations[floor_id] + 0.5 < z < elevations[floor_id] + heights[floor_id] - 0.1:
+            camera_problems.append(f"camera '{camera.get('name')}' z={z} is outside the eye band "
+                                   f"of floor {floor_id}")
+    for room in rooms:
+        if not per_room_cameras.get(str(room["id"])):
+            camera_problems.append(f"room '{room['id']}' has no camera")
+    record("duplex_cameras", not camera_problems, violations=camera_problems,
+           cameras=len(cameras), per_room=per_room_cameras)
+    violations.extend(camera_problems)
+
+    # -- 2.5D reachability: doors within a floor + the stair edge ----------- #
+    reach_problems: List[str] = []
+    adjacency: Dict[str, set] = {str(room["id"]): set() for room in rooms}
+    for opening in spec_dict.get("openings", []):
+        a, b = str(opening["between"][0]), str(opening["between"][1])
+        if a in adjacency and b in adjacency:
+            adjacency[a].add(b)
+            adjacency[b].add(a)
+    if stair is not None:
+        a, b = str(stair.get("from_room")), str(stair.get("to_room"))
+        if a in adjacency and b in adjacency:
+            adjacency[a].add(b)
+            adjacency[b].add(a)
+    entry = next((str(room["id"]) for room in rooms
+                  if str(room.get("floor_id")) == floor_ids[0]
+                  and str(room.get("type")) == "entry"), None)
+    if entry is None:
+        entry = str(cameras[0]["room"]) if cameras else (rooms[0]["id"] if rooms else None)
+    if entry is not None:
+        seen = {entry}
+        frontier = [entry]
+        while frontier:
+            room_id = frontier.pop()
+            for peer in adjacency.get(room_id, ()):
+                if peer not in seen:
+                    seen.add(peer)
+                    frontier.append(peer)
+        missing = [str(room["id"]) for room in rooms if str(room["id"]) not in seen]
+        if missing:
+            reach_problems.append("rooms unreachable from the entrance: " + ", ".join(missing))
+    else:
+        reach_problems.append("no entrance (floor 1 entry room) to start the reachability pass")
+    record("duplex_reachability", not reach_problems, violations=reach_problems,
+           entrance=entry, nodes=len(rooms), edges=sum(len(peers) for peers in adjacency.values()) // 2)
+    violations.extend(reach_problems)
+
+    # -- lighting: the dark-room fix and the lit service rooms -------------- #
+    lighting = spec_dict.get("lighting") or {}
+    lamp_w = float(lighting.get("lamp_w", 0.0))
+    lamp_problems: List[str] = []
+    if lamp_w < LIGHTING_DEFAULTS["lamp_w"]:
+        lamp_problems.append(f"lighting.lamp_w {lamp_w} is below the {LIGHTING_DEFAULTS['lamp_w']} W "
+                             f"default (windowless rooms render dark)")
+    lit_rooms = {str(item["room"]) for item in furniture
+                 if item.get("mount") == "ceiling" or "lamp" in str(item.get("asset"))}
+    for room in rooms:
+        if str(room.get("type")) in ("bathroom", "corridor", "entry", "storage", "laundry") \
+                and str(room["id"]) not in lit_rooms:
+            lamp_problems.append(f"windowless service room '{room['id']}' has no ceiling lamp")
+    record("duplex_lighting", not lamp_problems, violations=lamp_problems, lamp_w=lamp_w)
+    violations.extend(lamp_problems)
+
+    return {"kind": "blender_agent_duplex_checks",
+            "pass": all(entry["pass"] for entry in checks),
+            "checks": checks, "violations": violations}
+
+
 @dataclass
 class Scene:
     spec: dict
@@ -3029,7 +4216,7 @@ def _build_attempt(rng: random.Random, room_count: Optional[int], index: Dict[st
 def generate(seed: int, room_count: Optional[int] = None,
              assets_index: Optional[Dict[str, dict]] = None,
              attempts: int = MAX_LAYOUT_ATTEMPTS, verbose: bool = True,
-             shape: str = "row") -> Scene:
+             shape: str = "row", floors: int = 1) -> Scene:
     """Generate one layout; returns the spec dict plus the layout report.
 
     ``shape`` is ``"row"`` (the default single row), ``"block"`` (the same chain
@@ -3037,40 +4224,73 @@ def generate(seed: int, room_count: Optional[int] = None,
     (the seed draws the room count and one of :data:`ROOM_FAMILIES`), or any
     family name -- ``compact_2x2``, ``l_shape``, ``central_living``,
     ``corridor_single``, ``corridor_double``, ``loop``.
+
+    ``floors=2`` builds a **duplex** instead: two floors over one footprint,
+    each a row of 2-4 rooms (floor 1 = living/kitchen/entry/dining/bathroom,
+    floor 2 = bedroom/study/bathroom, optionally a small living room), connected
+    by one switchback or straight stair through a slab opening in the upper
+    floor.  ``room_count`` then means the total number of rooms (4..8, split
+    between the two floors) and ``shape`` must stay ``row`` or ``auto`` -- the
+    duplex draws its own arrangement.  A duplex spec is validated with
+    :func:`check_duplex_spec` (the generator-side 2.5D twin of ``checks.py``'s
+    single-floor rule set).
     """
+    if floors not in (1, 2):
+        raise ValueError(f"only 1 or 2 floors are supported, not {floors}")
+    if floors >= 2 and shape not in ("row", "auto"):
+        raise ValueError(f"--floors 2 builds its own duplex plan, --shape must be row or auto, "
+                         f"not '{shape}'")
     if shape not in ("row", "block", "auto") and shape not in ROOM_FAMILIES:
         raise ValueError(f"unknown layout shape '{shape}' (row, block, auto or a topology family)")
     if shape in ROOM_FAMILIES and room_count is not None and \
             ROOM_FAMILIES[shape].count != room_count:
         raise ValueError(f"layout '{shape}' has {ROOM_FAMILIES[shape].count} rooms, "
                          f"--rooms {room_count} does not match")
+    if floors >= 2 and room_count is not None and not 4 <= room_count <= 8:
+        raise ValueError(f"--rooms must be 4..8 with --floors 2 (2-4 rooms per floor), "
+                         f"not {room_count}")
     index = assets_index if assets_index is not None else checks_mod.load_assets_index()
     started = time.time()
     last_error = "unknown"
     for attempt in range(attempts):
         rng = random.Random(seed * 1000003 + attempt)
         try:
-            spec_dict, report = _build_attempt(rng, room_count, index, attempt, seed, shape)
-            spec = spec_mod.parse_spec(spec_dict)
+            if floors >= 2:
+                spec_dict, report = _build_duplex_attempt(rng, room_count, index, attempt, seed)
+            else:
+                spec_dict, report = _build_attempt(rng, room_count, index, attempt, seed, shape)
+                spec = spec_mod.parse_spec(spec_dict)
         except (_AttemptFailed, spec_mod.SpecError) as error:
             last_error = f"{type(error).__name__}: {error}"
             continue
+        if floors >= 2:
+            try:
+                spec = spec_mod.parse_spec(spec_dict)
+            except spec_mod.SpecError as error:
+                last_error = f"SpecError: {error}"
+                continue
+            duplex_check = check_duplex_spec(spec_dict, index)
+            report["duplex_checks"] = duplex_check
         check_report = checks_mod.check_spec(spec, index)
         report["checks"] = check_report
         if not check_report["pass"]:
             last_error = "; ".join(check_report["violations"][:4]) or "checks failed"
+            continue
+        if floors >= 2 and not duplex_check["pass"]:
+            last_error = "; ".join(duplex_check["violations"][:4]) or "duplex checks failed"
             continue
         report["stats"] = {
             "seed": seed,
             "attempt": attempt,
             "attempts_used": attempt + 1,
             "generation_seconds": round(time.time() - started, 3),
-            "shape": shape,
-            "rooms": len(spec.rooms),
-            "doors": len(spec.openings),
-            "windows": len(spec.windows),
-            "cameras": len(spec.cameras),
-            "furniture": len(spec.furniture),
+            "shape": "duplex" if floors >= 2 else shape,
+            "floors": floors,
+            "rooms": len(spec_dict["rooms"]),
+            "doors": len(spec_dict.get("openings", [])),
+            "windows": len(spec_dict.get("windows", [])),
+            "cameras": len(spec_dict["cameras"]),
+            "furniture": len(spec_dict.get("furniture", [])),
         }
         if verbose:
             print(f"[layout_gen] seed {seed}: {report['stats']} (last rejected attempt: {last_error})"
@@ -3093,18 +4313,29 @@ def main(argv=None) -> int:
                              + ", ".join(sorted(ROOM_FAMILIES))
                              + " -- also settable with PANOWORLD_LAYOUT_SHAPE, which is what "
                                "scripts/layout_gen_run.sh passes through")
+    parser.add_argument("--floors", type=int, choices=(1, 2),
+                        default=os.environ.get("PANOWORLD_LAYOUT_FLOORS", "1"),
+                        help="1 (default) or 2: with 2, generate a duplex -- two floors on one "
+                             "footprint, each a row of 2-4 rooms, connected by a switchback or "
+                             "straight stair through a slab opening.  --rooms then means the total "
+                             "(4..8) and --shape must stay row/auto; also settable with "
+                             "PANOWORLD_LAYOUT_FLOORS, which is how scripts/layout_gen_run.sh "
+                             "passes it through")
     parser.add_argument("--assets-index", default=DEFAULT_ASSETS_INDEX)
     parser.add_argument("--report", default=None, help="layout report (default: next to --out)")
     parser.add_argument("--attempts", type=int, default=MAX_LAYOUT_ATTEMPTS)
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
-    if args.rooms is not None and not 2 <= args.rooms <= 7:
-        parser.error("--rooms must be between 2 and 7")
+    if args.rooms is not None:
+        if args.floors >= 2 and not 4 <= args.rooms <= 8:
+            parser.error("--rooms must be 4..8 with --floors 2 (2-4 rooms per floor)")
+        if args.floors < 2 and not 2 <= args.rooms <= 7:
+            parser.error("--rooms must be between 2 and 7")
 
     index = checks_mod.load_assets_index(args.assets_index)
     try:
         scene = generate(args.seed, args.rooms, index, attempts=args.attempts,
-                         verbose=not args.quiet, shape=args.shape)
+                         verbose=not args.quiet, shape=args.shape, floors=args.floors)
     except ValueError as error:                 # a room count or shape the CLI cannot honour
         print(f"[layout_gen] FAILED: {error}", file=sys.stderr)
         return 2

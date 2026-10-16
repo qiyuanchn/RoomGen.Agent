@@ -912,5 +912,243 @@ class FixtureFurnitureTest(unittest.TestCase):
             self.assertTrue(fixtures.is_fixture(asset.split(":", 1)[1]))
 
 
+class DuplexLayoutTest(unittest.TestCase):
+    """``--floors 2``: two floors on one footprint, joined by a switchback stair.
+
+    The spec follows the shared multi-floor contract of ``spec.py`` (schema
+    version 2: ``floors``, ``room.floor_id``, ``connectors``, ``slab_openings``,
+    world-z furniture/cameras) and is accepted by ``checks.py``'s per-storey
+    rule set, stair checks included; ``layout_gen.check_duplex_spec`` is the
+    generator-side twin that also pins the programme and the reserved shaft.
+    """
+
+    SEEDS = (0, 1, 2, 3)
+    FLOOR1_TYPES = {"living_room", "kitchen", "entry", "dining", "bathroom"}
+    FLOOR2_TYPES = {"corridor", "bedroom", "bathroom", "study", "living_room"}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.scenes = {seed: layout_gen.generate(seed, None, ASSETS_INDEX, verbose=False, floors=2)
+                      for seed in cls.SEEDS}
+
+    def _spec(self, seed):
+        return spec_mod.parse_spec(copy.deepcopy(self.scenes[seed].spec))
+
+    def test_two_floors_two_to_four_rooms_each(self):
+        for seed, scene in self.scenes.items():
+            spec = self._spec(seed)
+            with self.subTest(seed=seed):
+                self.assertEqual(len(spec.floors), 2)
+                counts = {floor.id: len(spec.floor_rooms(floor.id)) for floor in spec.floors}
+                for floor_id, count in counts.items():
+                    self.assertGreaterEqual(count, 2, floor_id)
+                    self.assertLessEqual(count, 4, floor_id)
+                rooms = [room for floor in spec.floors for room in spec.floor_rooms(floor.id)]
+                self.assertEqual(len(rooms), len(spec.rooms))
+                self.assertEqual(len({room.id for room in rooms}), len(rooms))
+                for floor in spec.floors:
+                    self.assertNotIn(None, [room.floor_id for room in spec.floor_rooms(floor.id)])
+
+    def test_floors_stack_with_the_slab_between_them(self):
+        """``elevation_above - slab == elevation + height`` (no duplicated slab)."""
+        for seed, scene in self.scenes.items():
+            lower, upper = self._spec(seed).floors
+            with self.subTest(seed=seed):
+                self.assertAlmostEqual(lower.elevation, 0.0, places=6)
+                self.assertAlmostEqual(upper.elevation - upper.slab_thickness,
+                                       lower.elevation + lower.height, places=6)
+                self.assertAlmostEqual(upper.elevation - lower.elevation,
+                                       layout_gen.WALL_HEIGHT + layout_gen.FLOOR_SLAB_M, places=6)
+
+    def test_floor_programme(self):
+        """Floor 1 is the public floor, floor 2 the sleeping floor with its hall."""
+        for seed, scene in self.scenes.items():
+            spec = self._spec(seed)
+            types1 = {room.type for room in spec.floor_rooms(spec.floors[0].id)}
+            types2 = {room.type for room in spec.floor_rooms(spec.floors[1].id)}
+            all_types = types1 | types2
+            with self.subTest(seed=seed):
+                self.assertTrue(types1 <= self.FLOOR1_TYPES, types1)
+                self.assertTrue(types2 <= self.FLOOR2_TYPES, types2)
+                self.assertIn("living_room", types1)
+                self.assertIn("kitchen", types1)
+                self.assertIn("corridor", types2)          # the upstairs landing
+                self.assertIn("bedroom", all_types)
+                self.assertIn("bathroom", all_types)
+                for room in spec.rooms:
+                    low, high = layout_gen.ROOM_AREA_M2[room.type]
+                    area = abs(spec_mod.polygon_area(room.polygon))
+                    self.assertGreaterEqual(area, low - 0.06)
+                    self.assertLessEqual(area, high + 0.06)
+
+    def test_stair_connector_and_slab_opening(self):
+        for seed, scene in self.scenes.items():
+            spec = self._spec(seed)
+            plans = spec.stair_plans()
+            with self.subTest(seed=seed):
+                self.assertEqual(len(plans), 1)
+                plan = plans[0]
+                self.assertEqual(plan.connector.from_floor, spec.floors[0].id)
+                self.assertEqual(plan.connector.to_floor, spec.floors[1].id)
+                self.assertNotEqual(plan.connector.from_room, plan.connector.to_room)
+                self.assertLessEqual(plan.riser_m, spec_mod.STAIR_RISER_MAX_M + 1e-9)
+                self.assertGreaterEqual(plan.tread_m, spec_mod.STAIR_TREAD_MIN_M - 1e-9)
+                self.assertGreaterEqual(plan.width, spec_mod.STAIR_WIDTH_MIN_M)
+                self.assertGreaterEqual(plan.landing_m, spec_mod.STAIR_LANDING_MIN_M)
+                self.assertTrue(plan.switchback)
+                self.assertAlmostEqual(plan.rise_total,
+                                       spec.floors[1].elevation - spec.floors[0].elevation, places=6)
+                # both rooms own the shaft: the opening sits inside each polygon
+                for room_id in (plan.connector.from_room, plan.connector.to_room):
+                    polygon = spec.room(room_id).polygon
+                    for point in plan.footprint:
+                        self.assertTrue(spec_mod.point_in_polygon(point, polygon),
+                                        f"{seed}: stair leaves room {room_id}")
+                openings = spec.slab_openings_for(spec.floors[1].id)
+                self.assertEqual(len(openings), 1)
+                for point in plan.footprint:
+                    self.assertTrue(openings[0].contains(point))
+
+    def test_cross_floor_reachability_via_checks(self):
+        """``checks.py`` walks the storeys: every room and camera is reachable."""
+        for seed, scene in self.scenes.items():
+            report = scene.report["checks"]
+            with self.subTest(seed=seed):
+                self.assertTrue(report["pass"], report["violations"][:4])
+                circulation = next(entry for entry in report["checks"]
+                                   if entry["name"] == "circulation_reachable")
+                self.assertEqual(circulation["grid"]["stair_links"], 1)
+                for name, stats in circulation["cameras"].items():
+                    self.assertTrue(stats["reachable"], f"seed {seed}: camera {name} unreachable")
+                self.assertTrue(scene.report["duplex_checks"]["pass"],
+                                scene.report["duplex_checks"]["violations"][:4])
+
+    def test_no_furniture_on_the_stair_or_its_landing(self):
+        """checks.stair_clearance and the generator's reserved shaft agree."""
+        for seed, scene in self.scenes.items():
+            spec = self._spec(seed)
+            boxes, unknown = checks_mod.item_boxes(spec, ASSETS_INDEX)
+            with self.subTest(seed=seed):
+                self.assertFalse(unknown)
+                self.assertEqual(checks_mod.stair_clearance(spec, boxes), [])
+                plan = spec.stair_plans()[0]
+                reserve = self.scenes[seed].report["stair"]["reserve"]
+                for box in boxes:
+                    if box.room not in (plan.connector.from_room, plan.connector.to_room):
+                        continue
+                    if box.placement == checks_mod.CEILING:
+                        # Pendants may hang over the walk-off/landing strip; they
+                        # must only stay off the stair flight itself, which is
+                        # what the Placer enforces and stair_clearance verifies.
+                        continue
+                    self.assertGreater(checks_mod.rect_distance(box.aabb, tuple(reserve)), 0.0)
+
+    def test_cameras_and_furniture_carry_world_z(self):
+        for seed, scene in self.scenes.items():
+            spec = self._spec(seed)
+            elevations = {floor.id: floor.elevation for floor in spec.floors}
+            heights = {floor.id: floor.height for floor in spec.floors}
+            for camera in spec.cameras:
+                floor = spec.room_floor(camera.room)
+                with self.subTest(seed=seed, camera=camera.name):
+                    self.assertAlmostEqual(camera.pos[2], floor.elevation + layout_gen.CAMERA_Z_M,
+                                           places=4)
+                    self.assertTrue(spec_mod.point_in_polygon(camera.pos, spec.room(camera.room).polygon))
+            for item in spec.furniture:
+                floor = spec.room_floor(item.room)
+                with self.subTest(seed=seed, item=item.name):
+                    if item.z is not None:
+                        self.assertGreaterEqual(item.z, floor.elevation - 0.01)
+                        self.assertLessEqual(item.z, floor.elevation + floor.height)
+
+    def test_every_room_has_a_camera(self):
+        for seed, scene in self.scenes.items():
+            spec = self._spec(seed)
+            rooms_with = {camera.room for camera in spec.cameras}
+            with self.subTest(seed=seed):
+                self.assertEqual(rooms_with, {room.id for room in spec.rooms})
+
+    def test_duplex_is_deterministic(self):
+        for seed in (0, 1):
+            first = layout_gen.generate(seed, None, ASSETS_INDEX, verbose=False, floors=2)
+            second = layout_gen.generate(seed, None, ASSETS_INDEX, verbose=False, floors=2)
+            self.assertEqual(json.dumps(first.spec, sort_keys=True),
+                             json.dumps(second.spec, sort_keys=True), seed)
+
+    def test_room_count_override_splits_between_the_floors(self):
+        scene = layout_gen.generate(7, 6, ASSETS_INDEX, verbose=False, floors=2)
+        counts = [sum(1 for room in scene.spec["rooms"] if room["floor_id"] == floor_id)
+                  for floor_id in layout_gen.FLOOR_IDS]
+        self.assertEqual(sum(counts), 6)
+        self.assertTrue(all(2 <= count <= 4 for count in counts), counts)
+        with self.assertRaises(ValueError):
+            layout_gen.generate(0, 3, ASSETS_INDEX, verbose=False, floors=2)
+
+    def test_two_floors_reject_single_floor_shapes(self):
+        with self.assertRaises(ValueError):
+            layout_gen.generate(0, None, ASSETS_INDEX, verbose=False, shape="compact_2x2", floors=2)
+        with self.assertRaises(ValueError):
+            layout_gen.generate(0, None, ASSETS_INDEX, verbose=False, floors=3)
+
+    def test_floors_1_keeps_the_single_storey_spec(self):
+        """``--floors 1`` (the default) must stay the legacy single-floor spec."""
+        for seed in (0, 2):
+            single = layout_gen.generate(seed, None, ASSETS_INDEX, verbose=False)
+            explicit = layout_gen.generate(seed, None, ASSETS_INDEX, verbose=False, floors=1)
+            self.assertEqual(json.dumps(single.spec, sort_keys=True),
+                             json.dumps(explicit.spec, sort_keys=True))
+            for key in ("floors", "connectors", "connector", "slab_openings",
+                        "slab_opening", "schema_version"):
+                self.assertNotIn(key, single.spec)
+
+    def test_duplex_cli_and_checks_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "spec.json")
+            result = subprocess.run(
+                [sys.executable, os.path.join(REPO_ROOT, "blender_agent", "layout_gen.py"),
+                 "--seed", "1", "--floors", "2", "--out", out],
+                capture_output=True, text=True, cwd=REPO_ROOT,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            with open(out, encoding="utf-8") as handle:
+                spec = json.load(handle)
+            self.assertEqual(spec["schema_version"], 2)
+            self.assertEqual(len(spec["floors"]), 2)
+            self.assertEqual(len(spec["connectors"]), 1)
+            self.assertIn("slab_openings", spec)
+            report = json.load(open(os.path.join(tmp, "layout_report.json"), encoding="utf-8"))
+            self.assertTrue(report["checks"]["pass"])
+            self.assertTrue(report["duplex_checks"]["pass"])
+            self.assertEqual(report["shape"], "duplex")
+            # the shared checks CLI accepts the written spec as-is
+            result = subprocess.run(
+                [sys.executable, os.path.join(REPO_ROOT, "blender_agent", "checks.py"), out],
+                capture_output=True, text=True, cwd=REPO_ROOT,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout[-2000:])
+
+    def test_windowless_service_rooms_get_a_lamp_upstairs_too(self):
+        for seed, scene in self.scenes.items():
+            types = {room["id"]: room["type"] for room in scene.spec["rooms"]}
+            lamps = {item["room"] for item in scene.spec["furniture"]
+                     if item.get("mount") == "ceiling" or "lamp" in item["asset"]}
+            dark = [room_id for room_id, room_type in types.items()
+                    if room_type in ("bathroom", "corridor", "entry", "storage", "laundry")
+                    and room_id not in lamps]
+            with self.subTest(seed=seed):
+                self.assertEqual(dark, [], f"seed {seed}: unlit rooms {dark}")
+
+
+class LightingDefaultsTest(unittest.TestCase):
+    """The lamp wattage the dark-room fix pins (see blender_agent/README.md)."""
+
+    def test_lamp_default_is_twelve_watts(self):
+        self.assertEqual(layout_gen.LIGHTING_DEFAULTS["lamp_w"], 12.0)
+        for floors in (1, 2):
+            scene = layout_gen.generate(0, None, ASSETS_INDEX, verbose=False, floors=floors)
+            self.assertEqual(scene.spec["lighting"]["lamp_w"], 12.0)
+            self.assertEqual(scene.spec["lighting"]["window_portal_w"], 42.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
