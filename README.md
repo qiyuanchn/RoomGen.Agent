@@ -138,19 +138,57 @@ carry the distribution.  `layout_gen_run.sh` exits with the failing stage
 stamps a `run_id` into `run_summary.json` so a batch can refuse a stale report;
 a memory failure is retried once at a reduced profile (half resolution,
 `min(samples, 16)`; override with `PANOWORLD_RETRY_RES` /
-`PANOWORLD_RETRY_SAMPLES`).  `batch_generate.sh` exits 0 only when every scene
-reached `bundle_ok`, and an interrupted run can be finished without repeating
-completed seeds:
+`PANOWORLD_RETRY_SAMPLES`).  A scene whose retry *succeeded* at that reduced
+profile is a `bundle_ok` but a **degraded** one: the row's `render_quality`
+carries the requested and the effective profile, `batch_summary.json` counts
+them (`degraded`, `degraded_seeds`) and the table prints
+`[degraded 512x256, 16 samples at the requested 1024x512, 24 samples]`, so a
+downgraded render can never be read as a completion at the requested quality.
+
+`batch_generate.sh` exits 0 only when every scene reached `bundle_ok`, and an
+interrupted run can be finished without repeating a scene that is provably the
+same request:
 
 ```bash
 PANOWORLD_BATCH_RENDER=1 bash scripts/batch_generate.sh 0 100 outputs/stream
 PANOWORLD_BATCH_RENDER=1 PANOWORLD_BATCH_RESUME=1 \
-  bash scripts/batch_generate.sh 0 100 outputs/stream     # skip bundle_ok scenes
+  bash scripts/batch_generate.sh 0 100 outputs/stream     # skip provably current scenes
 PANOWORLD_BATCH_SUMMARY_ONLY=1 \
   bash scripts/batch_generate.sh 0 100 outputs/stream     # rebuild the table only
 PANOWORLD_BATCH_RENDER=1 PANOWORLD_REVIEW=1 \
   bash scripts/batch_generate.sh 0 20 outputs/stream      # + the visual review
 ```
+
+Resume is bound to a *request manifest*, not to a summary that merely says
+`bundle_ok`.  Every scene the batch runs gets `<scene_dir>/resume_manifest.json`
+holding
+
+* the request: seed, resolution, samples, floors, shape, rooms, review mode,
+  and whether the render was requested;
+* the sha256 of every source that decides the spec and the artifacts
+  (`layout_gen.py`, `spec.py`, `checks.py`, the build/render/export modules,
+  the three scripts, the validator, the layout config), the asset registry the
+  generator sizes furniture from, and the git commit for provenance;
+* the normalized spec hash plus the room/floor/camera counts it describes;
+* the requested and the effective render profile (they differ after a
+  memory retry) and the artifact check result.
+
+`PANOWORLD_BATCH_RESUME=1` keeps a scene only when the manifest parses, the
+current request hashes to the recorded one, `spec.json` still hashes to the
+recorded value, `run_summary.json` is a complete bundle of the requested mode,
+and every camera of the spec still has a decodable `panoImage_2048.png` at the
+effective resolution, a `uint16` `place_depth.png` of the same size, a positive
+`place_depth_scale.txt`, a rigid `extrinsics.txt` plus `map.json` and
+`topdown.png`.  Anything else is re-run and the reason is printed
+(`(rerun: request changed: render.samples: 4 -> 128; ...)`).  A scene without a
+manifest — anything an older batch produced — is never reused, because its
+request cannot be proven to match: re-point a pre-manifest output directory
+once, or rebuild only the table with `PANOWORLD_BATCH_SUMMARY_ONLY=1`.  The
+layout request is explicit, too: `PANOWORLD_BATCH_RENDER` /
+`PANOWORLD_RES` / `PANOWORLD_SAMPLES` / `PANOWORLD_ROOMS` /
+`PANOWORLD_LAYOUT_FLOORS` / `PANOWORLD_LAYOUT_SHAPE` are resolved (and
+exported) by the batch, so the manifest always describes the profile the child
+runs really used.
 
 ### Visual review and the repair loop
 
@@ -467,7 +505,7 @@ bash  tests/test_front3d_replay.sh                      # replay end-to-end
 python tests/test_layout_gen.py                         # layout generator units
 python tests/test_settle.py                             # furniture settling units + box self-check
 python tests/test_multifloor.py                         # storey contract, stairs, 2.5D checks, probes
-python tests/test_batch_stats.py                        # batch grading, exit codes, retry, resume
+python tests/test_batch_stats.py                        # batch grading, exit codes, retry, resume manifests
 python tests/test_review.py                             # review checks, repair, the review hooks
 bash  scripts/blender_agent_run.sh configs/blender_agent_p0_demo.json outputs/p0
 ```
