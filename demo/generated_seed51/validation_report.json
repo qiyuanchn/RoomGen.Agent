@@ -1,0 +1,174 @@
+{
+  "kind": "blender_agent_p0_validation",
+  "spec": "/home/dataset-assist-0/zqyws/PanoWorld/outputs/layout_gen/batch_stream/scene_0051/spec.json",
+  "build": "/home/dataset-assist-0/zqyws/PanoWorld/outputs/layout_gen/batch_stream/scene_0051/build",
+  "scene": "/home/dataset-assist-0/zqyws/PanoWorld/outputs/layout_gen/batch_stream/scene_0051/scene",
+  "pass": false,
+  "checks": [
+    {
+      "name": "canonical_resolution",
+      "pass": false,
+      "render_size": [
+        1024,
+        512
+      ],
+      "expected": [
+        2048,
+        1024
+      ]
+    },
+    {
+      "name": "files_present",
+      "pass": true,
+      "missing": []
+    },
+    {
+      "name": "pano_format",
+      "pass": true
+    },
+    {
+      "name": "depth_format",
+      "pass": true
+    },
+    {
+      "name": "extrinsics_valid",
+      "pass": true
+    },
+    {
+      "name": "camera_pose_matches_spec",
+      "pass": true
+    },
+    {
+      "name": "depth_matches_geometry",
+      "pass": true,
+      "thresholds": {
+        "valid_fraction_min": 0.995,
+        "median_error_max_m": 0.005,
+        "p95_error_max_m": 0.02
+      },
+      "cameras": [
+        {
+          "camera": "0000",
+          "valid_fraction": 1.0,
+          "pixels": 524288,
+          "valid_pixels": 524288,
+          "invalid_in_render": 0,
+          "no_geometry_hit": 0,
+          "median_error_m": 0.00025139617919922586,
+          "p95_error_m": 0.0004704008102416335,
+          "max_error_m": 1.0648531990051273,
+          "cast_seconds": 24.39,
+          "door_spot_check": {
+            "pass": true,
+            "column": 498,
+            "wall_distance_m": 1.8062391868188445,
+            "door_row": 295,
+            "wall_row": 178,
+            "door_depth_m": 5.724,
+            "wall_depth_m": 1.964,
+            "ratio": 2.914460285132383
+          },
+          "pass": true
+        },
+        {
+          "camera": "0001",
+          "valid_fraction": 1.0,
+          "pixels": 524288,
+          "valid_pixels": 524288,
+          "invalid_in_render": 0,
+          "no_geometry_hit": 0,
+          "median_error_m": 0.0002499599456786683,
+          "p95_error_m": 0.0004705200195311843,
+          "max_error_m": 0.5832819871902466,
+          "cast_seconds": 24.91,
+          "door_spot_check": {
+            "pass": true,
+            "column": 14,
+            "wall_distance_m": 1.6568041525780886,
+            "door_row": 299,
+            "wall_row": 173,
+            "door_depth_m": 5.4,
+            "wall_depth_m": 1.825,
+            "ratio": 2.9589041095890414
+          },
+          "pass": true
+        },
+        {
+          "camera": "0002",
+          "valid_fraction": 1.0,
+          "pixels": 524288,
+          "valid_pixels": 524288,
+          "invalid_in_render": 0,
+          "no_geometry_hit": 0,
+          "median_error_m": 0.0002484712600707706,
+          "p95_error_m": 0.00047241401672359906,
+          "max_error_m": 1.0491627273559576,
+          "cast_seconds": 22.51,
+          "door_spot_check": {
+            "pass": true,
+            "column": 507,
+            "wall_distance_m": 5.302122216622322,
+            "door_row": 269,
+            "wall_row": 227,
+            "door_depth_m": 9.075,
+            "wall_depth_m": 5.323,
+            "ratio": 1.704865677249671
+          },
+          "pass": true
+        }
+      ],
+      "ply": "outputs/layout_gen/batch_stream/scene_0051/build/furnished.ply"
+    },
+    {
+      "name": "caster_cross_check",
+      "pass": true,
+      "available": true,
+      "sample_rays": 786,
+      "triangles": 381264,
+      "brute_force_seconds": 57.49,
+      "max_abs_delta_m": 8.9994688878825e-07,
+      "hit_mask_mismatches": 0,
+      "brute_force_pass": true,
+      "delta_note": "float32 BVH vs float64 brute force",
+      "trimesh_rtree_available": false,
+      "trimesh_rtree_note": "rtree not installed; trimesh's RayMeshIntersector was unavailable"
+    },
+    {
+      "name": "map_json_reachable",
+      "pass": true,
+      "graph": {
+        "0000": [
+          "0001"
+        ],
+        "0001": [
+          "0000",
+          "0002"
+        ],
+        "0002": [
+          "0001"
+        ]
+      },
+      "expected": {
+        "0000": [
+          "0001"
+        ],
+        "0001": [
+          "0000",
+          "0002"
+        ],
+        "0002": [
+          "0001"
+        ]
+      }
+    },
+    {
+      "name": "topdown_non_empty",
+      "pass": true,
+      "shape": [
+        694,
+        1309
+      ],
+      "std": 66.04470075214319
+    }
+  ]
+}

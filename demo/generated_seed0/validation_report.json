@@ -1,0 +1,236 @@
+{
+  "kind": "blender_agent_p0_validation",
+  "spec": "/home/dataset-assist-0/zqyws/PanoWorld/outputs/layout_gen/batch3/scene_0000/spec.json",
+  "build": "/home/dataset-assist-0/zqyws/PanoWorld/outputs/layout_gen/batch3/scene_0000/build",
+  "scene": "/home/dataset-assist-0/zqyws/PanoWorld/outputs/layout_gen/batch3/scene_0000/scene",
+  "pass": true,
+  "checks": [
+    {
+      "name": "canonical_resolution",
+      "pass": true,
+      "render_size": [
+        2048,
+        1024
+      ],
+      "expected": [
+        2048,
+        1024
+      ]
+    },
+    {
+      "name": "files_present",
+      "pass": true,
+      "missing": []
+    },
+    {
+      "name": "pano_format",
+      "pass": true
+    },
+    {
+      "name": "depth_format",
+      "pass": true
+    },
+    {
+      "name": "extrinsics_valid",
+      "pass": true
+    },
+    {
+      "name": "camera_pose_matches_spec",
+      "pass": true
+    },
+    {
+      "name": "depth_matches_geometry",
+      "pass": true,
+      "thresholds": {
+        "valid_fraction_min": 0.995,
+        "median_error_max_m": 0.005,
+        "p95_error_max_m": 0.02
+      },
+      "cameras": [
+        {
+          "camera": "0000",
+          "valid_fraction": 1.0,
+          "pixels": 2097152,
+          "valid_pixels": 2097152,
+          "invalid_in_render": 0,
+          "no_geometry_hit": 0,
+          "median_error_m": 0.00025118160247794563,
+          "p95_error_m": 0.0004766008615492811,
+          "max_error_m": 1.4676181087493898,
+          "cast_seconds": 74.82,
+          "door_spot_check": {
+            "pass": true,
+            "column": 1029,
+            "wall_distance_m": 8.201078526632946,
+            "door_row": 529,
+            "wall_row": 475,
+            "door_depth_m": 16.988,
+            "wall_depth_m": 8.192,
+            "ratio": 2.07373046875
+          },
+          "pass": true
+        },
+        {
+          "camera": "0001",
+          "valid_fraction": 1.0,
+          "pixels": 2097152,
+          "valid_pixels": 2097152,
+          "invalid_in_render": 0,
+          "no_geometry_hit": 0,
+          "median_error_m": 0.0002506122589112092,
+          "p95_error_m": 0.0004767694473266637,
+          "max_error_m": 1.1674637031555175,
+          "cast_seconds": 73.44,
+          "door_spot_check": {
+            "pass": true,
+            "column": 1015,
+            "wall_distance_m": 4.451537824168183,
+            "door_row": 544,
+            "wall_row": 445,
+            "door_depth_m": 11.495,
+            "wall_depth_m": 4.485,
+            "ratio": 2.56298773690078
+          },
+          "pass": true
+        },
+        {
+          "camera": "0002",
+          "valid_fraction": 1.0,
+          "pixels": 2097152,
+          "valid_pixels": 2097152,
+          "invalid_in_render": 0,
+          "no_geometry_hit": 0,
+          "median_error_m": 0.0002500972747803143,
+          "p95_error_m": 0.00047669315338128015,
+          "max_error_m": 0.9656471481323243,
+          "cast_seconds": 82.69,
+          "door_spot_check": {
+            "pass": true,
+            "column": 15,
+            "wall_distance_m": 2.402850182595661,
+            "door_row": 572,
+            "wall_row": 392,
+            "door_depth_m": 8.128,
+            "wall_depth_m": 2.509,
+            "ratio": 3.239537664408131
+          },
+          "pass": true
+        },
+        {
+          "camera": "0003",
+          "valid_fraction": 1.0,
+          "pixels": 2097152,
+          "valid_pixels": 2097152,
+          "invalid_in_render": 0,
+          "no_geometry_hit": 0,
+          "median_error_m": 0.0002506980895997657,
+          "p95_error_m": 0.00047669315338128015,
+          "max_error_m": 0.1159724712371828,
+          "cast_seconds": 77.28,
+          "door_spot_check": {
+            "pass": true,
+            "column": 6,
+            "wall_distance_m": 5.751190224640463,
+            "door_row": 537,
+            "wall_row": 460,
+            "door_depth_m": 16.092,
+            "wall_depth_m": 5.763,
+            "ratio": 2.79229567933368
+          },
+          "pass": true
+        },
+        {
+          "camera": "0004",
+          "valid_fraction": 1.0,
+          "pixels": 2097152,
+          "valid_pixels": 2097152,
+          "invalid_in_render": 0,
+          "no_geometry_hit": 0,
+          "median_error_m": 0.00024960899353043686,
+          "p95_error_m": 0.00047669315338128015,
+          "max_error_m": 0.02519330692291266,
+          "cast_seconds": 78.85,
+          "door_spot_check": {
+            "pass": true,
+            "column": 5,
+            "wall_distance_m": 7.450918668191193,
+            "door_row": 531,
+            "wall_row": 471,
+            "door_depth_m": 17.774,
+            "wall_depth_m": 7.448,
+            "ratio": 2.3864124597207304
+          },
+          "pass": true
+        }
+      ],
+      "ply": "outputs/layout_gen/batch3/scene_0000/build/furnished.ply"
+    },
+    {
+      "name": "caster_cross_check",
+      "pass": true,
+      "available": true,
+      "sample_rays": 568,
+      "triangles": 527656,
+      "brute_force_seconds": 67.87,
+      "max_abs_delta_m": 2.523750834981797e-06,
+      "hit_mask_mismatches": 0,
+      "brute_force_pass": true,
+      "delta_note": "float32 BVH vs float64 brute force",
+      "trimesh_rtree_available": false,
+      "trimesh_rtree_note": "rtree not installed; trimesh's RayMeshIntersector was unavailable"
+    },
+    {
+      "name": "map_json_reachable",
+      "pass": true,
+      "graph": {
+        "0000": [
+          "0001"
+        ],
+        "0001": [
+          "0000",
+          "0002"
+        ],
+        "0002": [
+          "0001",
+          "0003"
+        ],
+        "0003": [
+          "0002",
+          "0004"
+        ],
+        "0004": [
+          "0003"
+        ]
+      },
+      "expected": {
+        "0000": [
+          "0001"
+        ],
+        "0001": [
+          "0000",
+          "0002"
+        ],
+        "0002": [
+          "0001",
+          "0003"
+        ],
+        "0003": [
+          "0002",
+          "0004"
+        ],
+        "0004": [
+          "0003"
+        ]
+      }
+    },
+    {
+      "name": "topdown_non_empty",
+      "pass": true,
+      "shape": [
+        762,
+        2458
+      ],
+      "std": 64.16073436803946
+    }
+  ]
+}

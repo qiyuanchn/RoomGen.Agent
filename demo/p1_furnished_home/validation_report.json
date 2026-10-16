@@ -1,0 +1,143 @@
+{
+  "kind": "blender_agent_p0_validation",
+  "spec": "configs/blender_agent_p1_furnished.json",
+  "build": "/home/dataset-assist-0/zqyws/PanoWorld/outputs/blender_agent/furnished_home/build",
+  "scene": "/home/dataset-assist-0/zqyws/PanoWorld/outputs/blender_agent/furnished_home/scene",
+  "pass": true,
+  "checks": [
+    {
+      "name": "canonical_resolution",
+      "pass": true,
+      "render_size": [
+        2048,
+        1024
+      ],
+      "expected": [
+        2048,
+        1024
+      ]
+    },
+    {
+      "name": "files_present",
+      "pass": true,
+      "missing": []
+    },
+    {
+      "name": "pano_format",
+      "pass": true
+    },
+    {
+      "name": "depth_format",
+      "pass": true
+    },
+    {
+      "name": "extrinsics_valid",
+      "pass": true
+    },
+    {
+      "name": "camera_pose_matches_spec",
+      "pass": true
+    },
+    {
+      "name": "depth_matches_geometry",
+      "pass": true,
+      "thresholds": {
+        "valid_fraction_min": 0.995,
+        "median_error_max_m": 0.005,
+        "p95_error_max_m": 0.02
+      },
+      "cameras": [
+        {
+          "camera": "0000",
+          "valid_fraction": 1.0,
+          "pixels": 2097152,
+          "valid_pixels": 2097152,
+          "invalid_in_render": 0,
+          "no_geometry_hit": 0,
+          "median_error_m": 0.0002511072158812855,
+          "p95_error_m": 0.0004765396118164844,
+          "max_error_m": 0.3985926170349119,
+          "cast_seconds": 154.61,
+          "door_spot_check": {
+            "pass": true,
+            "column": 1024,
+            "wall_distance_m": 2.6,
+            "door_row": 567,
+            "wall_row": 400,
+            "door_depth_m": 6.286,
+            "wall_depth_m": 2.696,
+            "ratio": 2.33160237388724
+          },
+          "pass": true
+        },
+        {
+          "camera": "0001",
+          "valid_fraction": 1.0,
+          "pixels": 2097152,
+          "valid_pixels": 2097152,
+          "invalid_in_render": 0,
+          "no_geometry_hit": 0,
+          "median_error_m": 0.0002501802444458967,
+          "p95_error_m": 0.0004752912521361896,
+          "max_error_m": 0.3963890113830566,
+          "cast_seconds": 66.65,
+          "door_spot_check": {
+            "pass": true,
+            "column": 0,
+            "wall_distance_m": 2.0,
+            "door_row": 584,
+            "wall_row": 370,
+            "door_depth_m": 6.8,
+            "wall_depth_m": 2.138,
+            "ratio": 3.1805425631431246
+          },
+          "pass": true
+        }
+      ],
+      "ply": "outputs/blender_agent/furnished_home/build/furnished.ply"
+    },
+    {
+      "name": "caster_cross_check",
+      "pass": true,
+      "available": true,
+      "sample_rays": 402,
+      "triangles": 745835,
+      "brute_force_seconds": 189.39,
+      "max_abs_delta_m": 5.287631021921868e-07,
+      "hit_mask_mismatches": 0,
+      "brute_force_pass": true,
+      "delta_note": "float32 BVH vs float64 brute force",
+      "trimesh_rtree_available": false,
+      "trimesh_rtree_note": "rtree not installed; trimesh's RayMeshIntersector was unavailable"
+    },
+    {
+      "name": "map_json_reachable",
+      "pass": true,
+      "graph": {
+        "0000": [
+          "0001"
+        ],
+        "0001": [
+          "0000"
+        ]
+      },
+      "expected": {
+        "0000": [
+          "0001"
+        ],
+        "0001": [
+          "0000"
+        ]
+      }
+    },
+    {
+      "name": "topdown_non_empty",
+      "pass": true,
+      "shape": [
+        715,
+        1276
+      ],
+      "std": 66.1438695607961
+    }
+  ]
+}
