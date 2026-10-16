@@ -5,9 +5,11 @@ The shell is built from :mod:`blender_agent.spec` with plain mesh data (no
 
 * one floor slab prism per room, spanning ``z in [elevation - slab_thickness,
   elevation]`` (legacy single-storey specs: ``z in [-0.05, 0]``)
-* a ceiling/roof prism only where no other storey's slab covers the room, so an
-  upper floor slab and a lower ceiling are never one and the same duplicated
-  body -- the storey above *is* the ceiling
+* a ceiling/roof prism for exactly the part of a room that no other storey's
+  slab covers (``spec.ceiling_regions``): a fully covered room gets none -- the
+  storey above *is* the ceiling -- a partially covered one gets one prism per
+  surviving region, so the upper slab and the lower ceiling are never one and the
+  same duplicated body and never leave a hole either
 * one wall box per merged wall span (see ``spec.build_wall_segments``), the
   polygon centre line carrying a ``wall_thickness`` box that is extended by
   half a thickness at both ends so perpendicular walls close the corners;
@@ -25,7 +27,7 @@ The shell is built from :mod:`blender_agent.spec` with plain mesh data (no
 from __future__ import annotations
 
 import math
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import bpy
 
@@ -249,21 +251,6 @@ def add_wedge(name: str, bottom: Sequence[Sequence[float]], top: Sequence[Sequen
     return link_object(name, mesh, collection)
 
 
-def _ceiling_is_upper_slab(spec: spec_mod.SceneSpec, floor: spec_mod.FloorSpec,
-                           room: spec_mod.RoomSpec) -> Optional[spec_mod.FloorSpec]:
-    """The storey whose slab *is* this room's ceiling, when there is one."""
-    ceiling = floor.elevation + spec.room_height(room.id)
-    for upper in spec.floors:
-        if upper.elevation <= floor.elevation + 1e-9:
-            continue
-        if abs((upper.elevation - upper.slab_thickness) - ceiling) > 1e-6:
-            continue
-        for other in spec.floor_rooms(upper.id):
-            if spec_mod.polygons_overlap(room.polygon, other.polygon):
-                return upper
-    return None
-
-
 def _synthetic_floor(spec: spec_mod.SceneSpec) -> spec_mod.FloorSpec:
     return spec_mod.FloorSpec(id="", elevation=0.0, height=spec.wall_height,
                               slab_thickness=FLOOR_SLAB)
@@ -319,13 +306,24 @@ def build_shell(spec: spec_mod.SceneSpec, collection_name: str = SHELL_COLLECTIO
         ceiling_objects: List[bpy.types.Object] = []
         for room in rooms:
             top = floor.elevation + spec.room_height(room.id)
-            upper = _ceiling_is_upper_slab(spec, floor, room)
-            if upper is not None:
-                covered_by_upper.append(f"ceiling_{room.id} (slab of floor '{upper.id}')")
+            parts = spec.ceiling_regions(room.id)
+            replaced = spec.ceiling_replaced_by(room.id)
+            if not parts:
+                upper = ", ".join(sorted({cover["floor"] for cover in replaced}))
+                covered_by_upper.append(f"ceiling_{room.id} (slab of floor '{upper}')")
                 continue
-            ceiling_objects.append(
-                add_prism(f"ceiling_{room.id}", room.polygon, top, top + floor.slab_thickness, collection)
-            )
+            for index, polygon in enumerate(parts):
+                name = f"ceiling_{room.id}" if len(parts) == 1 else f"ceiling_{room.id}_{index}"
+                ceiling_objects.append(
+                    add_prism(name, polygon, top, top + floor.slab_thickness, collection)
+                )
+            if replaced:
+                area = sum(cover["area_m2"] for cover in replaced)
+                covered_by_upper.append(
+                    f"ceiling_{room.id} (partly under floor "
+                    f"'{'/'.join(sorted({cover['floor'] for cover in replaced}))}', "
+                    f"{area:.2f} m^2 replaced, {len(parts)} part(s) built)"
+                )
         ceilings.extend(ceiling_objects)
 
         segments = spec_mod.build_wall_segments(rooms)

@@ -2615,7 +2615,8 @@ def _cell_span(low: float, high: float, origin: float, step: float, count: int) 
 
 
 def _walkable_grid(plan: RoomPlan, items: Sequence[Item], step: float = checks_mod.GRID_M,
-                   reserved: Sequence[Tuple[float, float, float, float]] = ()) -> dict:
+                   reserved: Sequence[Tuple[float, float, float, float]] = (),
+                   holes: Sequence[Sequence[Sequence[float]]] = ()) -> dict:
     """One room's free-cell lattice plus the cells its doorways can reach.
 
     The rule is the one :func:`checks.circulation_report` applies to the whole
@@ -2628,7 +2629,9 @@ def _walkable_grid(plan: RoomPlan, items: Sequence[Item], step: float = checks_m
 
     ``reserved`` rectangles (a duplex stair shaft) block cells exactly like a
     blocking footprint, so no camera stand and no coverage target is placed
-    inside the stair.
+    inside the stair.  ``holes`` are outlines where the storey has **no floor at
+    all** (its slab openings: the stairwell and any declared void), so a camera
+    stand is never placed over one -- there would be no surface to stand on.
     """
     poly = checks_mod.inset_polygon(plan.rect.polygon(), WALL_THICKNESS / 2.0)
     xs = [float(point[0]) for point in poly]
@@ -2661,6 +2664,13 @@ def _walkable_grid(plan: RoomPlan, items: Sequence[Item], step: float = checks_m
         for ix in range(ix_lo, ix_hi + 1):
             for iy in range(iy_lo, iy_hi + 1):
                 blocked[ix * ny + iy] = 1
+    for outline in (holes or ()):
+        for ix in range(nx):
+            cx = x0 + ix * step
+            for iy in range(ny):
+                cy = y0 + iy * step
+                if checks_mod.point_in_polygon((cx, cy), outline):
+                    free[ix * ny + iy] = 0
     return {"x0": x0, "y0": y0, "step": step, "nx": nx, "ny": ny, "free": free, "blocked": blocked,
             "reachable": bytearray(nx * ny)}
 
@@ -2811,10 +2821,11 @@ def _ray_box_entry(origin, direction, aabb, z_range, t_max: float) -> Optional[f
 
 
 def _room_camera_context(plan: RoomPlan, items: Sequence[Item], doors: Sequence[DoorPlan],
-                         reserved: Sequence[Tuple[float, float, float, float]] = ()) -> dict:
+                         reserved: Sequence[Tuple[float, float, float, float]] = (),
+                         holes: Sequence[Sequence[Sequence[float]]] = ()) -> dict:
     """Everything a stand needs: the walkable grid, the coverage targets and the
     blocking furniture (with the probe point a visibility test aims at)."""
-    grid = _walkable_grid(plan, items, reserved=reserved)
+    grid = _walkable_grid(plan, items, reserved=reserved, holes=holes)
     room_doors = [door for door in doors if plan.room_id in (door.a, door.b)]
     _mark_reachable(grid, [door.center for door in room_doors] or [plan.rect.center])
     blockers = []
@@ -2934,7 +2945,8 @@ def _second_camera_entry(entry: dict, pick: dict) -> dict:
 def place_cameras(rng: random.Random, plans: Sequence[RoomPlan], doors: Sequence[DoorPlan],
                   items: Sequence[Item], model: ShellModel,
                   want_second: bool,
-                  reserved_by_room: Optional[Dict[str, List[Tuple[float, float, float, float]]]] = None
+                  reserved_by_room: Optional[Dict[str, List[Tuple[float, float, float, float]]]] = None,
+                  floor_holes: Sequence[Sequence[Sequence[float]]] = ()
                   ) -> Tuple[List[dict], Optional[DoorPlan], dict]:
     """Pick 1-2 cameras per room by sampling the walkable area.
 
@@ -2948,6 +2960,9 @@ def place_cameras(rng: random.Random, plans: Sequence[RoomPlan], doors: Sequence
     middle of the room or in a corner behind the sofa; the view score picks the
     stand that shows the room.
 
+    ``floor_holes`` are the slab openings of the storey the stands are drawn on
+    (a stairwell, a declared void): no stand goes over one, because there is no
+    floor under it -- the camera rule of ``checks.py`` measures exactly that.
     Nothing here is tied to a row any more.  The previous design kept stands in
     a band around one *common door line* and rejected every stand whose
     pre-computed door ratio fell below ``DOOR_FORECAST_MIN_RATIO``: that mirror
@@ -2967,7 +2982,8 @@ def place_cameras(rng: random.Random, plans: Sequence[RoomPlan], doors: Sequence
     contexts: Dict[str, dict] = {}
     for plan in plans:
         reserved = (reserved_by_room or {}).get(plan.room_id) or ()
-        context = _room_camera_context(plan, items_by_room[plan.room_id], doors, reserved=reserved)
+        context = _room_camera_context(plan, items_by_room[plan.room_id], doors, reserved=reserved,
+                                       holes=floor_holes)
         context["stands"] = _camera_stands(plan, items_by_room[plan.room_id], context["grid"])
         context["doors"] = [door for door in doors if plan.room_id in (door.a, door.b)]
         if not context["stands"]:
@@ -3486,6 +3502,16 @@ def _duplex_width_candidates(rng: random.Random, order1: Sequence[str], order2: 
     return candidates
 
 
+def _stair_slab_opening(stair: StairPlan) -> List[List[float]]:
+    """The upper storey's slab opening of a duplex stair: the shaft plus clearance."""
+    shaft = stair.shaft
+    hole = STAIR_HOLE_CLEARANCE_M
+    return [[round(shaft.x0 - hole, 4), round(shaft.y0 - hole, 4)],
+            [round(shaft.x1 + hole, 4), round(shaft.y0 - hole, 4)],
+            [round(shaft.x1 + hole, 4), round(shaft.y1 + hole, 4)],
+            [round(shaft.x0 - hole, 4), round(shaft.y1 + hole, 4)]]
+
+
 def _build_duplex_attempt(rng: random.Random, room_count: Optional[int], index: Dict[str, dict],
                           attempt: int, seed: int) -> Tuple[dict, dict]:
     """One duplex attempt: programme, shared footprint, stair, furniture, cameras.
@@ -3601,6 +3627,7 @@ def _build_duplex_attempt(rng: random.Random, room_count: Optional[int], index: 
         slots_floor.append(slots)
 
     elevations = [record["elevation"] for record in _floor_records()]
+    stair_hole = _stair_slab_opening(stair)
     cameras: List[dict] = []
     forecast: Dict[str, dict] = {}
     openings_first: List[Optional[DoorPlan]] = []
@@ -3608,9 +3635,12 @@ def _build_duplex_attempt(rng: random.Random, room_count: Optional[int], index: 
     for position, plans in enumerate(plans_floor):
         rooms_by_id = {plan.room_id: plan.rect for plan in plans}
         model = ShellModel(rooms_by_id, doors_floor[position], items_floor[position])
+        # the stair's slab opening is the only hole of the upper storey: no camera
+        # stand is drawn over it (there is no floor under such a stand)
+        holes = [stair_hole] if FLOOR_IDS[position] == stair.to_floor else []
         floor_cameras, opening0, floor_forecast = place_cameras(
             rng, plans, doors_floor[position], items_floor[position], model,
-            want_second=len(plans) <= 3, reserved_by_room=reserve)
+            want_second=len(plans) <= 3, reserved_by_room=reserve, floor_holes=holes)
         for camera in floor_cameras:
             name = f"{next_camera:04d}"
             next_camera += 1
@@ -3713,13 +3743,7 @@ def _spec_dict_duplex(seed: int, floors: Sequence[dict], plans_floor: Sequence[S
             if entry.get("z") is not None:
                 entry["z"] = round(float(floor["elevation"]) + float(entry["z"]), 4)
             furniture.append(entry)
-    shaft = stair.shaft
-    hole = STAIR_HOLE_CLEARANCE_M
-    slab_opening = {"outline": [[round(shaft.x0 - hole, 4), round(shaft.y0 - hole, 4)],
-                                [round(shaft.x1 + hole, 4), round(shaft.y0 - hole, 4)],
-                                [round(shaft.x1 + hole, 4), round(shaft.y1 + hole, 4)],
-                                [round(shaft.x0 - hole, 4), round(shaft.y1 + hole, 4)]],
-                    "floors": [stair.to_floor]}
+    slab_opening = {"outline": _stair_slab_opening(stair), "floors": [stair.to_floor]}
     return {
         "_comment": [
             f"generated by blender_agent/layout_gen.py --seed {seed} --floors 2",

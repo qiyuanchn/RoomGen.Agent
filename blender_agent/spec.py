@@ -83,6 +83,18 @@ Semantics frozen with the generator:
   its room's floor is the floor's ``elevation``, an explicit ``z`` is a world
   height, and everything the builder writes (manifest, extrinsics, settled
   poses) stays in world coordinates.
+* **walkable ground is real surfaces only.**  A storey's floor slab is floor
+  where a room of that storey covers the point and no ``slab_opening`` of that
+  storey is punched there; a stair or ramp is *not* floor -- it is a walk track
+  of nodes that carry their own height (:func:`stair_track` / :func:`ramp_track`),
+  joined to the storey grids at its entry and exit nodes only.  A camera stands
+  on a floor slab of its own storey at ``elevation + CAMERA_EYE_HEIGHT_M``
+  (see :meth:`SceneSpec.support_surfaces`), never in mid air over a stairwell.
+* **ceilings are replaced per area, not per room.**  Where a storey above has a
+  slab bottom on the room's ceiling plane and a room covering the area, the slab
+  *is* the ceiling for exactly that area; the rest of the room keeps its own
+  ceiling slab (:meth:`SceneSpec.ceiling_regions`).  A ``slab_opening`` is a
+  declared void and stays open in both bodies.
 """
 
 from __future__ import annotations
@@ -126,11 +138,21 @@ STAIR_RISER_MAX_M = 0.19
 STAIR_TREAD_MIN_M = 0.24
 STAIR_LANDING_MIN_M = 0.80
 STAIR_HEADROOM_MIN_M = 2.0
+#: the steepest legal riser/tread pair (0.19 / 0.24) is 38.4 deg, so a walk track
+#: that climbs steeper than this has a broken step sequence
+STAIR_PITCH_MAX_DEG = 40.0
 RAMP_WIDTH_MIN_M = 0.90
 #: a ramp that climbs a whole storey needs ~23 m of run at the 1:12 accessibility
 #: limit, so the first version bounds the slope loosely (a steep interior ramp)
 #: and leaves long accessible ramps to split levels
 RAMP_SLOPE_MAX = 0.30
+
+#: eye height of a camera above the surface it stands on: the stands of
+#: ``layout_gen`` place the camera at ``floor elevation + CAMERA_EYE_HEIGHT_M``
+#: and ``checks`` measures the same offset downwards against the support surface
+CAMERA_EYE_HEIGHT_M = 1.5
+#: a camera whose feet are further than this off its support is not standing on it
+CAMERA_EYE_HEIGHT_TOL_M = 0.25
 
 
 class SpecError(ValueError):
@@ -427,6 +449,83 @@ def polygons_overlap(a: Sequence[Sequence[float]], b: Sequence[Sequence[float]],
     return polygon_overlap_area(a, b) > eps
 
 
+def _axis_rect(polygon: Sequence[Sequence[float]]) -> Optional[Tuple[float, float, float, float]]:
+    """``(x0, y0, x1, y1)`` when the polygon is an axis-aligned rectangle, else None."""
+    if len(polygon) != 4:
+        return None
+    xs = [float(p[0]) for p in polygon]
+    ys = [float(p[1]) for p in polygon]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    for x, y in ((xs[i], ys[i]) for i in range(4)):
+        if not (abs(x - x0) <= 1e-6 or abs(x - x1) <= 1e-6):
+            return None
+        if not (abs(y - y0) <= 1e-6 or abs(y - y1) <= 1e-6):
+            return None
+    return (x0, y0, x1, y1)
+
+
+def _merge_rect_cells(kept: Sequence[Sequence[bool]], xs: Sequence[float],
+                      ys: Sequence[float]) -> List[List[List[float]]]:
+    """Greedy merge of a kept-cell lattice into rectangles (covers every kept cell)."""
+    nx = len(xs) - 1
+    ny = len(ys) - 1
+    open_runs: Dict[Tuple[int, int], int] = {}
+    out: List[List[List[float]]] = []
+    for j in range(ny):
+        runs: List[Tuple[int, int]] = []
+        i = 0
+        while i < nx:
+            if not kept[j][i]:
+                i += 1
+                continue
+            start = i
+            while i < nx and kept[j][i]:
+                i += 1
+            runs.append((start, i - 1))
+        still = {run: open_runs.get(run, j) for run in runs}
+        for run, j0 in open_runs.items():
+            if run not in still:
+                out.append([[xs[run[0]], ys[j0]], [xs[run[1] + 1], ys[j0]],
+                            [xs[run[1] + 1], ys[j]], [xs[run[0]], ys[j]]])
+        open_runs = still
+    for run, j0 in open_runs.items():
+        out.append([[xs[run[0]], ys[j0]], [xs[run[1] + 1], ys[j0]],
+                    [xs[run[1] + 1], ys[ny]], [xs[run[0]], ys[ny]]])
+    return out
+
+
+def polygon_difference(subject: Sequence[Sequence[float]],
+                       cutters: Sequence[Sequence[Sequence[float]]]) -> List[List[List[float]]]:
+    """``subject`` minus the union of ``cutters``, as a list of polygons (all inside it).
+
+    Exact for axis-aligned rectangles -- what the generator and the hand-written
+    demos emit -- by cutting the subject's lattice at every cutter edge and merging
+    the surviving cells back into rectangles.  Any other outline keeps the whole
+    subject, which is the safe side for a shell part: a piece that is not needed is
+    a duplicated body, a missing one is a hole in the building.
+    """
+    subject_rect = _axis_rect(subject)
+    cutter_rects = [_axis_rect(cutter) for cutter in cutters]
+    if subject_rect is None or any(rect is None for rect in cutter_rects):
+        return [[[float(p[0]), float(p[1])] for p in subject]]
+    x0, y0, x1, y1 = subject_rect
+    xs = _dedup([x0, x1] + [min(max(rect[0], x0), x1) for rect in cutter_rects if rect]
+                + [min(max(rect[2], x0), x1) for rect in cutter_rects if rect])
+    ys = _dedup([y0, y1] + [min(max(rect[1], y0), y1) for rect in cutter_rects if rect]
+                + [min(max(rect[3], y0), y1) for rect in cutter_rects if rect])
+    nx, ny = len(xs) - 1, len(ys) - 1
+    kept = [[True] * nx for _ in range(ny)]
+    for j in range(ny):
+        cy = 0.5 * (ys[j] + ys[j + 1])
+        for i in range(nx):
+            cx = 0.5 * (xs[i] + xs[i + 1])
+            if any(rect[0] - 1e-9 <= cx <= rect[2] + 1e-9 and rect[1] - 1e-9 <= cy <= rect[3] + 1e-9
+                   for rect in cutter_rects if rect):
+                kept[j][i] = False
+    return _merge_rect_cells(kept, xs, ys)
+
+
 # --------------------------------------------------------------------------- #
 # dataclasses
 # --------------------------------------------------------------------------- #
@@ -575,6 +674,10 @@ class StairPlan:
     base_rect: Tuple[float, float, float, float]
     head_rect: Tuple[float, float, float, float]
 
+    def walk_nodes(self) -> List["WalkNode"]:
+        """The ordered walk track of this stair, see :func:`stair_track`."""
+        return stair_track(self)
+
 
 @dataclass
 class RampPlan:
@@ -596,6 +699,38 @@ class RampPlan:
     head_point: Tuple[float, float]
     base_rect: Tuple[float, float, float, float]
     head_rect: Tuple[float, float, float, float]
+
+    def walk_nodes(self) -> List["WalkNode"]:
+        """The ordered walk track of this ramp, see :func:`ramp_track`."""
+        return ramp_track(self)
+
+
+@dataclass
+class WalkNode:
+    """One point of a walk track: where a walker stands and on what surface.
+
+    ``z`` is the height of the surface itself (a floor slab, a stair step top, a
+    half landing, an inclined ramp), never an eye height.  ``kind`` names that
+    surface -- ``floor`` / ``step`` / ``landing`` / ``ramp`` -- and ``polygon``
+    carries the XY outline the node stands for (stair boxes), so a point can be
+    mapped back to the node under it.  Stair and ramp tracks start and end on the
+    storey floors: only those two nodes join the floor graph.
+    """
+
+    point: Tuple[float, float]
+    z: float
+    kind: str
+    label: str = ""
+    polygon: Optional[List[List[float]]] = None
+
+
+@dataclass
+class SupportSurface:
+    """A walkable surface found at one XY point, as seen from one storey."""
+
+    z: float
+    kind: str
+    label: str
 
 
 @dataclass
@@ -695,6 +830,29 @@ class SceneSpec:
 
     def in_slab_opening(self, floor_id: str, point: Sequence[float]) -> bool:
         return any(opening.contains(point) for opening in self.slab_openings_for(floor_id))
+
+    # -- walkable surfaces --------------------------------------------------- #
+    def ceiling_regions(self, room_id: str) -> List[List[List[float]]]:
+        """Ceiling outline(s) this room still owns, see :func:`room_ceiling_parts`."""
+        return room_ceiling_parts(self, room_id)
+
+    def ceiling_replaced_by(self, room_id: str) -> List[dict]:
+        """Upper slabs that replace parts of this room's ceiling, see :func:`room_ceiling_covers`."""
+        return room_ceiling_covers(self, room_id)
+
+    def ceiling_above(self, room_id: str, point: Sequence[float]) -> bool:
+        """True when ``point`` is under a ceiling this room owns, see :func:`room_ceiling_contains`."""
+        return room_ceiling_contains(self, room_id, point)
+
+    def support_surfaces(self, point: Sequence[float], floor_id: str) -> List[SupportSurface]:
+        """Walkable surfaces at ``point`` on one storey, see :func:`point_support_surfaces`."""
+        return point_support_surfaces(self, point, floor_id)
+
+    def walk_tracks(self) -> List[Tuple[ConnectorSpec, List[WalkNode]]]:
+        """Every stair / ramp as an ordered walk track, with the connector that made it."""
+        tracks = [(plan.connector, stair_track(plan)) for plan in self.stair_plans()]
+        tracks += [(plan.connector, ramp_track(plan)) for plan in self.ramp_plans()]
+        return tracks
 
     # -- connections -------------------------------------------------------- #
     def connections(self) -> List[ConnectorSpec]:
@@ -1004,6 +1162,159 @@ def ramp_plan(spec: "SceneSpec", connector: ConnectorSpec) -> RampPlan:
         base_rect=_rect_of(center, direction, u0 - 0.80, u0, -width / 2.0, width / 2.0),
         head_rect=_rect_of(center, direction, u1, u1 + 0.80, -width / 2.0, width / 2.0),
     )
+
+
+# --------------------------------------------------------------------------- #
+# walk tracks, support surfaces and ceilings
+# --------------------------------------------------------------------------- #
+def stair_track(plan: StairPlan) -> List[WalkNode]:
+    """The walker's path up a stair, bottom-up, with the surface under every node.
+
+    Nodes are the lower floor at the base point, the top of every step in
+    climbing order, the half landing of a switchback and the upper floor at the
+    head point.  Step boxes are already ordered along the climb (their tops rise
+    from the entry), so sorting a role's boxes by ``z1`` keeps the walk order for
+    the straight run and for both switchback flights; ``walk_nodes`` on the plan
+    is the entry point used by the checker and the builder.
+    """
+    nodes = [WalkNode(point=plan.base_point, z=plan.from_elevation, kind="floor",
+                      label=f"floor at the base of '{plan.connector.from_room}'")]
+    by_role: Dict[str, List[dict]] = {}
+    for box in plan.boxes:
+        by_role.setdefault(box["role"], []).append(box)
+    ordered: List[dict] = []
+    for role in ("flight", "flight_a", "landing", "flight_b"):
+        ordered.extend(sorted(by_role.get(role, []), key=lambda box: float(box["z1"])))
+    for index, box in enumerate(ordered):
+        centroid = _polygon_centroid(box["polygon"])
+        nodes.append(WalkNode(
+            point=(float(centroid[0]), float(centroid[1])), z=float(box["z1"]),
+            kind="landing" if box["role"] == "landing" else "step",
+            label=f"{box['role']} {index}",
+            polygon=[[float(p[0]), float(p[1])] for p in box["polygon"]],
+        ))
+    nodes.append(WalkNode(point=plan.head_point, z=plan.to_elevation, kind="floor",
+                          label=f"floor at the head of '{plan.connector.to_room}'"))
+    return nodes
+
+
+def ramp_track(plan: RampPlan) -> List[WalkNode]:
+    """The walker's path up a ramp: lower floor, middle of the incline, upper floor."""
+    middle = (0.5 * (plan.base_point[0] + plan.head_point[0]),
+              0.5 * (plan.base_point[1] + plan.head_point[1]))
+    return [
+        WalkNode(point=plan.base_point, z=plan.from_elevation, kind="floor",
+                 label=f"floor at the base of '{plan.connector.from_room}'"),
+        WalkNode(point=middle, z=0.5 * (plan.from_elevation + plan.to_elevation), kind="ramp",
+                 label="ramp"),
+        WalkNode(point=plan.head_point, z=plan.to_elevation, kind="floor",
+                 label=f"floor at the head of '{plan.connector.to_room}'"),
+    ]
+
+
+def stair_surface_at(plan: StairPlan, point: Sequence[float]) -> Optional[SupportSurface]:
+    """The step top / half landing a stair provides at ``point`` (None off the stair)."""
+    for box in plan.boxes:
+        if point_in_polygon(point, box["polygon"]):
+            return SupportSurface(z=float(box["z1"]),
+                                  kind="landing" if box["role"] == "landing" else "step",
+                                  label=box["role"])
+    return None
+
+
+def ramp_surface_at(plan: RampPlan, point: Sequence[float]) -> Optional[SupportSurface]:
+    """The inclined surface a ramp provides at ``point`` (None off the ramp)."""
+    if not point_in_polygon(point, plan.footprint):
+        return None
+    ux, uy = plan.direction
+    u = (float(point[0]) - plan.center[0]) * ux + (float(point[1]) - plan.center[1]) * uy
+    t = min(1.0, max(0.0, (u + plan.run / 2.0) / plan.run))
+    return SupportSurface(z=plan.from_elevation + t * plan.rise_total, kind="ramp",
+                          label=f"ramp {plan.connector.from_room}->{plan.connector.to_room}")
+
+
+def point_support_surfaces(spec: "SceneSpec", point: Sequence[float],
+                           floor_id: str) -> List[SupportSurface]:
+    """Every walkable surface at ``point``, as seen from one storey.
+
+    The storey's own floor slab counts where a room of that storey covers the
+    point **and the slab is not opened** -- a stairwell or a declared void has no
+    floor at its XY, which is what the old footprint rule got wrong.  Stairs and
+    ramps contribute the surface of the box the point falls on (a step top, a half
+    landing, the incline), so a checker can tell a stand on the floor from one in
+    mid air, and a stair case from a floor.
+    """
+    out: List[SupportSurface] = []
+    if spec.floors:
+        floor = spec.floor(floor_id)
+        rooms = spec.floor_rooms(floor_id)
+        opened = spec.in_slab_opening(floor_id, point)
+    else:
+        floor = FloorSpec(id="", elevation=0.0, height=spec.wall_height,
+                          slab_thickness=DEFAULT_SLAB_M)
+        rooms = list(spec.rooms)
+        opened = False
+    for room in rooms:
+        if not opened and point_in_polygon(point, room.polygon):
+            out.append(SupportSurface(z=floor.elevation, kind="floor", label=room.id))
+    for plan in spec.stair_plans():
+        surface = stair_surface_at(plan, point)
+        if surface is not None:
+            out.append(surface)
+    for plan in spec.ramp_plans():
+        surface = ramp_surface_at(plan, point)
+        if surface is not None:
+            out.append(surface)
+    return out
+
+
+def room_ceiling_covers(spec: "SceneSpec", room_id: str) -> List[dict]:
+    """Upper-storey slabs that replace parts of this room's ceiling.
+
+    A storey above replaces a ceiling where its slab bottom sits exactly on the
+    room's ceiling plane *and* one of its rooms covers the area.  Each entry is
+    ``{"floor": id, "room": id, "polygon": clipped outline, "area_m2": area}`` --
+    a list because an upper floor may cover the room only partly, so the rest of
+    the ceiling still has to be built.
+    """
+    room = spec.room(room_id)
+    floor = spec.room_floor(room_id)
+    ceiling = floor.elevation + spec.room_height(room_id)
+    covers: List[dict] = []
+    for upper in spec.floors:
+        if upper.elevation <= floor.elevation + 1e-9:
+            continue
+        if abs((upper.elevation - upper.slab_thickness) - ceiling) > 1e-6:
+            continue
+        for other in spec.floor_rooms(upper.id):
+            area = polygon_overlap_area(room.polygon, other.polygon)
+            if area <= 1e-6:
+                continue
+            covers.append({"floor": upper.id, "room": other.id,
+                           "polygon": polygon_clip(room.polygon, other.polygon),
+                           "area_m2": area})
+    return covers
+
+
+def room_ceiling_parts(spec: "SceneSpec", room_id: str) -> List[List[List[float]]]:
+    """The ceiling outline(s) this room still owns: the room minus what is covered.
+
+    Empty when an upper storey covers the whole room (that slab *is* the ceiling,
+    no duplicated body), the full polygon for a legacy single-storey room or one
+    that nothing covers, and one rectangle per surviving region for a partial
+    cover -- the "lower 4x4, upper 2x2" case that used to lose the whole ceiling.
+    A declared ``slab_opening`` above is *not* filled in: the void is explicit.
+    """
+    room = spec.room(room_id)
+    covers = room_ceiling_covers(spec, room_id)
+    if not covers:
+        return [[[float(p[0]), float(p[1])] for p in room.polygon]]
+    return polygon_difference(room.polygon, [cover["polygon"] for cover in covers])
+
+
+def room_ceiling_contains(spec: "SceneSpec", room_id: str, point: Sequence[float]) -> bool:
+    """True when ``point`` lies under a ceiling the room owns (replacement is not)."""
+    return any(point_in_polygon(point, part) for part in room_ceiling_parts(spec, room_id))
 
 
 # --------------------------------------------------------------------------- #

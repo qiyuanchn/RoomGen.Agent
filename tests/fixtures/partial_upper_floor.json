@@ -1,0 +1,67 @@
+{
+  "_comment": [
+    "Partial upper coverage (schema_version 2) -- the counterexample of review round 2,",
+    "defect 3: 'the upper storey only covers part of the lower room'.  The ground-floor",
+    "hall (8 x 6 m) is covered by the first-storey landing over its southern half only",
+    "(y in [0, 3]); over the northern half (y in [3, 6]) the hall keeps its OWN ceiling",
+    "slab.  The old _ceiling_is_upper_slab() dropped the whole room's ceiling as soon as",
+    "any overlap existed, so the northern half ended up open to the sky.",
+    "Two slab openings of floor f1 are declared: the stairwell the straight stair rises",
+    "through (1.9..6.1 x 0.9..2.1) and a 1 x 1 m void over the COVERED half (6.5..7.5 x",
+    "0.5..1.5) -- a double-height space, i.e. an explicit void declared by slab_opening.",
+    "The ground floor keeps the legacy 0.05 m slab while f1 is 0.15 m thick, so the two",
+    "bodies can be told apart by rays: in the uncovered half the hall's own ceiling",
+    "spans 2.70..2.75 m, in the covered half the f1 slab spans 2.70..2.85 m.",
+    "Rays in the three regions: covered -> the f1 slab bottom at 2.70 m (top 2.85 m);",
+    "uncovered -> the hall's own ceiling bottom at 2.70 m (top 2.75 m) -- with the old",
+    "room-wide skip this ray hit NOTHING within 20 m; void -> no body at all around",
+    "2.70 m, the first upward hit is the landing roof at 5.55 m.",
+    "See tests/test_multifloor.py::CeilingCoverageTest."
+  ],
+  "schema_version": 2,
+  "unit": "meter",
+  "wall_height": 2.7,
+  "wall_thickness": 0.12,
+  "floors": [
+    {"id": "f0", "elevation": 0.0, "height": 2.7, "slab_thickness": 0.05},
+    {"id": "f1", "elevation": 2.85, "height": 2.7, "slab_thickness": 0.15}
+  ],
+  "rooms": [
+    {"id": "hall", "type": "hall", "floor_id": "f0", "floor_color": [0.62, 0.58, 0.52],
+     "polygon": [[0, 0], [8.0, 0], [8.0, 6.0], [0, 6.0]]},
+    {"id": "entry", "type": "entry", "floor_id": "f0", "floor_color": [0.66, 0.62, 0.56],
+     "polygon": [[8.0, 0], [10.0, 0], [10.0, 3.0], [8.0, 3.0]]},
+
+    {"id": "landing", "type": "hall", "floor_id": "f1", "floor_color": [0.62, 0.58, 0.52],
+     "polygon": [[0, 0], [8.0, 0], [8.0, 3.0], [0, 3.0]]}
+  ],
+  "connectors": [
+    {"kind": "door", "from_room": "hall", "to_room": "entry", "from_floor": "f0", "to_floor": "f0",
+     "center": [8.0, 1.5], "width": 0.9, "height": 2.05},
+    {"kind": "stair", "from_room": "hall", "to_room": "landing", "from_floor": "f0", "to_floor": "f1",
+     "width": 0.9, "run": 3.9, "rise": 2.85, "steps": 16, "landing_m": 0.0,
+     "center": [4.0, 1.5], "direction_deg": 0}
+  ],
+  "slab_openings": [
+    {"outline": [[1.9, 0.9], [6.1, 0.9], [6.1, 2.1], [1.9, 2.1]], "floors": ["f1"]},
+    {"outline": [[6.5, 0.5], [7.5, 0.5], [7.5, 1.5], [6.5, 1.5]], "floors": ["f1"]}
+  ],
+  "cameras": [
+    {"name": "0000", "room": "hall", "pos": [1.0, 4.5, 1.5]},
+    {"name": "0001", "room": "entry", "pos": [9.0, 2.2, 1.5]},
+    {"name": "0100", "room": "landing", "pos": [0.8, 2.5, 4.35]}
+  ],
+  "style": {
+    "sun_elevation_deg": 35,
+    "sun_azimuth_deg": 210,
+    "sky_strength": 1.0,
+    "sun_energy": 3.0,
+    "view_transform": "AgX",
+    "exposure": 1.4
+  },
+  "lighting": {"lamp_w": 8.0, "lamp_radius": 0.08},
+  "furniture": [
+    {"asset": "builtin:storage_shelf", "room": "entry", "pos": [9.5, 0.3], "rot_z_deg": 0,
+     "name": "entry_shelf"}
+  ]
+}

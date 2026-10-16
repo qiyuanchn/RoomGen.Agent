@@ -17,8 +17,16 @@ Covers the frozen schema_version 2 contract and everything that reads it:
   landing for the switchback, and entry/exit points on the right sides.
 * **checks**: the shipped ``two_floor_demo.json`` passes every placement,
   circulation (2.5D: both storeys reachable through the stair), stair
-  geometry / opening / headroom / clearance rule, and the same-XY-same-storey
-  pairs that must *not* read as a collision.
+  geometry / opening / headroom / clearance rule, walk-track rule and the
+  same-XY-same-storey pairs that must *not* read as a collision.
+* **stairs as a walk track** (``stair_well_camera.json``): the stair footprint is
+  a hole in the storey floor and a track of height-carrying nodes above it, so a
+  camera standing over the stair well (step top 1.959 m, storey floor 2.85 m) is
+  rejected -- while the same scene with a camera on the floor still passes.
+* **ceilings per area** (``partial_upper_floor.json``): a room only loses the
+  ceiling an upper slab really replaces; the rest keeps its own ceiling slab, and
+  a declared ``slab_opening`` stays open.  Rays in the covered / uncovered /
+  void region must land where the geometry says.
 * **settle**: the rest plane of a placement is its room's floor (a second
   storey item is not "held" because its world z is large).
 * **export**: per-storey top-down plans plus the composite, and the viewpoint
@@ -56,11 +64,43 @@ from blender_agent import spec as spec_mod  # noqa: E402
 import validate_blender_agent_p0 as validator  # noqa: E402
 
 DEMO_SPEC = os.path.join(TESTS_DIR, "fixtures", "two_floor_demo.json")
+STAIR_CAMERA_SPEC = os.path.join(TESTS_DIR, "fixtures", "stair_well_camera.json")
+PARTIAL_CEILING_SPEC = os.path.join(TESTS_DIR, "fixtures", "partial_upper_floor.json")
 
 
 def _demo_dict() -> dict:
     with open(DEMO_SPEC, "r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def _load_dict(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _rect_of_polygon(polygon) -> tuple:
+    """``(x0, y0, x1, y1)`` of a 4-vertex axis-aligned rectangle (asserted)."""
+    xs = sorted({round(float(p[0]), 6) for p in polygon})
+    ys = sorted({round(float(p[1]), 6) for p in polygon})
+    assert len(polygon) == 4 and len(xs) == 2 and len(ys) == 2, f"not an axis-aligned rectangle: {polygon}"
+    return xs[0], ys[0], xs[1], ys[1]
+
+
+def _box_of_polygon(polygon, z0: float, z1: float) -> trimesh.Trimesh:
+    x0, y0, x1, y1 = _rect_of_polygon(polygon)
+    return _box(x0, y0, x1, y1, z0, z1)
+
+
+def _dome(radius: float = 30.0, z: float = 2.7) -> trimesh.Trimesh:
+    """Far enclosure for the dependency-free caster (the big mesh component)."""
+    return trimesh.creation.icosphere(subdivisions=3, radius=radius).apply_translation((0.0, 0.0, z))
+
+
+def _vertical_hit(caster, x: float, y: float, z: float, up: bool = True) -> float:
+    """Distance of the first hit of a vertical ray; ``inf`` when nothing is hit."""
+    origin = np.array([[float(x), float(y), float(z)]], dtype=np.float64)
+    direction = np.array([[0.0, 0.0, 1.0 if up else -1.0]], dtype=np.float64)
+    return float(caster.cast(origin, direction)[0])
 
 
 def _box(x0, y0, x1, y1, z0, z1) -> trimesh.Trimesh:
@@ -313,7 +353,8 @@ class DemoChecksTest(unittest.TestCase):
     def test_multi_floor_checks_are_present(self):
         names = {entry["name"] for entry in self._report()["checks"]}
         for name in ("stairs_geometry", "stairs_slab_openings", "stairs_headroom", "stairs_clear",
-                     "cross_floor_xy_ok_info", "circulation_reachable"):
+                     "stairs_walk_track", "cameras_stand", "cross_floor_xy_ok_info",
+                     "circulation_reachable"):
             self.assertIn(name, names)
 
     def test_both_storeys_are_reachable_through_the_stair(self):
@@ -404,6 +445,327 @@ class DemoChecksTest(unittest.TestCase):
         upper = [zone for zone in zones if zone.floor_id == "f1"]
         self.assertEqual(len(lower), 3)
         self.assertEqual(len(upper), 3)
+
+
+class WalkTrackTest(unittest.TestCase):
+    """The stair is a track of height-carrying nodes, not walkable floor.
+
+    ``checks`` builds the track of every stair / ramp (``spec.stair_track``) and
+    joins it to the storey grids at its entry and exit nodes only; the cells of
+    the stair footprint are holes in both storeys' floor grids.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.spec = spec_mod.load_spec(DEMO_SPEC)
+        cls.report = checks_mod.check_spec(cls.spec)
+
+    def _entry(self, name: str) -> dict:
+        return next(entry for entry in self.report["checks"] if entry["name"] == name)
+
+    def test_the_switchback_track_climbs_to_the_upper_floor(self):
+        tracks = self.spec.walk_tracks()
+        self.assertEqual(len(tracks), 1)
+        connector, nodes = tracks[0]
+        plan = self.spec.stair_plans()[0]
+        self.assertEqual(connector.kind, "stair")
+        self.assertEqual(len(nodes), len(plan.boxes) + 2)  # base + boxes + head
+        self.assertEqual(nodes[0].kind, "floor")
+        self.assertEqual(nodes[-1].kind, "floor")
+        self.assertAlmostEqual(nodes[0].z, 0.0, places=9)
+        self.assertAlmostEqual(nodes[-1].z, 2.85, places=9)
+        zs = [node.z for node in nodes]
+        self.assertTrue(all(b >= a - 1e-9 for a, b in zip(zs, zs[1:])), zs)
+        self.assertEqual([node.kind for node in nodes].count("landing"), 1)
+
+    def test_the_track_numbers_are_reported_per_stair(self):
+        entry = self._entry("stairs_walk_track")
+        self.assertTrue(entry["pass"], entry["violations"])
+        track = entry["tracks"][0]
+        self.assertAlmostEqual(track["max_step_rise_m"], 2.85 / 16, places=4)
+        self.assertLess(track["max_pitch_deg"], spec_mod.STAIR_PITCH_MAX_DEG)
+        self.assertGreaterEqual(track["min_clearance_m"], spec_mod.STAIR_HEADROOM_MIN_M)
+        self.assertTrue(track["monotonic"])
+        self.assertEqual(track["nodes"], 19)
+
+    def test_the_track_joins_the_floor_graph_at_its_two_ends(self):
+        track = self._entry("circulation_reachable")["tracks"][0]
+        self.assertTrue(track["entry_linked"])
+        self.assertTrue(track["exit_linked"])
+        self.assertEqual(track["nodes"], 19)
+
+    def test_the_slab_opening_above_the_stair_is_not_floor(self):
+        point = (1.9, 3.0)  # the review's stand, inside the f1 slab opening
+        self.assertTrue(self.spec.in_slab_opening("f1", point))
+        kinds = [surface.kind for surface in self.spec.support_surfaces(point, "f1")]
+        self.assertEqual(kinds, ["step"])
+        self.assertNotIn("floor", kinds)
+
+    def test_the_stair_footprint_used_to_be_free_on_both_storeys(self):
+        """The lower floor has no floor there either: the flight is solid."""
+        kinds = {surface.kind for surface in self.spec.support_surfaces((1.9, 3.0), "f0")}
+        self.assertEqual(kinds, {"floor", "step"})
+
+
+class CameraStandTest(unittest.TestCase):
+    """A camera stands on a real surface of its own storey -- never on a stair.
+
+    The counterexample is the review round 2 repro (``stair_well_camera.json``):
+    ``two_floor_demo.json`` without furniture and its only camera over the stair
+    well of the upper landing.  The stair footprint used to be free floor on
+    *both* storeys, so the camera passed every check although the slab above the
+    stair is opened and the step under it is 0.891 m below the storey floor.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.data = _load_dict(STAIR_CAMERA_SPEC)
+        cls.spec = spec_mod.parse_spec(copy.deepcopy(cls.data))
+        cls.report = checks_mod.check_spec(cls.spec)
+
+    def _entry(self, name: str) -> dict:
+        return next(entry for entry in self.report["checks"] if entry["name"] == name)
+
+    def _failing(self, report: dict):
+        return sorted(entry["name"] for entry in report["checks"] if not entry["pass"])
+
+    def test_the_counterexample_spec_parses(self):
+        self.assertEqual(len(self.spec.rooms), 8)
+        self.assertEqual([camera.name for camera in self.spec.cameras], ["0000"])
+        self.assertEqual(len(self.spec.stair_plans()), 1)
+
+    def test_only_the_camera_rules_fail(self):
+        self.assertEqual(self._failing(self.report),
+                         ["cameras_stand", "circulation_reachable"], self.report["violations"])
+
+    def test_the_stand_over_the_stair_well_is_rejected_with_numbers(self):
+        message = " ".join(self._entry("cameras_stand")["violations"])
+        self.assertIn("'0000'", message)
+        self.assertIn("1.959", message)   # the top of the step under the camera
+        self.assertIn("2.391", message)   # 4.35 - 1.959: 0.891 m over a 1.5 m eye height
+        self.assertIn("a stair is not a camera stand", message)
+
+    def test_the_support_surfaces_are_reported(self):
+        camera = self._entry("cameras_stand")["cameras"]["0000"]
+        self.assertEqual([surface["kind"] for surface in camera["surfaces"]], ["step"])
+        self.assertEqual(camera["support"]["kind"], "step")
+        self.assertAlmostEqual(camera["support"]["z"], 1.959, places=3)
+        self.assertAlmostEqual(camera["eye_height_m"], 2.391, places=3)
+
+    def test_the_camera_cell_is_not_free_floor(self):
+        stats = self._entry("circulation_reachable")["cameras"]["0000"]
+        self.assertFalse(stats["free"])
+        self.assertFalse(stats["reachable"])
+
+    def test_a_camera_on_the_landing_floor_of_the_same_scene_passes(self):
+        data = copy.deepcopy(self.data)
+        data["cameras"] = [{"name": "0000", "room": "landing", "pos": [0.8, 5.5, 4.35]}]
+        report = checks_mod.check_spec(spec_mod.parse_spec(data))
+        self.assertTrue(report["pass"], report["violations"][:3])
+
+    def test_a_camera_inside_the_flight_downstairs_is_rejected(self):
+        data = copy.deepcopy(self.data)
+        data["cameras"] = [{"name": "0000", "room": "hall", "pos": [1.9, 3.0, 1.5]}]
+        report = checks_mod.check_spec(spec_mod.parse_spec(data))
+        self.assertEqual(self._failing(report), ["cameras_stand", "circulation_reachable"],
+                         report["violations"])
+
+    def test_a_camera_over_a_declared_void_is_rejected(self):
+        data = _load_dict(PARTIAL_CEILING_SPEC)
+        data["cameras"] = [{"name": "0000", "room": "landing", "pos": [7.0, 1.0, 4.35]}]
+        report = checks_mod.check_spec(spec_mod.parse_spec(data))
+        self.assertIn("cameras_stand", self._failing(report))
+        entry = next(entry for entry in report["checks"] if entry["name"] == "cameras_stand")
+        self.assertIn("no surface under it", " ".join(entry["violations"]))
+
+    def test_an_eye_height_off_the_floor_is_rejected(self):
+        data = _load_dict(PARTIAL_CEILING_SPEC)
+        # 2.10 m is still inside the storey band (0 .. 2.70), so only the
+        # eye-height rule can catch a camera that is 0.60 m off its floor
+        data["cameras"] = [{"name": "0000", "room": "hall", "pos": [1.0, 4.5, 2.1]}]
+        report = checks_mod.check_spec(spec_mod.parse_spec(data))
+        self.assertEqual(self._failing(report), ["cameras_stand"], report["violations"])
+        entry = next(entry for entry in report["checks"] if entry["name"] == "cameras_stand")
+        self.assertIn("eye height is 2.100 m", " ".join(entry["violations"]))
+
+
+class CeilingCoverageTest(unittest.TestCase):
+    """A room keeps the ceiling an upper storey does not really replace.
+
+    The fixture (``partial_upper_floor.json``) is an 8 x 6 hall on f0 with the f1
+    landing over its southern half only, plus a 1 x 1 m ``slab_opening`` (a
+    declared void) inside the covered half.  Three regions are probed with rays
+    against the shell the builder emits (prisms from the same spec numbers):
+    covered -> the f1 slab, uncovered -> the hall's own ceiling (0.05 m thick),
+    void -> neither body around 2.70 m.
+    """
+
+    COVERED = (7.0, 2.5)
+    UNCOVERED = (7.0, 4.5)
+    VOID = (7.0, 1.0)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.spec = spec_mod.load_spec(PARTIAL_CEILING_SPEC)
+        cls.caster = validator.MeshRayCaster(cls._mesh(cls.spec))
+
+    @classmethod
+    def _ceiling_boxes(cls, spec, room_id: str) -> list:
+        floor = spec.room_floor(room_id)
+        top = floor.elevation + spec.room_height(room_id)
+        return [_box_of_polygon(part, top, top + floor.slab_thickness)
+                for part in spec.ceiling_regions(room_id)]
+
+    @classmethod
+    def _slab_boxes(cls, spec, floor_id: str) -> list:
+        """Floor slabs of one storey, with that storey's openings punched out."""
+        floor = spec.floor(floor_id)
+        openings = [opening.outline for opening in spec.slab_openings_for(floor_id)]
+        boxes = []
+        for room in spec.floor_rooms(floor_id):
+            for part in spec_mod.polygon_difference(room.polygon, openings):
+                boxes.append(_box_of_polygon(part, floor.elevation - floor.slab_thickness,
+                                             floor.elevation))
+        return boxes
+
+    @classmethod
+    def _mesh(cls, spec) -> trimesh.Trimesh:
+        boxes = cls._slab_boxes(spec, "f0")
+        boxes += cls._slab_boxes(spec, "f1")
+        for room_id in ("hall", "entry", "landing"):
+            boxes += cls._ceiling_boxes(spec, room_id)
+        boxes.append(_dome())
+        return trimesh.util.concatenate(boxes)
+
+    def test_the_hall_loses_only_the_covered_area(self):
+        parts = self.spec.ceiling_regions("hall")
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(_rect_of_polygon(parts[0]), (0.0, 3.0, 8.0, 6.0))
+        covers = self.spec.ceiling_replaced_by("hall")
+        self.assertEqual([cover["floor"] for cover in covers], ["f1"])
+        self.assertAlmostEqual(sum(cover["area_m2"] for cover in covers), 24.0, places=6)
+
+    def test_rooms_with_nothing_above_keep_a_whole_ceiling(self):
+        self.assertEqual(len(self.spec.ceiling_regions("entry")), 1)
+        self.assertEqual(len(self.spec.ceiling_regions("landing")), 1)
+
+    def test_the_fully_covered_demo_room_still_loses_its_whole_ceiling(self):
+        """Regression: two identical outlines (old duplex) keep the old result."""
+        demo = spec_mod.load_spec(DEMO_SPEC)
+        for room_id in ("hall", "living", "kitchen", "dining"):
+            with self.subTest(room=room_id):
+                self.assertEqual(demo.ceiling_regions(room_id), [])
+        for room_id in ("landing", "bedroom", "study", "bath"):
+            with self.subTest(room=room_id):
+                self.assertEqual(len(demo.ceiling_regions(room_id)), 1)
+
+    def test_rays_land_in_the_three_regions(self):
+        # covered: the f1 slab itself, one slab (0.15 m) thick
+        self.assertAlmostEqual(_vertical_hit(self.caster, *self.COVERED, 1.5), 1.20, places=2)
+        self.assertAlmostEqual(_vertical_hit(self.caster, *self.COVERED, 3.5, up=False), 0.65, places=2)
+        # uncovered: the hall's own ceiling, 2.70 .. 2.75
+        self.assertAlmostEqual(_vertical_hit(self.caster, *self.UNCOVERED, 1.5), 1.20, places=2)
+        self.assertAlmostEqual(_vertical_hit(self.caster, *self.UNCOVERED, 3.5, up=False), 0.75, places=2)
+        # declared void: nothing at 2.70 -- the first hit is the landing roof at 5.55
+        self.assertAlmostEqual(_vertical_hit(self.caster, *self.VOID, 1.5), 4.05, places=2)
+
+    def test_obstruction_bottoms_follows_the_same_rule(self):
+        labels = [label for _bottom, label in
+                  checks_mod._obstruction_bottoms(self.spec, self.COVERED, 1.5)]
+        self.assertIn("slab of floor 'f1'", labels)
+        self.assertNotIn("ceiling of room 'hall'", labels)
+        labels = [label for _bottom, label in
+                  checks_mod._obstruction_bottoms(self.spec, self.UNCOVERED, 1.5)]
+        self.assertIn("ceiling of room 'hall'", labels)
+        self.assertFalse(any(label.startswith("slab of floor") for label in labels))
+        void = [(round(bottom, 3), label) for bottom, label in
+                checks_mod._obstruction_bottoms(self.spec, self.VOID, 1.5)]
+        self.assertEqual(void, [(5.55, "ceiling of room 'landing'")])
+
+    def test_a_declared_void_stays_open(self):
+        self.assertTrue(self.spec.in_slab_opening("f1", self.VOID))
+        self.assertFalse(self.spec.ceiling_above("hall", self.VOID))
+        self.assertFalse(self.spec.ceiling_above("hall", self.COVERED))
+
+    def test_a_cover_in_the_middle_keeps_a_ring_of_ceiling(self):
+        """The decomposition splits a ring into rectangles (no hole polygon needed)."""
+        data = {
+            "schema_version": 2, "unit": "meter",
+            "wall_height": 2.7, "wall_thickness": 0.12,
+            "floors": [{"id": "f0", "elevation": 0.0, "height": 2.7, "slab_thickness": 0.15},
+                       {"id": "f1", "elevation": 2.85, "height": 2.7, "slab_thickness": 0.15}],
+            "rooms": [
+                {"id": "low", "type": "living_room", "floor_id": "f0",
+                 "polygon": [[0, 0], [6.0, 0], [6.0, 6.0], [0, 6.0]]},
+                {"id": "up", "type": "bedroom", "floor_id": "f1",
+                 "polygon": [[2.0, 2.0], [4.0, 2.0], [4.0, 4.0], [2.0, 4.0]]},
+            ],
+            "cameras": [{"name": "0000", "room": "low", "pos": [0.5, 0.5, 1.5]}],
+        }
+        spec = spec_mod.parse_spec(data)
+        parts = spec.ceiling_regions("low")
+        self.assertEqual(len(parts), 4)
+        self.assertAlmostEqual(sum(abs(spec_mod.polygon_area(part)) for part in parts), 32.0, places=6)
+        self.assertTrue(spec.ceiling_above("low", (3.0, 5.0)))
+        self.assertFalse(spec.ceiling_above("low", (3.0, 3.0)))
+
+    def test_a_non_rectangular_outline_keeps_the_whole_ceiling(self):
+        """Only axis-aligned rectangles are split; any other outline stays whole.
+
+        The fallback is deliberate (``spec.polygon_difference``): a ceiling part
+        that is not needed is a duplicated body, a missing one is a hole in the
+        building, so an L-shaped room keeps its ceiling everywhere instead of
+        risking a gap.
+        """
+        data = {
+            "schema_version": 2, "unit": "meter",
+            "wall_height": 2.7, "wall_thickness": 0.12,
+            "floors": [{"id": "f0", "elevation": 0.0, "height": 2.7, "slab_thickness": 0.15},
+                       {"id": "f1", "elevation": 2.85, "height": 2.7, "slab_thickness": 0.15}],
+            "rooms": [
+                {"id": "low", "type": "living_room", "floor_id": "f0",
+                 "polygon": [[0, 0], [4.0, 0], [4.0, 2.0], [2.0, 2.0], [2.0, 4.0], [0, 4.0]]},
+                {"id": "up", "type": "bedroom", "floor_id": "f1",
+                 "polygon": [[1.0, 1.0], [3.0, 1.0], [3.0, 3.0], [1.0, 3.0]]},
+            ],
+            "cameras": [{"name": "0000", "room": "low", "pos": [0.5, 3.5, 1.5]}],
+        }
+        spec = spec_mod.parse_spec(data)
+        parts = spec.ceiling_regions("low")
+        self.assertEqual(len(parts), 1)
+        self.assertAlmostEqual(abs(spec_mod.polygon_area(parts[0])), 12.0, places=6)
+        self.assertTrue(spec.ceiling_replaced_by("low"))
+        self.assertTrue(spec.ceiling_above("low", (0.5, 3.5)))
+
+    def test_the_minimal_review_repro_keeps_the_rest_of_the_ceiling(self):
+        """Lower 4 x 4 m, upper 2 x 2 m: 12 m^2 of ceiling used to disappear."""
+        data = {
+            "schema_version": 2, "unit": "meter",
+            "wall_height": 2.7, "wall_thickness": 0.12,
+            "floors": [{"id": "f0", "elevation": 0.0, "height": 2.7, "slab_thickness": 0.15},
+                       {"id": "f1", "elevation": 2.85, "height": 2.7, "slab_thickness": 0.15}],
+            "rooms": [
+                {"id": "low", "type": "living_room", "floor_id": "f0",
+                 "polygon": [[0, 0], [4.0, 0], [4.0, 4.0], [0, 4.0]]},
+                {"id": "up", "type": "bedroom", "floor_id": "f1",
+                 "polygon": [[0, 0], [2.0, 0], [2.0, 2.0], [0, 2.0]]},
+            ],
+            "cameras": [{"name": "0000", "room": "low", "pos": [3.0, 3.0, 1.5]}],
+        }
+        spec = spec_mod.parse_spec(data)
+        parts = spec.ceiling_regions("low")
+        self.assertAlmostEqual(sum(abs(spec_mod.polygon_area(part)) for part in parts), 12.0, places=6)
+        self.assertTrue(spec.ceiling_above("low", (3.0, 3.0)))
+        self.assertFalse(spec.ceiling_above("low", (1.0, 1.0)))
+        boxes = [_box_of_polygon(part, 2.7, 2.75) for part in parts]
+        boxes.append(_box(0.0, 0.0, 2.0, 2.0, 2.7, 2.85))    # the upper slab
+        boxes.append(_box(0.0, 0.0, 4.0, 4.0, -0.15, 0.0))    # the lower slab
+        boxes.append(_dome())
+        caster = validator.MeshRayCaster(trimesh.util.concatenate(boxes))
+        # the uncovered [3, 3] hits the ceiling at 2.70 (the review: "20 m, no hit")
+        self.assertAlmostEqual(_vertical_hit(caster, 3.0, 3.0, 1.5), 1.20, places=2)
+        # the covered [1, 1] hits the upper slab, also at 2.70
+        self.assertAlmostEqual(_vertical_hit(caster, 1.0, 1.0, 1.5), 1.20, places=2)
 
 
 class SettleFloorTest(unittest.TestCase):

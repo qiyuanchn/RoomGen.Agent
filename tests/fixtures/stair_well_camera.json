@@ -1,0 +1,530 @@
+{
+  "_comment": [
+    "Stair-well camera (schema_version 2) -- the counterexample of review round 2,",
+    "defect 2: 'the stair footprint is read as walkable floor on BOTH storeys'.",
+    "Derived from tests/fixtures/two_floor_demo.json by dropping the furniture and",
+    "putting the only camera over the stair well of the upper landing: the XY",
+    "[1.9, 3.0] lies inside the slab opening of floor f1, where the stair's step top",
+    "is at 1.959 m while the storey floor is at 2.85 m.  Treating the stair footprint",
+    "(blender_agent/checks.py circulation) as free cells of both storeys let this",
+    "camera pass every check -- a stand 0.891 m above the tread it would have to",
+    "hover over, in a hole of the floor.  The camera rule now asks for a real",
+    "support surface under the camera at eye height, so this spec must FAIL",
+    "(cameras_stand + the camera being unreachable).",
+    "See tests/test_multifloor.py::CameraStandTest.",
+    "Everything else (rooms, six doors, the switchback stair and its slab opening)",
+    "is the demo scene, so the fix is not allowed to disturb it."
+  ],
+  "schema_version": 2,
+  "unit": "meter",
+  "wall_height": 2.7,
+  "wall_thickness": 0.12,
+  "floors": [
+    {
+      "id": "f0",
+      "elevation": 0.0,
+      "height": 2.7,
+      "slab_thickness": 0.15
+    },
+    {
+      "id": "f1",
+      "elevation": 2.85,
+      "height": 2.7,
+      "slab_thickness": 0.15
+    }
+  ],
+  "rooms": [
+    {
+      "id": "hall",
+      "type": "hall",
+      "floor_id": "f0",
+      "floor_color": [
+        0.62,
+        0.58,
+        0.52
+      ],
+      "polygon": [
+        [
+          0,
+          0
+        ],
+        [
+          3.0,
+          0
+        ],
+        [
+          3.0,
+          6.0
+        ],
+        [
+          0,
+          6.0
+        ]
+      ]
+    },
+    {
+      "id": "living",
+      "type": "living_room",
+      "floor_id": "f0",
+      "floor_color": [
+        0.55,
+        0.38,
+        0.22
+      ],
+      "polygon": [
+        [
+          3.0,
+          3.0
+        ],
+        [
+          8.0,
+          3.0
+        ],
+        [
+          8.0,
+          6.0
+        ],
+        [
+          3.0,
+          6.0
+        ]
+      ]
+    },
+    {
+      "id": "kitchen",
+      "type": "kitchen",
+      "floor_id": "f0",
+      "floor_color": [
+        0.72,
+        0.7,
+        0.66
+      ],
+      "polygon": [
+        [
+          3.0,
+          0
+        ],
+        [
+          5.8,
+          0
+        ],
+        [
+          5.8,
+          3.0
+        ],
+        [
+          3.0,
+          3.0
+        ]
+      ]
+    },
+    {
+      "id": "dining",
+      "type": "dining_room",
+      "floor_id": "f0",
+      "floor_color": [
+        0.6,
+        0.45,
+        0.3
+      ],
+      "polygon": [
+        [
+          5.8,
+          0
+        ],
+        [
+          8.0,
+          0
+        ],
+        [
+          8.0,
+          3.0
+        ],
+        [
+          5.8,
+          3.0
+        ]
+      ]
+    },
+    {
+      "id": "landing",
+      "type": "hall",
+      "floor_id": "f1",
+      "floor_color": [
+        0.62,
+        0.58,
+        0.52
+      ],
+      "polygon": [
+        [
+          0,
+          0
+        ],
+        [
+          3.0,
+          0
+        ],
+        [
+          3.0,
+          6.0
+        ],
+        [
+          0,
+          6.0
+        ]
+      ]
+    },
+    {
+      "id": "bedroom",
+      "type": "bedroom",
+      "floor_id": "f1",
+      "floor_color": [
+        0.6,
+        0.5,
+        0.4
+      ],
+      "polygon": [
+        [
+          3.0,
+          3.0
+        ],
+        [
+          8.0,
+          3.0
+        ],
+        [
+          8.0,
+          6.0
+        ],
+        [
+          3.0,
+          6.0
+        ]
+      ]
+    },
+    {
+      "id": "study",
+      "type": "study",
+      "floor_id": "f1",
+      "floor_color": [
+        0.58,
+        0.46,
+        0.34
+      ],
+      "polygon": [
+        [
+          3.0,
+          0
+        ],
+        [
+          5.8,
+          0
+        ],
+        [
+          5.8,
+          3.0
+        ],
+        [
+          3.0,
+          3.0
+        ]
+      ]
+    },
+    {
+      "id": "bath",
+      "type": "bathroom",
+      "floor_id": "f1",
+      "floor_color": [
+        0.78,
+        0.8,
+        0.8
+      ],
+      "polygon": [
+        [
+          5.8,
+          0
+        ],
+        [
+          8.0,
+          0
+        ],
+        [
+          8.0,
+          3.0
+        ],
+        [
+          5.8,
+          3.0
+        ]
+      ]
+    }
+  ],
+  "connectors": [
+    {
+      "kind": "door",
+      "from_room": "hall",
+      "to_room": "living",
+      "from_floor": "f0",
+      "to_floor": "f0",
+      "center": [
+        3.0,
+        5.5
+      ],
+      "width": 0.9,
+      "height": 2.05
+    },
+    {
+      "kind": "door",
+      "from_room": "hall",
+      "to_room": "kitchen",
+      "from_floor": "f0",
+      "to_floor": "f0",
+      "center": [
+        3.0,
+        1.6
+      ],
+      "width": 0.9,
+      "height": 2.05
+    },
+    {
+      "kind": "open_passage",
+      "from_room": "living",
+      "to_room": "dining",
+      "from_floor": "f0",
+      "to_floor": "f0",
+      "center": [
+        6.9,
+        3.0
+      ],
+      "width": 1.2,
+      "height": 2.25
+    },
+    {
+      "kind": "door",
+      "from_room": "landing",
+      "to_room": "bedroom",
+      "from_floor": "f1",
+      "to_floor": "f1",
+      "center": [
+        3.0,
+        4.0
+      ],
+      "width": 0.9,
+      "height": 2.05
+    },
+    {
+      "kind": "door",
+      "from_room": "landing",
+      "to_room": "study",
+      "from_floor": "f1",
+      "to_floor": "f1",
+      "center": [
+        3.0,
+        1.0
+      ],
+      "width": 0.9,
+      "height": 2.05
+    },
+    {
+      "kind": "door",
+      "from_room": "study",
+      "to_room": "bath",
+      "from_floor": "f1",
+      "to_floor": "f1",
+      "center": [
+        5.8,
+        1.5
+      ],
+      "width": 0.9,
+      "height": 2.05
+    },
+    {
+      "kind": "stair",
+      "from_room": "hall",
+      "to_room": "landing",
+      "from_floor": "f0",
+      "to_floor": "f1",
+      "width": 0.85,
+      "run": 2.6,
+      "rise": 2.85,
+      "steps": 16,
+      "landing_m": 1.0,
+      "center": [
+        1.5,
+        3.0
+      ],
+      "direction_deg": 90
+    }
+  ],
+  "slab_openings": [
+    {
+      "outline": [
+        [
+          0.65,
+          1.2
+        ],
+        [
+          2.35,
+          1.2
+        ],
+        [
+          2.35,
+          4.95
+        ],
+        [
+          0.65,
+          4.95
+        ]
+      ],
+      "floors": [
+        "f1"
+      ]
+    }
+  ],
+  "windows": [
+    {
+      "room": "hall",
+      "wall": [
+        [
+          0,
+          5.0
+        ],
+        [
+          0,
+          5.9
+        ]
+      ],
+      "sill": 0.9,
+      "height": 1.4
+    },
+    {
+      "room": "living",
+      "wall": [
+        [
+          3.6,
+          6.0
+        ],
+        [
+          5.0,
+          6.0
+        ]
+      ],
+      "sill": 0.9,
+      "height": 1.4
+    },
+    {
+      "room": "kitchen",
+      "wall": [
+        [
+          3.6,
+          0.0
+        ],
+        [
+          4.9,
+          0.0
+        ]
+      ],
+      "sill": 1.2,
+      "height": 1.1
+    },
+    {
+      "room": "dining",
+      "wall": [
+        [
+          5.9,
+          0.0
+        ],
+        [
+          7.3,
+          0.0
+        ]
+      ],
+      "sill": 0.9,
+      "height": 1.4
+    },
+    {
+      "room": "landing",
+      "wall": [
+        [
+          0,
+          5.0
+        ],
+        [
+          0,
+          5.9
+        ]
+      ],
+      "sill": 0.9,
+      "height": 1.4
+    },
+    {
+      "room": "bedroom",
+      "wall": [
+        [
+          6.0,
+          6.0
+        ],
+        [
+          7.6,
+          6.0
+        ]
+      ],
+      "sill": 0.9,
+      "height": 1.4
+    },
+    {
+      "room": "study",
+      "wall": [
+        [
+          4.0,
+          0.0
+        ],
+        [
+          5.4,
+          0.0
+        ]
+      ],
+      "sill": 0.9,
+      "height": 1.4
+    },
+    {
+      "room": "bath",
+      "wall": [
+        [
+          8.0,
+          0.8
+        ],
+        [
+          8.0,
+          2.0
+        ]
+      ],
+      "sill": 0.9,
+      "height": 1.4
+    }
+  ],
+  "cameras": [
+    {
+      "name": "0000",
+      "room": "landing",
+      "pos": [
+        1.9,
+        3.0,
+        4.35
+      ]
+    }
+  ],
+  "style": {
+    "sun_elevation_deg": 35,
+    "sun_azimuth_deg": 210,
+    "sky_strength": 1.0,
+    "sun_energy": 3.0,
+    "view_transform": "AgX",
+    "exposure": 1.4
+  },
+  "lighting": {
+    "lamp_w": 8.0,
+    "lamp_radius": 0.08
+  },
+  "furniture": []
+}
