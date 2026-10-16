@@ -11,12 +11,15 @@ Checks, in order:
 4. **depth numerics**: for every camera, all ERP rays are cast against
    ``build/furnished.ply`` (the manifest's ``visible_geometry``) and compared
    with ``place_depth.png / scale``
-5. **door geometry**, per opening and independent of the cameras: local rays
-   from *both* sides of every door measure the hole in the wall (is it really
-   open, is the wall really there beside it, is the opening as wide and as high
-   as the spec says) -- see :func:`check_door_openings`.  Every door is measured
-   inside its **own storey**: the probe z band starts at the storey's floor
-   (``floor.elevation``) and stops below its room height.
+5. **door geometry**, per door connection and independent of the cameras: local
+   rays from *both* sides of every door measure the hole in the wall (is it
+   really open, is the wall really there beside it, is the opening as wide and
+   as high as the spec says) -- see :func:`check_door_openings`.  Every door is
+   measured inside its **own storey**: the probe z band starts at the storey's
+   floor (``floor.elevation``) and stops below its room height.  The doors come
+   from :meth:`SceneSpec.door_connections` -- legacy ``openings`` and
+   schema_version 2 ``connectors`` are one list, so neither spelling can slip
+   past the gate.
 6. **door visibility coverage** (informational, never fails a scene): for every
    camera the doors of its own room are projected into the ERP frame with the
    matrix-inverse projection of :func:`world_to_erp` and compared with the
@@ -534,6 +537,15 @@ def check_door_openings(spec: spec_mod.SceneSpec, caster, probe_m: float = 0.35,
       the wall is its width, the open run from the floor up is its height, and
       both are compared with the spec.
 
+    Every along-wall probe and scan stays **inside the shared wall span**: the
+    nominal 0.15 m beside-jamb probe and the 0.5 m width-scan margin are pulled
+    back to just inside the span ends (or dropped on a side with no wall at
+    all, i.e. an opening that spans the whole wall).  Without that, a door close
+    to a corner -- ``tests/fixtures/two_floor_demo.json`` has one 5 cm from the
+    wall end -- would be probed in the empty space *past* the wall, and the run
+    past the span would read as "wall missing next to the door" and as extra
+    open width.
+
     Doors are measured **within their own storey**: the probe z values start at
     the storey's walking surface (``floor.elevation + 0.10``) and stop below the
     room height, so a second-storey door is measured where the second storey is
@@ -580,6 +592,12 @@ def check_door_openings(spec: spec_mod.SceneSpec, caster, probe_m: float = 0.35,
         width = float(connector.width)
         failures: list = []
 
+        # the shared wall span in "along" coordinates relative to the door
+        # centre: -- | -- span_low ---------- 0 ---------- span_high -- | --
+        along_centre = float((centre[0] - segment.p0[0]) * direction[0]
+                             + (centre[1] - segment.p0[1]) * direction[1])
+        span_low, span_high = -along_centre, float(segment.length) - along_centre
+
         # which side of the wall each room is on (the ray probe has to stand
         # inside that room, so the sign comes from the room polygon itself)
         probe_sign = {}
@@ -611,8 +629,29 @@ def check_door_openings(spec: spec_mod.SceneSpec, caster, probe_m: float = 0.35,
                     start = None
             return best
 
+        def beside_offsets() -> list:
+            """Where the "wall beside the opening" probes stand, inside the span.
+
+            Nominal: 0.15 m past each jamb.  A jamb closer than that to the end
+            of the shared span (a door near a corner) pulls the probe back to
+            just inside the span end, so it measures the last sliver of the
+            wall instead of the empty space past it.  A side whose wall is
+            entirely covered by the opening (a door as wide as its wall span)
+            gets no probe; ``wall_solid_fraction`` is then ``None``.
+            """
+            offsets = []
+            for nominal in (-(width / 2.0 + 0.15), width / 2.0 + 0.15):
+                if nominal < 0.0:
+                    offset = max(nominal, span_low + 0.02)
+                else:
+                    offset = min(nominal, span_high - 0.02)
+                if abs(offset) >= width / 2.0 + 0.01:
+                    offsets.append(offset)
+            return offsets
+
         z_scan = elevation + min(max(height / 2.0, 0.45), height - 0.15, headroom - 0.15)
-        along_scan = np.arange(-(width / 2.0 + 0.5), width / 2.0 + 0.5 + 1e-9, step_m)
+        along_scan = np.arange(max(-(width / 2.0 + 0.5), span_low + step_m / 2.0),
+                               min(width / 2.0 + 0.5, span_high - step_m / 2.0) + 1e-9, step_m)
         z_values = np.arange(elevation + 0.10, elevation + headroom - 0.05 + 1e-9, step_m)
 
         measured_widths, measured_heights = [], []
@@ -623,11 +662,12 @@ def check_door_openings(spec: spec_mod.SceneSpec, caster, probe_m: float = 0.35,
                        for along in np.linspace(-(width / 2.0 - 0.05), width / 2.0 - 0.05, 7)]
             open_fraction = float(np.mean(cast(through) >= t_exit - 1e-4))
 
-            beside = [offset_ray(along, z, side)
-                      for along in (-(width / 2.0 + 0.15), width / 2.0 + 0.15)
+            offsets = beside_offsets()
+            beside = [offset_ray(along, z, side) for along in offsets
                       for z in (elevation + 0.6, z_scan)]
-            beside_hits = cast(beside)
-            solid_fraction = float(np.mean((beside_hits >= t_enter - 1e-4) & (beside_hits <= t_exit + 1e-3)))
+            beside_hits = cast(beside) if beside else np.empty(0)
+            solid_fraction = float(np.mean((beside_hits >= t_enter - 1e-4)
+                                           & (beside_hits <= t_exit + 1e-3))) if beside else None
 
             run = longest_open_run(cast([offset_ray(along, z_scan, side) for along in along_scan]) >= t_exit - 1e-4)
             if run is None:
@@ -655,7 +695,8 @@ def check_door_openings(spec: spec_mod.SceneSpec, caster, probe_m: float = 0.35,
             report.setdefault("sides", {})[room_id] = {
                 "probe_sign": side,
                 "open_fraction": round(open_fraction, 4),
-                "wall_solid_fraction": round(solid_fraction, 4),
+                "wall_solid_fraction": None if solid_fraction is None else round(solid_fraction, 4),
+                "wall_beside_probes": len(offsets),
                 "open_width_m": round(measured_width, 3),
                 "open_height_m": round(measured_height, 3),
                 "width_centre_offset_m": None if centre_offset is None else round(centre_offset, 3),
@@ -663,7 +704,7 @@ def check_door_openings(spec: spec_mod.SceneSpec, caster, probe_m: float = 0.35,
             if open_fraction < 0.98:
                 failures.append(f"{room_id}: only {open_fraction * 100:.1f}% of the rays through the declared "
                                 f"opening leave the wall slab (the opening is not open)")
-            if solid_fraction < 0.95:
+            if solid_fraction is not None and solid_fraction < 0.95:
                 failures.append(f"{room_id}: {100 * (1 - solid_fraction):.1f}% of the rays beside the opening do "
                                 f"not stop inside the wall (the wall is missing next to the door)")
             if abs(measured_width - width) > width_tol_m:
@@ -1094,14 +1135,20 @@ def main(argv=None) -> int:
         ply=os.path.relpath(ply_path, REPO_ROOT) if os.path.isfile(ply_path) else None,
     )
 
-    # ---- 5: door geometry, every opening, both sides ---------------------- #
+    # ---- 5: door geometry, every door, both sides ------------------------- #
     # The doors are measured on the *shell* (walls and their cuts), not on the
     # furnished scene: the question here is the wall contract (open hole, wall
     # thickness, opening size), and furniture is ``checks.py``'s and the
     # visibility metric's business.
+    #
+    # "Every door" means ``spec.door_connections()``, the merged list of legacy
+    # ``openings`` and schema_version 2 ``connectors`` -- a spec that declares
+    # its doors only in ``connectors`` (the fixture's case) must be measured,
+    # not skipped.  The skip is only for a spec with no door-like connection at
+    # all; the check itself already walks the same merged list.
     door_ply_path = shell_ply_path if os.path.isfile(shell_ply_path) else ply_path
-    if not spec.openings:
-        record("door_openings_geometry", True, skipped="spec has no openings")
+    if not spec.door_connections():
+        record("door_openings_geometry", True, skipped="spec has no door connections")
     elif door_ply_path is None or not os.path.isfile(door_ply_path):
         record("door_openings_geometry", False, error="no PLY with the shell geometry to measure the doors")
     else:
