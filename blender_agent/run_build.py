@@ -32,7 +32,7 @@ if REPO_ROOT not in sys.path:
 
 import bpy  # noqa: E402  (must come after the sys.path fix)
 
-from blender_agent import assets, details, front3d, materials, panorama, render_selftest, shell  # noqa: E402
+from blender_agent import assets, details, front3d, materials, panorama, render_selftest, settle, shell  # noqa: E402
 from blender_agent import spec as spec_mod, stage  # noqa: E402
 
 DEFAULT_CACHE = os.path.join(REPO_ROOT, "third_party", "assets", "polyhaven")
@@ -502,6 +502,7 @@ def main(argv) -> int:
                                    apply_materials=(front3d_ctx is None and not textured.get("source")))
 
     furniture_info = place_furniture(spec, libraries, textured, front3d_ctx=front3d_ctx)
+    furniture_info["settle"] = settle.ground_furniture(spec, furniture_info, build_dir, shell_info)
     if furniture_info["placements"]:
         kinds = {}
         for placement in furniture_info["placements"]:

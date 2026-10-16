@@ -53,6 +53,7 @@ layout_gen.py ──► scene_spec.json ◄── front3d.py (dataset replay)
                 stage.py    PBR materials, sun+sky, window portals
                 assets.py   Poly Haven / MIDI-3D model libraries
                 details.py  skirting, casings, bevels, builtin props
+                settle.py   rigid-body drop-to-rest, baked into the poses
                 panorama.py equirect Cycles + Position-pass depth
                      │
                      ▼
@@ -201,6 +202,7 @@ spec is at 0.30 m -- the same geometric constraint).
 python tests/test_front3d_math.py                       # transform-order units
 bash  tests/test_front3d_replay.sh                      # replay end-to-end
 python tests/test_layout_gen.py                         # layout generator units
+python tests/test_settle.py                             # furniture settling units + box self-check
 bash  scripts/blender_agent_run.sh configs/blender_agent_p0_demo.json outputs/p0
 ```
 

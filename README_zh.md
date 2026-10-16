@@ -48,6 +48,7 @@ layout_gen.py ──► scene_spec.json ◄── front3d.py（数据集回放�
                 stage.py    PBR 材质、日光+天空、窗口补光
                 assets.py   Poly Haven / MIDI-3D 模型库
                 details.py  踢脚线、门窗套、倒角、内置道具
+                settle.py   刚体沉降（drop-to-rest），沉降结果烘焙回位姿
                 panorama.py 等距柱状 Cycles + Position-pass 深度
                      │
                      ▼
@@ -175,6 +176,7 @@ python tools/gen_assets_trellis.py generate --backend trellis \
 python tests/test_front3d_math.py                       # 变换顺序单元测试
 bash  tests/test_front3d_replay.sh                      # 回放端到端
 python tests/test_layout_gen.py                         # 布局生成单元测试
+python tests/test_settle.py                             # 家具物理沉降：单元测试 + 盒子自检
 bash  scripts/blender_agent_run.sh configs/blender_agent_p0_demo.json outputs/p0
 ```
 

@@ -98,6 +98,7 @@ PANOWORLD_RES=2048x1024 bash tests/test_front3d_replay.sh   # canonical size
 | `stage.py` | materials, Nishita sky world, sun, enclosing sky dome, window portal lights, lamp lights |
 | `panorama.py` | equirect camera, Position-pass depth, strip/binary PLY export, OIDN pass |
 | `render_selftest.py` | renders emissive markers along known world axes and checks the ERP mapping |
+| `settle.py` | physics settling: rigid bodies + drop-to-rest, bakes the settled transforms (see below) |
 | `run_build.py` | Blender entry point (build, render, denoise, asset prep, 3D-FRONT replay) |
 | `export_scene.py` | host: build output → `scene/viewpoints/<cam>/*`, `map.json`, `topdown.png` |
 
@@ -175,6 +176,82 @@ The P3 replay extends the same schema (a P0/P1 spec keeps working unchanged):
 "furniture": [{"asset": "front3d:<jid>", "room": "BedRoom-151355", "pos": [5.4, -1.7],
                "z": 0.0, "rot_z_deg": 90.0, "scale_xyz": [1.0, 0.8, 1.1]}]
 ```
+
+## Furniture settling (drop to rest)
+
+Placement in a spec is *analytic*: a piece's bottom goes to the authored `z`
+(0 = "on the floor") and is only cross-checked against the room outline. Nothing
+says the piece really stands on the slab, and two pieces may well be authored
+into each other. `blender_agent/settle.py` closes that gap: right after
+`place_furniture` every furniture instance gets a rigid body, the shell
+(floor/walls/ceiling) becomes a passive collider, the pieces are dropped a
+couple of centimetres and simulated until they rest, then the settled pose is
+**baked** into the object transforms -- BlenderProc's drop-to-rest recipe
+(rigid bodies + `bpy.ops.ptcache` stepping + baking), with nothing of the
+simulation left in the scene the cameras see.
+
+What that means in practice:
+
+* the manifest carries the *settled* geometry: `furniture[i].bbox_z` is the
+  world-space bottom/top after settling, and `furniture[i].settle` records the
+  mode, the reasoning, the values before/after, the drop and the movement. Every
+  floor-resting piece of the shipped P1 spec ends up 0-0.1 mm above the floor
+  (the collision margin *is* the resting gap);
+* a piece that was authored into something else is nudged out first
+  (minimum translation over the hulls) instead of being launched -- the P1 sofa
+  slides 4.6 cm out of the bookshelf's hull, the bedroom plant 6.3 cm out of the
+  east wall;
+* pieces gravity does not support keep their authored transform *exactly*:
+  `mount: "ceiling"`, `mount: "wall"`, and anything with an authored `z` above
+  `lift_tolerance_m` (default 2 cm) -- the book stacks on the shelf, the pictures
+  on the wall, the lamp on the nightstand. They still get their (kinematic) rigid
+  body, in a collision group of their own, so they neither fall nor push;
+* thin slabs (`builtin:rug`, <= `flat_height_m`, default 3 cm) share a collision
+  group with the floor instead of the furniture: a 12 mm rug is floor finish, it
+  does not lift the sofa standing on it.
+
+The three implementation details that make it work on *these* models are worth
+knowing when something looks off:
+
+1. **hull proxies.** Furniture models are collection instances and Blender's
+   rigid-body operator only accepts meshes, so each placement is simulated as
+   the convex hull of its world vertices, and the proxy's rigid transform is
+   composed onto the object afterwards (`object.matrix_world = P @ before`); the
+   instanced meshes and their textures are never touched.
+2. **the body's origin is its centre of mass** (that is what Bullet takes the
+   object origin for): it is placed over the piece's *floor contact patch* (the
+   geometry within `base_band_m`, default 1.5 cm, of the lowest point) and at the
+   height of the hull's volume centroid. A body whose mass hangs outside its
+   footprint tips over by itself -- the potted plants' canopy centre is 10 cm off
+   the pot, and they rolled over within a second before this.
+3. **`use_split_impulse` + margins.** Active bodies carry `margin_m` (default
+   2 mm; Blender's 40 mm default visibly floats everything), the passive shell a
+   zero margin, and a deeply interpenetrating pair is separated geometrically
+   first, because Bullet's penetration recovery overshoots by roughly the
+   overlap.
+
+```bash
+# on by default for a spec that places furniture (and off for a 3D-FRONT replay,
+# whose dataset poses must stay exact); force it either way with:
+PANOWORLD_SETTLE=0 bash scripts/blender_agent_run.sh ...   # off
+PANOWORLD_SETTLE=1 bash scripts/blender_agent_run.sh ...   # on (also for front3d)
+
+# per-spec parameters (spec.py ignores unknown top-level keys, so no schema change)
+"settle": {"margin_m": 0.002, "drop_m": 0.02, "frames": 60, "substeps": 20,
+           "lift_tolerance_m": 0.02, "base_band_m": 0.015, "separation": true}
+
+# headless self-check: placed boxes (floating, sunk, overlapping, stacked, on a
+# rug, in a wall, instanced) must end up on the floor, none sunk
+blender --background --factory-startup --python blender_agent/settle.py -- --selfcheck
+python tests/test_settle.py
+```
+
+Environment overrides: `PANOWORLD_SETTLE` (`1`/`0`/`auto`),
+`PANOWORLD_SETTLE_<PARAM>` (`MARGIN`, `DROP`, `FRAMES`, `SUBSTEPS`,
+`SOLVER_ITERATIONS`, `LIFT_TOLERANCE`, `BASE_BAND`, ...), same names as the spec
+block. The build writes `build/settle_report.json` with the per-object numbers
+and the list of separations; a settlement that leaves a resting piece floating or
+sunk is reported in `report.checks.violations`.
 
 ## Lighting model
 
