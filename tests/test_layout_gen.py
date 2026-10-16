@@ -6,15 +6,17 @@ Run::
 
 Covers the layout contract: deterministic seeds, room sizes and topology,
 door/window geometry, the furniture placement rules that ``checks.py`` enforces
-(including the ones it is supposed to *catch*), and the pre-computed forecast of
-the door depth spot check that ``tools/validate_blender_agent_p0.py`` runs after
-the render.
+(including the ones it is supposed to *catch*), the camera stands sampled on the
+walkable grid (view coverage, clearances, per-room cameras and the two-camera
+bearing difference) and the pre-computed forecast of the door depth spot check
+that ``tools/validate_blender_agent_p0.py`` runs after the render.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import subprocess
 import sys
@@ -42,6 +44,35 @@ def _generate(seed, rooms=None):
 def _check(spec_dict):
     spec = spec_mod.parse_spec(copy.deepcopy(spec_dict))
     return spec, checks_mod.check_spec(spec, ASSETS_INDEX)
+
+
+def _capture(seed, rooms=None):
+    """Generate a scene plus the objects the camera placement ran on.
+
+    The camera stands are picked inside :func:`layout_gen.place_cameras`, so the
+    tests re-run the placement rule against exactly the rooms, doors, items and
+    shell model the generator saw (spy on the call, keep the last attempt).
+    """
+    captured = {}
+    original = layout_gen.place_cameras
+
+    def spy(rng, plans, doors, items, model, want_second):
+        captured.update(plans=list(plans), doors=list(doors), items=list(items), model=model)
+        return original(rng, plans, doors, items, model, want_second)
+
+    layout_gen.place_cameras = spy
+    try:
+        scene = _generate(seed, rooms)
+    finally:
+        layout_gen.place_cameras = original
+    return scene, captured
+
+
+def _room_context(captured, room_id):
+    """``(plan, items, camera context)`` for one room of a captured placement."""
+    plan = next(plan for plan in captured["plans"] if plan.room_id == room_id)
+    items = [item for item in captured["items"] if item.room == room_id]
+    return plan, items, layout_gen._room_camera_context(plan, items, captured["doors"])
 
 
 class LayoutStructureTest(unittest.TestCase):
@@ -297,6 +328,100 @@ class CommandLineTest(unittest.TestCase):
                                      bad], capture_output=True, text=True, cwd=REPO_ROOT)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("FAIL", result.stdout)
+
+
+class CameraSamplingTest(unittest.TestCase):
+    """Cameras are sampled on the room's walkable grid and picked for what they see."""
+
+    SEEDS = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)
+    MIN_CENTRE_DISTANCE_M = 0.40
+    MIN_COVERAGE_FRACTION = 0.50
+
+    @classmethod
+    def setUpClass(cls):
+        cls.scenes = {}
+        cls.placed = {}
+        for seed in cls.SEEDS:
+            scene, captured = _capture(seed)
+            cls.scenes[seed] = scene
+            cls.placed[seed] = captured
+
+    def test_every_room_has_a_camera_on_the_walkable_grid(self):
+        """One camera per room, standing on a free cell the doorway BFS reaches."""
+        for seed, scene in self.scenes.items():
+            by_room = {}
+            for camera in scene.spec["cameras"]:
+                by_room.setdefault(camera["room"], []).append(camera)
+            self.assertEqual(set(by_room), {room["id"] for room in scene.spec["rooms"]}, f"seed {seed}")
+            for room_id, group in by_room.items():
+                plan, items, context = _room_context(self.placed[seed], room_id)
+                blockers = [item for item in items if layout_gen._blocks_camera(item)]
+                for camera in group:
+                    x, y = camera["pos"][0], camera["pos"][1]
+                    box = (x, y, x, y)
+                    with self.subTest(seed=seed, camera=camera["name"]):
+                        self.assertTrue(layout_gen._walkable(context["grid"], x, y, reachable=True),
+                                        f"seed {seed} camera {camera['name']} is not on a reachable walkable cell")
+                        self.assertGreaterEqual(checks_mod.wall_gap(box, plan.rect.polygon()),
+                                                layout_gen.CAMERA_INSET_M - 1e-6)
+                        self.assertGreaterEqual(
+                            min((checks_mod.rect_distance(box, item.aabb) for item in blockers),
+                                default=float("inf")),
+                            layout_gen.CAMERA_MIN_GAP_TO_FURNITURE_M - 1e-6)
+
+    def test_cameras_leave_the_room_centre(self):
+        """The replaced rule was "closest to the room centre"; no camera sits there."""
+        for seed, scene in self.scenes.items():
+            for camera in scene.spec["cameras"]:
+                polygon = next(room["polygon"] for room in scene.spec["rooms"]
+                               if room["id"] == camera["room"])
+                centre = ((polygon[0][0] + polygon[2][0]) / 2.0, (polygon[0][1] + polygon[2][1]) / 2.0)
+                distance = math.dist(camera["pos"][:2], centre)
+                self.assertGreaterEqual(distance, self.MIN_CENTRE_DISTANCE_M,
+                                        f"seed {seed} camera {camera['name']} sits on the room centre")
+
+    def test_cameras_stay_in_the_opening_row_band(self):
+        """The door check samples the mirrored column, so stands stay on the row band."""
+        for seed, scene in self.scenes.items():
+            door = next(door for door in self.placed[seed]["doors"]
+                        if door.key() == scene.report["opening_0"])
+            for camera in scene.spec["cameras"]:
+                self.assertLessEqual(abs(camera["pos"][1] - door.center[1]),
+                                     layout_gen.CAMERA_BAND_M + 1e-6,
+                                     f"seed {seed} camera {camera['name']} left the door row band")
+
+    def test_view_coverage_is_high_and_reported(self):
+        """Every camera sees most of its room's walkable floor, and the report says so."""
+        for seed, scene in self.scenes.items():
+            for camera in scene.spec["cameras"]:
+                plan, _items, context = _room_context(self.placed[seed], camera["room"])
+                view = layout_gen._camera_view(self.placed[seed]["model"], plan, context, camera["pos"])
+                entry = scene.report["door_visual_forecast"][camera["name"]]
+                with self.subTest(seed=seed, camera=camera["name"]):
+                    self.assertAlmostEqual(entry["coverage"]["visible_area_fraction"],
+                                           round(view["coverage"], 3), places=3)
+                    self.assertAlmostEqual(entry["score"], round(view["score"], 3), places=3)
+                    self.assertGreaterEqual(view["coverage"], self.MIN_COVERAGE_FRACTION)
+
+    def test_two_camera_rooms_look_from_different_sides(self):
+        """A two-camera room gets two stands with a real bearing difference."""
+        for seed, scene in self.scenes.items():
+            rooms = scene.spec["rooms"]
+            cameras = scene.spec["cameras"]
+            self.assertEqual(len(cameras), len(rooms) + (1 if len(rooms) <= 3 else 0), f"seed {seed}")
+            for room in rooms:
+                group = [camera for camera in cameras if camera["room"] == room["id"]]
+                if len(group) < 2:
+                    continue
+                first, second = group
+                with self.subTest(seed=seed, room=room["id"]):
+                    self.assertGreaterEqual(math.dist(first["pos"][:2], second["pos"][:2]),
+                                            layout_gen.CAMERA_SECOND_MIN_GAP_M - 1e-6)
+                    entry = scene.report["door_visual_forecast"][second["name"]]["second_camera"]
+                    self.assertGreaterEqual(
+                        entry["bearing_angle_deg"], layout_gen.CAMERA_SECOND_MIN_ANGLE_DEG,
+                        f"seed {seed} room {room['id']}: the second camera looks at the room from "
+                        f"only {entry['bearing_angle_deg']} deg away")
 
 
 class ShellModelTest(unittest.TestCase):

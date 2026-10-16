@@ -25,7 +25,13 @@ that the existing pipeline can build, render and validate:
    against a wall, nightstand next to it with a lamp on top; kitchen/bathroom
    stay empty or get a plant).  Every slot resamples its position up to
    ``SLOT_ATTEMPTS`` times and a failed required slot restarts the layout.
-5. *cameras*: 1-2 per room, on the door line, >= 0.6 m from the furniture.
+5. *cameras*: 1-2 per room, sampled on the room's **walkable grid** (the free
+   cells of :func:`checks.circulation_report`, furniture footprints dilated)
+   and picked by what they see: the share of the walkable floor and of the
+   furniture in unobstructed view, the clearance to walls and furniture and the
+   distance to the doorways.  Stands stay in the band around the door line and
+   >= 0.6 m off the furniture, and a two-camera room gets two stands that look
+   at it from different bearings.
 6. *verification*: :mod:`blender_agent.checks` must pass, and the door depth
    spot check of ``tools/validate_blender_agent_p0.py`` is pre-computed with an
    analytic shell model (:class:`ShellModel`), so the rendered validation is not
@@ -45,6 +51,13 @@ maps the geometry onto itself, the sample hits the real sight line through the
 doorway, and the measured ratio matches the forecast (2-3.5x, exactly what the
 hand-tuned P1 scene shows).  ``keep_room_open``-style rules (a clear sight
 corridor, tall furniture out of it) are what makes that line stay clear.
+
+The forecast is only worth trusting because it *measures* the way the validator
+measures: the same column arithmetic, the same pixel rows (``_sample_row``) and
+the same 5x5 window median (:meth:`ShellModel._window_median`).  Both details
+matter at long range -- half a row of rounding is 4 mm at a door 8 m away, and
+the width of that margin decides whether the wall ray grazes over a doorway
+lintel (a 2.2x ratio) or slips under it (1.4x, which fails the render check).
 
 Outputs ``scene_spec.json`` (strictly the schema ``blender_agent/spec.py``
 accepts) plus ``layout_report.json`` (room graph, furniture list, per-slot
@@ -73,6 +86,7 @@ from blender_agent import spec as spec_mod  # noqa: E402
 DEFAULT_ASSETS_INDEX = checks_mod.DEFAULT_ASSETS_INDEX
 DEFAULT_REPORT_NAME = "layout_report.json"
 PANO_W = spec_mod.PANO_WIDTH
+PANO_H = spec_mod.PANO_HEIGHT
 
 WALL_HEIGHT = 2.7
 WALL_THICKNESS = 0.12
@@ -114,12 +128,29 @@ MAX_LAYOUT_ATTEMPTS = 80
 SLOT_ATTEMPTS = 8
 CAMERA_INSET_M = 0.40
 CAMERA_GRID_M = 0.25
+CAMERA_ROW_STEPS = 3
 CAMERA_BAND_M = 0.35
 CAMERA_Z_M = 1.5
 CAMERA_MIN_GAP_TO_FURNITURE_M = 0.60
 CAMERA_DOOR_GAP_M = 0.60
 CAMERA_RATIO_WEIGHT = 0.35
 DOOR_FORECAST_MIN_RATIO = 1.65
+# camera sampling (step 5): stands are drawn from the room's walkable grid and
+# scored by what they can see -- see ``place_cameras``
+CAMERA_VIS_GRID_M = 0.60
+CAMERA_TARGET_Z_M = 0.45
+CAMERA_VIS_TOLERANCE_M = 0.05
+CAMERA_COVERAGE_WEIGHT = 2.0
+CAMERA_FURNITURE_WEIGHT = 0.8
+CAMERA_WALL_WEIGHT = 0.6
+CAMERA_CLEARANCE_WEIGHT = 0.4
+CAMERA_DOOR_WEIGHT = 0.6
+CAMERA_WALL_COMFORT_M = 1.20
+CAMERA_CLEARANCE_COMFORT_M = 1.20
+CAMERA_SECOND_MIN_GAP_M = 1.20
+CAMERA_SECOND_MIN_ANGLE_DEG = 45.0
+CAMERA_SECOND_GAP_WEIGHT = 0.35
+CAMERA_SECOND_ANGLE_WEIGHT = 0.8
 
 STYLE_DEFAULTS = {
     "sun_elevation_deg": 35,
@@ -1217,6 +1248,18 @@ class _Box:
         return max(t0, t_min)
 
 
+def _sample_row(lat: float, height: int) -> int:
+    """The pixel row the validator samples for ``lat``.
+
+    ``tools/validate_blender_agent_p0.py`` maps a latitude to a row with
+    ``(pi/2 - lat) / pi * height - 0.5``, rounds it and clamps it to
+    ``[2, height - 3]``; the model has to do the same or its rays drift from the
+    sampled ones by up to half a row (0.09 deg at 1024 rows), which is exactly
+    the margin that decides whether a wall ray grazes over a doorway lintel.
+    """
+    return max(2, min(height - 3, int(round((math.pi / 2.0 - lat) / math.pi * height - 0.5))))
+
+
 def _door_hole(door_span_xy, door_height):
     """Predicate: does this ray travel through the door tunnel?"""
     x0, x1, y0, y1 = door_span_xy
@@ -1289,14 +1332,36 @@ class ShellModel:
                     best = t
         return best
 
-    def ray_for_pixel(self, door: DoorPlan, camera_pos: Sequence[float]) -> Optional[dict]:
+    def _row_depth(self, origin, lon: float, row: int, height: int) -> float:
+        """Depth along the ERP ray of one pixel row (measured at the row centre)."""
+        lat = math.pi / 2.0 - (row + 0.5) / height * math.pi
+        ray = (math.cos(lat) * math.cos(lon), -math.cos(lat) * math.sin(lon), math.sin(lat))
+        return self.cast(tuple(origin), ray)
+
+    def _window_median(self, origin, lon: float, row: int, height: int, half: int = 2) -> float:
+        """Median row depth over the validator's pixel window.
+
+        The validator takes the median depth of a 5x5 pixel neighbourhood around
+        the sampled column and row, so the forecast has to be the median of those
+        *rows* too -- a single centre ray can slide under a doorway lintel that
+        most of the window still sees, and then predicts a wall depth the render
+        never reports.  The column spread is left out: at 2 px it is a ~7 cm
+        lateral offset, while the rows decide the lintel.
+        """
+        rows = [max(0, min(height - 1, row + offset)) for offset in range(-half, half + 1)]
+        depths = sorted(self._row_depth(origin, lon, value, height) for value in rows)
+        return depths[len(depths) // 2]
+
+    def ray_for_pixel(self, door: DoorPlan, camera_pos: Sequence[float],
+                      height: int = PANO_H) -> Optional[dict]:
         """Depths of the validator's door/wall rows for the column it samples.
 
         ``tools/validate_blender_agent_p0.py`` computes the column from
         ``atan2(dy, dx)`` while the ERP convention (``spec.py``) maps a direction
         to ``atan2(-dy, dx)``: the sampled column is the mirror image about the
         camera's +X axis.  The model reproduces that, so the forecast matches the
-        render even where the column is mirrored.
+        render even where the column is mirrored, and it samples the same pixel
+        rows (:func:`_sample_row`) with the same window median.
         """
         segment = self.door_segments.get(door.key())
         if segment is None:
@@ -1319,12 +1384,12 @@ class ShellModel:
             return None
         column = int(round((math.atan2(to_door[1], to_door[0]) + math.pi) / (2.0 * math.pi) * PANO_W - 0.5)) % PANO_W
         lon = (column + 0.5) / PANO_W * 2.0 * math.pi - math.pi
-        lat_door = math.atan2(DOOR_H / 2.0 - camera_pos[2], horizontal)
-        lat_wall = math.atan2(((DOOR_H + 0.1 + self.wall_height - 0.05) / 2.0) - camera_pos[2], horizontal)
+        row_door = _sample_row(math.atan2(DOOR_H / 2.0 - camera_pos[2], horizontal), height)
+        row_wall = _sample_row(
+            math.atan2(((DOOR_H + 0.1 + self.wall_height - 0.05) / 2.0) - camera_pos[2], horizontal), height)
         depths = {}
-        for name, lat in (("door", lat_door), ("wall", lat_wall)):
-            ray = (math.cos(lat) * math.cos(lon), -math.cos(lat) * math.sin(lon), math.sin(lat))
-            depths[name] = self.cast(tuple(camera_pos), ray)
+        for name, row in (("door", row_door), ("wall", row_wall)):
+            depths[name] = self._window_median(camera_pos, lon, row, height)
         if not (0 < depths["door"] < float("inf") and 0 < depths["wall"] < float("inf")):
             return None
         return {"column": column, "horizontal_m": horizontal, "door_depth_m": depths["door"],
@@ -1335,88 +1400,412 @@ def door_forecast(model: ShellModel, door: DoorPlan, camera_pos: Sequence[float]
     return model.ray_for_pixel(door, tuple(camera_pos))
 
 
+def _blocks_walking(item: Item) -> bool:
+    """Mirror of ``checks.ItemBox.blocks_walking``: does the item block walkers?"""
+    if item.placement == checks_mod.FLOOR_FLAT:
+        return False
+    return item.z_range[0] < checks_mod.WALK_BAND_M[1] and item.z_range[1] > checks_mod.WALK_BAND_M[0]
+
+
+def _blocks_camera(item: Item) -> bool:
+    if item.placement in (checks_mod.FLOOR_FLAT, checks_mod.CEILING, checks_mod.MOUNTED):
+        return False
+    return item.z_range[0] < checks_mod.WALK_BAND_M[1] and item.z_range[1] > checks_mod.WALK_BAND_M[0]
+
+
+def _unit(vector: Sequence[float]) -> Tuple[float, float]:
+    length = math.hypot(vector[0], vector[1])
+    if length < 1e-9:
+        return (0.0, 0.0)
+    return (vector[0] / length, vector[1] / length)
+
+
+def _bearing_angle(first: Sequence[float], second: Sequence[float]) -> float:
+    """Angle in degrees between two view bearings (how differently two cameras look)."""
+    dot = max(-1.0, min(1.0, first[0] * second[0] + first[1] * second[1]))
+    return math.degrees(math.acos(dot))
+
+
+def _cell_span(low: float, high: float, origin: float, step: float, count: int) -> Tuple[int, int]:
+    first = max(0, int(math.ceil((low - origin) / step - 1e-9)))
+    last = min(count - 1, int(math.floor((high - origin) / step + 1e-9)))
+    return first, last
+
+
+def _walkable_grid(plan: RoomPlan, items: Sequence[Item], step: float = checks_mod.GRID_M) -> dict:
+    """One room's free-cell lattice plus the cells its doorways can reach.
+
+    The rule is the one :func:`checks.circulation_report` applies to the whole
+    apartment: a cell is *free* when it is inside the room polygon **inset by the
+    wall half thickness** (the walkable side of the wall centre line) and not
+    inside a blocking footprint dilated by ``checks.FURNITURE_DILATION_M`` -- rugs,
+    wall art and ceiling lamps never block.  ``reachable`` is a BFS over the free
+    cells from this room's doorways, so a camera standing on a reachable cell is
+    walkable from the front door, which is what the circulation check requires.
+    """
+    poly = checks_mod.inset_polygon(plan.rect.polygon(), WALL_THICKNESS / 2.0)
+    xs = [float(point[0]) for point in poly]
+    ys = [float(point[1]) for point in poly]
+    x0, y0 = min(xs) - step, min(ys) - step
+    nx = int(math.ceil((max(xs) + step - x0) / step)) + 1
+    ny = int(math.ceil((max(ys) + step - y0) / step)) + 1
+    free = bytearray(nx * ny)
+    for ix in range(nx):
+        cx = x0 + ix * step
+        for iy in range(ny):
+            cy = y0 + iy * step
+            if checks_mod.point_in_polygon((cx, cy), poly):
+                free[ix * ny + iy] = 1
+    blocked = bytearray(nx * ny)
+    for item in items:
+        if not _blocks_walking(item):
+            continue
+        aabb = item.aabb
+        ix_lo, ix_hi = _cell_span(aabb[0] - checks_mod.FURNITURE_DILATION_M,
+                                  aabb[2] + checks_mod.FURNITURE_DILATION_M, x0, step, nx)
+        iy_lo, iy_hi = _cell_span(aabb[1] - checks_mod.FURNITURE_DILATION_M,
+                                  aabb[3] + checks_mod.FURNITURE_DILATION_M, y0, step, ny)
+        for ix in range(ix_lo, ix_hi + 1):
+            for iy in range(iy_lo, iy_hi + 1):
+                blocked[ix * ny + iy] = 1
+    return {"x0": x0, "y0": y0, "step": step, "nx": nx, "ny": ny, "free": free, "blocked": blocked,
+            "reachable": bytearray(nx * ny)}
+
+
+def _grid_cell(grid: dict, x: float, y: float) -> Optional[Tuple[int, int]]:
+    ix = int(round((x - grid["x0"]) / grid["step"]))
+    iy = int(round((y - grid["y0"]) / grid["step"]))
+    if 0 <= ix < grid["nx"] and 0 <= iy < grid["ny"]:
+        return ix, iy
+    return None
+
+
+def _grid_free(grid: dict, ix: int, iy: int) -> bool:
+    index = ix * grid["ny"] + iy
+    return bool(grid["free"][index]) and not grid["blocked"][index]
+
+
+def _walkable(grid: dict, x: float, y: float, reachable: bool = False) -> bool:
+    cell = _grid_cell(grid, x, y)
+    if cell is None or not _grid_free(grid, cell[0], cell[1]):
+        return False
+    return bool(grid["reachable"][cell[0] * grid["ny"] + cell[1]]) if reachable else True
+
+
+def _mark_reachable(grid: dict, starts: Sequence[Sequence[float]]) -> None:
+    """BFS over the free cells from the points nearest ``starts`` (the doorways)."""
+    reachable = grid["reachable"]
+    ny, nx = grid["ny"], grid["nx"]
+    queue: List[Tuple[int, int]] = []
+    for start in starts:
+        cell = _grid_cell(grid, start[0], start[1])
+        if cell is None:
+            continue
+        found = None
+        for radius in range(0, 8):  # same spiral as checks.room_connectivity
+            for dx in range(-radius, radius + 1):
+                for dy in range(-radius, radius + 1):
+                    jx, jy = cell[0] + dx, cell[1] + dy
+                    if 0 <= jx < nx and 0 <= jy < ny and _grid_free(grid, jx, jy):
+                        found = (jx, jy)
+                        break
+                if found:
+                    break
+            if found:
+                break
+        if found is None:
+            continue
+        index = found[0] * ny + found[1]
+        if not reachable[index]:
+            reachable[index] = 1
+            queue.append(found)
+    while queue:
+        ix, iy = queue.pop()
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            jx, jy = ix + dx, iy + dy
+            if not (0 <= jx < nx and 0 <= jy < ny):
+                continue
+            index = jx * ny + jy
+            if reachable[index] or not _grid_free(grid, jx, jy):
+                continue
+            reachable[index] = 1
+            queue.append((jx, jy))
+
+
+def _camera_stands(plan: RoomPlan, items: Sequence[Item], grid: dict,
+                   rows: Sequence[float]) -> List[Tuple[float, float]]:
+    """Candidate stands: the walkable grid sampled every ``CAMERA_GRID_M`` in X
+    and on the given door-line rows in Y.
+
+    A stand has to sit on a free cell the room's doorway BFS reaches (so the
+    circulation check passes), keep ``CAMERA_INSET_M`` off the wall centre lines
+    and ``CAMERA_MIN_GAP_TO_FURNITURE_M`` off every blocking footprint.
+    """
+    rect = plan.rect
+    blockers = [item for item in items if _blocks_camera(item)]
+    stands: List[Tuple[float, float]] = []
+    x = rect.x0 + CAMERA_INSET_M
+    while x <= rect.x1 - CAMERA_INSET_M + 1e-9:
+        for row in rows:
+            point = (round(x, 3), round(row, 3))
+            if not (rect.y0 + CAMERA_INSET_M - 1e-9 <= point[1] <= rect.y1 - CAMERA_INSET_M + 1e-9):
+                continue
+            if _walkable(grid, point[0], point[1], reachable=True):
+                box = (point[0], point[1], point[0], point[1])
+                if checks_mod.wall_gap(box, rect.polygon()) >= CAMERA_INSET_M - 1e-9 and \
+                        all(checks_mod.rect_distance(box, item.aabb) >= CAMERA_MIN_GAP_TO_FURNITURE_M - 1e-9
+                            for item in blockers):
+                    stands.append(point)
+        x += CAMERA_GRID_M
+    return stands
+
+
+def _coverage_targets(grid: dict, plan: RoomPlan) -> List[Tuple[float, float]]:
+    """The room's walkable floor sampled every ``CAMERA_VIS_GRID_M``.
+
+    These are the points a stand's *coverage* is measured on: the share of them
+    whose sight line at ``CAMERA_TARGET_Z_M`` reaches them unobstructed.
+    """
+    rect = plan.rect
+    margin = WALL_THICKNESS / 2.0 + 0.05
+    targets: List[Tuple[float, float]] = []
+    x = rect.x0 + margin
+    while x <= rect.x1 - margin + 1e-9:
+        y = rect.y0 + margin
+        while y <= rect.y1 - margin + 1e-9:
+            if _walkable(grid, x, y):
+                targets.append((round(x, 3), round(y, 3)))
+            y += CAMERA_VIS_GRID_M
+        x += CAMERA_VIS_GRID_M
+    return targets
+
+
+def _ray_to(origin, point) -> Tuple[Optional[Tuple[float, float, float]], float]:
+    dx, dy, dz = point[0] - origin[0], point[1] - origin[1], point[2] - origin[2]
+    distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if distance < 1e-9:
+        return None, 0.0
+    return (dx / distance, dy / distance, dz / distance), distance
+
+
+def _visible(model: ShellModel, origin, point) -> bool:
+    """True when nothing stands between the camera and ``point``."""
+    direction, distance = _ray_to(origin, point)
+    if direction is None:
+        return False
+    return model.cast(origin, direction) >= distance - CAMERA_VIS_TOLERANCE_M
+
+
+def _ray_box_entry(origin, direction, aabb, z_range, t_max: float) -> Optional[float]:
+    """Distance at which the ray enters the furniture box (slab test), or None."""
+    low = (aabb[0], aabb[1], z_range[0])
+    high = (aabb[2], aabb[3], z_range[1])
+    t0, t1 = 0.0, t_max
+    for axis in range(3):
+        if abs(direction[axis]) < 1e-12:
+            if origin[axis] < low[axis] or origin[axis] > high[axis]:
+                return None
+            continue
+        inv = 1.0 / direction[axis]
+        near, far = (low[axis] - origin[axis]) * inv, (high[axis] - origin[axis]) * inv
+        if near > far:
+            near, far = far, near
+        t0, t1 = max(t0, near), min(t1, far)
+        if t0 > t1:
+            return None
+    return t0 if t0 > 1e-6 else None
+
+
+def _room_camera_context(plan: RoomPlan, items: Sequence[Item], doors: Sequence[DoorPlan]) -> dict:
+    """Everything a stand needs: the walkable grid, the coverage targets and the
+    blocking furniture (with the probe point a visibility test aims at)."""
+    grid = _walkable_grid(plan, items)
+    room_doors = [door for door in doors if plan.room_id in (door.a, door.b)]
+    _mark_reachable(grid, [door.center for door in room_doors] or [plan.rect.center])
+    blockers = []
+    for item in items:
+        if not _blocks_camera(item):
+            continue
+        aabb = item.aabb
+        z_range = item.z_range
+        blockers.append({"aabb": aabb, "z_range": z_range,
+                         "probe": (0.5 * (aabb[0] + aabb[2]), 0.5 * (aabb[1] + aabb[3]),
+                                   _clamp(0.5 * (z_range[0] + z_range[1]), 0.30, 1.30))})
+    return {"grid": grid,
+            "targets": _coverage_targets(grid, plan),
+            "blockers": blockers,
+            "door_rects": door_rects_for(plan.rect, room_doors)}
+
+
+def _camera_view(model: ShellModel, plan: RoomPlan, context: dict, pos: Sequence[float]) -> dict:
+    """What a camera standing at ``pos`` sees, and the terms its score is built from."""
+    origin = (pos[0], pos[1], CAMERA_Z_M)
+    seen, sum_x, sum_y = 0, 0.0, 0.0
+    for target in context["targets"]:
+        if _visible(model, origin, (target[0], target[1], CAMERA_TARGET_Z_M)):
+            seen += 1
+            sum_x += target[0]
+            sum_y += target[1]
+    blockers = context["blockers"]
+    items_seen = 0
+    for block in blockers:
+        direction, distance = _ray_to(origin, block["probe"])
+        if direction is None:
+            continue
+        entry = _ray_box_entry(origin, direction, block["aabb"], block["z_range"], distance)
+        if entry is not None and model.cast(origin, direction) >= entry - CAMERA_VIS_TOLERANCE_M:
+            items_seen += 1
+    box = (pos[0], pos[1], pos[0], pos[1])
+    rect = plan.rect
+    center = rect.center if not seen else (sum_x / seen, sum_y / seen)
+    clearance = min((checks_mod.rect_distance(box, block["aabb"]) for block in blockers),
+                    default=float("inf"))
+    view = {
+        "coverage": seen / max(1, len(context["targets"])),
+        "visible_cells": seen,
+        "cells": len(context["targets"]),
+        "visible_items": items_seen,
+        "items": len(blockers),
+        "furniture_fraction": (items_seen / len(blockers)) if blockers else 1.0,
+        "wall_clearance": checks_mod.wall_gap(box, rect.polygon()),
+        "furniture_clearance": clearance,
+        "door_gap": min((checks_mod.rect_distance(box, rect_) for rect_ in context["door_rects"]),
+                        default=CAMERA_DOOR_GAP_M),
+        "bearing": _unit((center[0] - pos[0], center[1] - pos[1])),
+    }
+    view["score"] = _camera_score(view)
+    return view
+
+
+def _camera_score(view: dict) -> float:
+    """Rank a stand: seeing the room beats standing in a corner, a doorway or
+    right next to a wardrobe."""
+    return (CAMERA_COVERAGE_WEIGHT * view["coverage"]
+            + CAMERA_FURNITURE_WEIGHT * view["furniture_fraction"]
+            + CAMERA_WALL_WEIGHT * min(view["wall_clearance"], CAMERA_WALL_COMFORT_M) / CAMERA_WALL_COMFORT_M
+            + CAMERA_CLEARANCE_WEIGHT * min(view["furniture_clearance"], CAMERA_CLEARANCE_COMFORT_M)
+            / CAMERA_CLEARANCE_COMFORT_M
+            + CAMERA_DOOR_WEIGHT * min(view["door_gap"], CAMERA_DOOR_GAP_M) / CAMERA_DOOR_GAP_M)
+
+
+def _forecast_entry(plan: RoomPlan, door: DoorPlan, pick: dict) -> dict:
+    """One ``door_visual_forecast`` row: the pre-computed door check plus what the
+    stand was picked for."""
+    view = pick["view"]
+    clearance = view["furniture_clearance"]
+    return {
+        "room": plan.room_id,
+        "ratio": round(pick["ratio"], 3),
+        "opening0": door.key(),
+        "score": round(view["score"], 3),
+        "coverage": {
+            "visible_area_fraction": round(view["coverage"], 3),
+            "visible_cells": view["visible_cells"],
+            "cells": view["cells"],
+            "visible_items": view["visible_items"],
+            "furniture": view["items"],
+            "wall_clearance_m": round(view["wall_clearance"], 3),
+            "furniture_clearance_m": None if clearance == float("inf") else round(clearance, 3),
+            "door_gap_m": round(view["door_gap"], 3),
+            "view_bearing_deg": round(math.degrees(math.atan2(view["bearing"][1], view["bearing"][0])), 1),
+        },
+    }
+
+
+def _second_camera_entry(entry: dict, pick: dict) -> dict:
+    """Add the relationship to the room's first camera (second camera only)."""
+    entry["second_camera"] = {"gap_m": round(pick["gap"], 3), "bearing_angle_deg": round(pick["angle"], 1)}
+    return entry
+
+
 def place_cameras(rng: random.Random, plans: Sequence[RoomPlan], doors: Sequence[DoorPlan],
                   items: Sequence[Item], model: ShellModel,
                   want_second: bool) -> Tuple[List[dict], DoorPlan, dict]:
-    """Pick 1-2 cameras per room and the opening that every camera can see.
+    """Pick 1-2 cameras per room by sampling the walkable area.
 
-    Candidates live in the band around the shared door line (see
-    :func:`plan_doors`): there the door direction is perpendicular to the wall
-    and the validator's mirrored sampling column coincides with the real sight
-    line through the doorway.
+    Every room contributes at least one camera.  Stands come from the room's
+    *walkable grid* (the free-cell lattice of :func:`_walkable_grid`, furniture
+    footprints dilated as in :mod:`blender_agent.checks`) and are scored by what
+    they see: the share of the walkable floor in unobstructed view, how much of
+    the furniture is visible, the clearance to walls and furniture and the
+    distance to the doorways.  The old rule -- the point closest to the room
+    centre -- put a camera in the middle of the room or in a corner behind the
+    sofa; the view score picks the stand that shows the room.
+
+    Two constraints survive from the previous design, because the render
+    validator depends on them:
+
+    * a stand only counts when the pre-computed door check
+      (:func:`door_forecast`) still sees the opening at
+      ``DOOR_FORECAST_MIN_RATIO`` -- the validator samples the *mirrored*
+      column of the door direction (see :meth:`ShellModel.ray_for_pixel`), which
+      only reaches the doorway from the band around the door line, hence
+      ``CAMERA_BAND_M``; the opening is chosen to maximise the worst forecast
+      over all cameras;
+    * the second camera in the living room has to stand
+      ``CAMERA_SECOND_MIN_GAP_M`` away from the first and look at the room from a
+      different bearing (``CAMERA_SECOND_MIN_ANGLE_DEG``), so a two-camera room
+      is really seen from two sides.
     """
     items_by_room: Dict[str, List[Item]] = {plan.room_id: [] for plan in plans}
     for item in items:
         items_by_room[item.room].append(item)
+    # stands are sampled on the rows around the common door line (half the grid
+    # step apart); the forecast filter below then keeps the ones whose mirrored
+    # column really reaches the doorway
     door_line = sum(door.center[1] for door in doors) / max(1, len(doors))
-    candidates: Dict[str, List[Tuple[Tuple[float, float], float]]] = {}
+    rows = [door_line + index * CAMERA_GRID_M / 2.0
+            for index in range(-CAMERA_ROW_STEPS, CAMERA_ROW_STEPS + 1)]
+    contexts: Dict[str, dict] = {}
     for plan in plans:
-        rect = plan.rect
-        band_lo = max(rect.y0 + CAMERA_INSET_M, door_line - CAMERA_BAND_M)
-        band_hi = min(rect.y1 - CAMERA_INSET_M, door_line + CAMERA_BAND_M)
-        if band_lo > band_hi:
-            raise _AttemptFailed(f"room {plan.room_id} cannot host a camera on the door line")
-        positions = []
-        x = rect.x0 + CAMERA_INSET_M
-        while x <= rect.x1 - CAMERA_INSET_M + 1e-9:
-            y = band_lo
-            while y <= band_hi + 1e-9:
-                positions.append((x, y))
-                y += CAMERA_GRID_M
-            x += CAMERA_GRID_M
-        door_rects = door_rects_for(rect, [door for door in doors if plan.room_id in (door.a, door.b)])
-        good = []
-        for pos in positions:
-            blocker_gap = float("inf")
-            ok = True
-            for item in items_by_room[plan.room_id]:
-                if not _blocks_camera(item):
-                    continue
-                distance = checks_mod.rect_distance((pos[0], pos[1], pos[0], pos[1]), item.aabb)
-                blocker_gap = min(blocker_gap, distance)
-                if distance < CAMERA_MIN_GAP_TO_FURNITURE_M:
-                    ok = False
-                    break
-            if not ok:
-                continue
-            room_point = (pos[0], pos[1], pos[0], pos[1])
-            door_gap = min((checks_mod.rect_distance(room_point, rect_) for rect_ in door_rects),
-                           default=CAMERA_DOOR_GAP_M)
-            # a viewpoint is nicer a couple of steps into the room than in the doorway
-            penalty = max(0.0, CAMERA_DOOR_GAP_M - door_gap)
-            center = rect.center
-            score = -math.dist(pos, center) + 0.15 * min(blocker_gap, 3.0) - 2.0 * penalty
-            good.append((pos, score))
-        if not good:
-            raise _AttemptFailed(f"no camera position in room {plan.room_id}")
-        candidates[plan.room_id] = good
+        context = _room_camera_context(plan, items_by_room[plan.room_id], doors)
+        context["stands"] = _camera_stands(plan, items_by_room[plan.room_id], context["grid"], rows)
+        if not context["stands"]:
+            raise _AttemptFailed(f"no walkable camera stand in room {plan.room_id}")
+        contexts[plan.room_id] = context
+
+    views: Dict[Tuple[str, float, float], dict] = {}
+
+    def view_of(plan: RoomPlan, pos: Sequence[float]) -> dict:
+        key = (plan.room_id, pos[0], pos[1])
+        if key not in views:
+            views[key] = _camera_view(model, plan, contexts[plan.room_id], pos)
+        return views[key]
+
+    def feasible(plan: RoomPlan, door: DoorPlan, pos: Sequence[float]):
+        if abs(pos[1] - door.center[1]) > CAMERA_BAND_M + 1e-9:
+            return None
+        forecast = door_forecast(model, door, (pos[0], pos[1], CAMERA_Z_M))
+        ratio = forecast["ratio"] if forecast else 0.0
+        if ratio < DOOR_FORECAST_MIN_RATIO:
+            return None
+        return ratio
 
     best_door = None
-    best_score = None
-    for door in doors:
-        picks: Dict[str, Tuple[Tuple[float, float], float, float]] = {}
+    best_worst = None
+    order = list(doors)
+    rng.shuffle(order)  # deterministic tie-break when several openings score alike
+    for door in order:
+        picks: Dict[str, dict] = {}
         worst = float("inf")
         for plan in plans:
             best = None
-            for pos, score in candidates[plan.room_id]:
-                forecast = door_forecast(model, door, (pos[0], pos[1], CAMERA_Z_M))
-                ratio = forecast["ratio"] if forecast else 0.0
-                if ratio < DOOR_FORECAST_MIN_RATIO:
+            for pos in contexts[plan.room_id]["stands"]:
+                ratio = feasible(plan, door, pos)
+                if ratio is None:
                     continue
-                # the door sight line decides *whether* a spot is usable, the view
-                # score (room centre, clear of furniture and doorways) decides which
-                # one is picked -- a camera squeezed against the wall looking along
-                # the room makes a poor panorama even when the ratio is highest
-                value = score + CAMERA_RATIO_WEIGHT * min(ratio, 3.0)
-                if best is None or value > best[3]:
-                    best = (pos, ratio, score, value)
+                # the door sight line decides *whether* a stand is usable, the
+                # view score decides which one is picked
+                value = view_of(plan, pos)["score"] + CAMERA_RATIO_WEIGHT * min(ratio, 3.0)
+                if best is None or value > best["value"] + 1e-9:
+                    best = {"pos": pos, "ratio": ratio, "view": view_of(plan, pos), "value": value}
             if best is None:
                 picks = {}
                 break
             picks[plan.room_id] = best
-            worst = min(worst, best[1])
-        if picks and (best_score is None or worst > best_score):
-            best_score = worst
+            worst = min(worst, best["ratio"])
+        if picks and (best_worst is None or worst > best_worst + 1e-9):
+            best_worst = worst
             best_door = (door, picks)
     if best_door is None:
         raise _AttemptFailed("no opening is visible from every camera candidate")
@@ -1426,39 +1815,47 @@ def place_cameras(rng: random.Random, plans: Sequence[RoomPlan], doors: Sequence
     camera_forecast: Dict[str, dict] = {}
     index = 0
     for plan in plans:
-        pos, ratio, _score, _value = picks[plan.room_id]
+        pick = picks[plan.room_id]
         name = f"{index:04d}"
         index += 1
-        cameras.append({"name": name, "room": plan.room_id, "pos": [round(pos[0], 3), round(pos[1], 3), CAMERA_Z_M]})
-        camera_forecast[name] = {"room": plan.room_id, "ratio": round(ratio, 3), "opening0": door.key()}
+        cameras.append({"name": name, "room": plan.room_id,
+                        "pos": [round(pick["pos"][0], 3), round(pick["pos"][1], 3), CAMERA_Z_M]})
+        camera_forecast[name] = _forecast_entry(plan, door, pick)
     if want_second:
         living = next((plan for plan in plans if plan.room_type == "living_room"), None)
-        if living is not None and len(candidates[living.room_id]) > 1:
-            first_pos = picks[living.room_id][0]
-            best = None
-            for pos, score in candidates[living.room_id]:
-                if math.dist(pos, first_pos) < 1.2:
-                    continue
-                forecast = door_forecast(model, door, (pos[0], pos[1], CAMERA_Z_M))
-                ratio = forecast["ratio"] if forecast else 0.0
-                if ratio < DOOR_FORECAST_MIN_RATIO:
-                    continue
-                value = math.dist(pos, first_pos) + 0.1 * ratio
-                if best is None or value > best[0]:
-                    best = (value, pos, ratio)
+        if living is not None:
+            first = picks[living.room_id]
+
+            def second(plan: RoomPlan, min_angle: float) -> Optional[dict]:
+                best = None
+                for pos in contexts[plan.room_id]["stands"]:
+                    gap = math.dist(pos, first["pos"])
+                    if gap < CAMERA_SECOND_MIN_GAP_M - 1e-9:
+                        continue
+                    ratio = feasible(plan, door, pos)
+                    if ratio is None:
+                        continue
+                    view = view_of(plan, pos)
+                    angle = _bearing_angle(first["view"]["bearing"], view["bearing"])
+                    if angle < min_angle - 1e-9:
+                        continue
+                    value = (view["score"] + CAMERA_SECOND_GAP_WEIGHT * min(gap, 3.0)
+                             + CAMERA_SECOND_ANGLE_WEIGHT * angle / 180.0)
+                    if best is None or value > best["value"] + 1e-9:
+                        best = {"pos": pos, "ratio": ratio, "view": view, "value": value,
+                                "angle": angle, "gap": gap}
+                return best
+
+            # a second camera is only worth it if it really looks at the room from
+            # another side; where the furniture leaves no stand that far around,
+            # the best remaining stand still wins (the report keeps its angle)
+            best = second(living, CAMERA_SECOND_MIN_ANGLE_DEG) or second(living, 0.0)
             if best is not None:
                 name = f"{index:04d}"
                 cameras.append({"name": name, "room": living.room_id,
-                                "pos": [round(best[1][0], 3), round(best[1][1], 3), CAMERA_Z_M]})
-                camera_forecast[name] = {"room": living.room_id, "ratio": round(best[2], 3),
-                                         "opening0": door.key()}
+                                "pos": [round(best["pos"][0], 3), round(best["pos"][1], 3), CAMERA_Z_M]})
+                camera_forecast[name] = _second_camera_entry(_forecast_entry(living, door, best), best)
     return cameras, door, camera_forecast
-
-
-def _blocks_camera(item: Item) -> bool:
-    if item.placement in (checks_mod.FLOOR_FLAT, checks_mod.CEILING, checks_mod.MOUNTED):
-        return False
-    return item.z_range[0] < checks_mod.WALK_BAND_M[1] and item.z_range[1] > checks_mod.WALK_BAND_M[0]
 
 
 # --------------------------------------------------------------------------- #

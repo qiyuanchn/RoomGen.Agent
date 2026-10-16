@@ -66,6 +66,26 @@ layout_gen.py ──► scene_spec.json ◄── front3d.py (dataset replay)
 `scene_spec.json` is the single contract: the planner only emits JSON, the
 builder is the only code that touches Blender, and validators close the loop.
 
+## Layout generation (seed → spec)
+
+`blender_agent/layout_gen.py --seed N --out spec.json` turns a seed into a
+furnished spec that passes `checks.py` and the render validator: 2–5 rooms in a
+row (one door per shared wall, all on a common door line near the south edge),
+windows on exterior spans, furniture placed from the asset index by room-type
+templates, and **cameras sampled on the room's walkable grid** — at least one per
+room, scored by what a stand sees (share of the walkable floor in unobstructed
+view, furniture in sight, wall and furniture clearance, distance to the
+doorways).  Small flats get a second living-room camera at least 1.2 m away
+whose bearing differs by ≥ 45°.  Stands stay in the band around the door line
+and ≥ 0.6 m off the furniture — the depth validator samples the *mirrored* door
+column, which only reaches the doorway from there (`blender_agent/layout_gen.py`
+explains why).
+
+```bash
+bash scripts/layout_gen_run.sh 7 outputs/layout_gen/seed7   # spec -> checks -> render -> validate
+bash scripts/batch_generate.sh 0 20 outputs/layout_gen/sweep20
+```
+
 ## Layout
 
 ```

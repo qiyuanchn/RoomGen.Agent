@@ -60,6 +60,21 @@ layout_gen.py ──► scene_spec.json ◄── front3d.py（数据集回放�
 
 `scene_spec.json` 是唯一契约：规划层只输出 JSON，构建层是唯一接触 Blender 的代码，校验层闭环反馈。
 
+## 布局生成（种子 → spec）
+
+`blender_agent/layout_gen.py --seed N --out spec.json` 把种子变成一份能通过
+`checks.py` 与渲染验证的家具化 spec：2–5 个房间排成一行（每面共享墙一扇门，门集中在
+靠南的公共门线），窗只开在外墙段，家具按房型模板从资产索引里选取，**相机在房间的
+可走网格上采样**——每房间至少一台，按"从这个点能看到什么"打分（可见可走面积占比、
+可见家具数、离墙与离家具净空、离门洞距离）。小户型客厅加第二台相机：至少相距 1.2 m，
+且观察房间的方位角相差 ≥ 45°。相机始终待在门线附近的带内、离家具 ≥ 0.6 m——深度
+校验取的是**镜像门列**，只有那个位置才能照到门洞（缘由见 `blender_agent/layout_gen.py`）。
+
+```bash
+bash scripts/layout_gen_run.sh 7 outputs/layout_gen/seed7   # 生成 → 校验 → 渲染 → 验证
+bash scripts/batch_generate.sh 0 20 outputs/layout_gen/sweep20
+```
+
 ## 目录结构
 
 ```
