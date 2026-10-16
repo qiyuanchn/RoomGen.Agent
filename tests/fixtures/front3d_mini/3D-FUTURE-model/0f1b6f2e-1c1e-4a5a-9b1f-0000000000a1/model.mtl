@@ -1,0 +1,6 @@
+# 3D-FUTURE mini fixture material
+newmtl sofa_material
+Kd 0.7200 0.3000 0.2400
+Ka 0.1000 0.1000 0.1000
+Tf 1.0000 1.0000 1.0000
+map_Kd texture.png

@@ -1,0 +1,6 @@
+# 3D-FUTURE mini fixture material
+newmtl bed_material
+Kd 0.5500 0.6000 0.7500
+Ka 0.1000 0.1000 0.1000
+Tf 1.0000 1.0000 1.0000
+map_Kd texture.png
