@@ -165,13 +165,18 @@ def setup_position_pass(
     return file_output
 
 
-def denoise_pano_file(raw_exr: str, out_png: str, prefilter: str = "ACCURATE", quality: str = "FAST") -> dict:
+def denoise_pano_file(raw_exr: str, out_png: str, prefilter: str = "ACCURATE", quality: str = "FAST",
+                      view_transform: str = "Standard", exposure: float = 0.0) -> dict:
     """OpenImageDenoise the linear EXR written by :func:`setup_position_pass`.
 
     Runs in its own Blender process on purpose: OIDN inside the 2048x1024 render
     process pushes the peak past this container's memory cap (measured 2306 MiB
     with HIGH, 1993 MiB with BALANCED+RGB against a ~1.9 GiB budget), while
     denoising one float image with OIDN/FAST costs ~1.5 GiB on its own.
+
+    ``view_transform``/``exposure`` reproduce the scene's display settings
+    (the spec ``style`` block); without them the delivered PNG silently used
+    Standard/0 and ``style.exposure`` never reached the output.
     """
     os.makedirs(os.path.dirname(os.path.abspath(out_png)), exist_ok=True)
     image = bpy.data.images.load(raw_exr)
@@ -198,8 +203,9 @@ def denoise_pano_file(raw_exr: str, out_png: str, prefilter: str = "ACCURATE", q
     output.format.color_depth = "8"
     if hasattr(output.format, "color_management"):
         output.format.color_management = "OVERRIDE"
-        output.format.view_settings.view_transform = "Standard"
+        output.format.view_settings.view_transform = view_transform
         output.format.view_settings.look = "None"
+        output.format.view_settings.exposure = float(exposure)
     stem = os.path.splitext(os.path.basename(out_png))[0]
     slot = output.file_slots[0]
     slot.path = f"{stem}_tmp_"
@@ -218,7 +224,9 @@ def denoise_pano_file(raw_exr: str, out_png: str, prefilter: str = "ACCURATE", q
         os.remove(stale)
     bpy.data.images.remove(image)
     return {"raw_exr": os.path.basename(raw_exr), "pano": os.path.basename(out_png),
-            "prefilter": prefilter, "quality": quality, "use_hdr": True, "size": [width, height]}
+            "prefilter": prefilter, "quality": quality, "use_hdr": True,
+            "view_transform": view_transform, "exposure": float(exposure),
+            "size": [width, height]}
 
 
 def read_image_pixels(path: str) -> np.ndarray:

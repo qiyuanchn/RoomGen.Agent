@@ -335,8 +335,12 @@ the pipeline already wrote:
   dark viewpoint; the depth maps add median depth and the near-content share of
   the horizon band as context;
 * **external** -- `REVIEW_CMD` (env) is split with `shlex.split`, gets the
-  panorama paths appended and must print one JSON object; a broken hook is
-  reported as `external.status: "error"` and never fails a scene by itself.
+  panorama paths appended and must print one JSON object; an explicit reject
+  always fails the scene, and a broken hook is reported as
+  `external.status: "error"` with `retry: true` and fails too unless
+  `--allow-external-error` opts out.  Every check carries a four-state result
+  (`ok` / `issues` / `not_run` / `error`) plus `required`; missing required
+  inputs are `not_run`, never a pass (`--spec-only` narrows the scopes).
 
 `--strict` promotes warnings to failures.  Every issue carries a `repair` hint,
 and `--apply-repair` applies the ones that are safe as **spec tweaks**:

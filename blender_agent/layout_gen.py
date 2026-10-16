@@ -238,8 +238,8 @@ STYLE_DEFAULTS = {
     "sun_azimuth_deg": 210,
     "sky_strength": 1.0,
     "sun_energy": 3.0,
-    "view_transform": "AgX",
-    "exposure": 1.4,
+    "view_transform": "Standard",
+    "exposure": 0.0,
 }
 MATERIAL_DEFAULTS = {
     "floor": "ph:oak_wood_planks",

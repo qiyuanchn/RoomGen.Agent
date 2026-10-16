@@ -96,7 +96,12 @@ def run_denoise_pass(build_dir: str, prefilter: str = "ACCURATE", quality: str =
         raw_path = os.path.join(build_dir, raw)
         pano_path = os.path.join(build_dir, entry["pano"])
         tick = time.time()
-        report = panorama.denoise_pano_file(raw_path, pano_path, prefilter=prefilter, quality=quality)
+        render_info = manifest.get("render", {})
+        report = panorama.denoise_pano_file(
+            raw_path, pano_path, prefilter=prefilter, quality=quality,
+            view_transform=render_info.get("view_transform", "Standard"),
+            exposure=float(render_info.get("exposure", 0.0) or 0.0),
+        )
         report["camera"] = entry["camera"]
         report["seconds"] = round(time.time() - tick, 2)
         reports.append(report)

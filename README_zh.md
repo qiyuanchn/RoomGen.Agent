@@ -106,13 +106,16 @@ passed**；`failure_reasons` / `failed_checks` 给出失败原因分布。`layou
 按失败阶段退出（`0` 成功、`2` 布局、`3` 检查、`4` 渲染、`5` 验证、`6` 评审），并把
 `run_id` 写进 `run_summary.json`，批次据此拒绝复用旧报告；内存失败会降参重跑一次
 （分辨率减半、`min(samples, 16)`，可用 `PANOWORLD_RETRY_RES` /
-`PANOWORLD_RETRY_SAMPLES` 覆盖）。`batch_generate.sh` 只有在所有场景都 `bundle_ok`
-时才退出 0；批量中断后可以跳过已完成种子继续跑：
+`PANOWORLD_RETRY_SAMPLES` 覆盖，`run_summary` 同时保留 requested/effective 两档，
+降质成功不会冒充原质量完成）。`batch_generate.sh` 只有在所有场景都 `bundle_ok`
+时才退出 0；断点续跑按 `resume_manifest.json` 的**配置指纹**判定复用：请求参数
+（分辨率/采样/楼层数/拓扑族）、规范化 spec 哈希、代码与资产哈希都匹配，且逐相机的
+全景/深度/位姿文件都存在可解码、尺寸正确，才会跳过；任一不符就重跑并打印原因：
 
 ```bash
 PANOWORLD_BATCH_RENDER=1 bash scripts/batch_generate.sh 0 100 outputs/stream
 PANOWORLD_BATCH_RENDER=1 PANOWORLD_BATCH_RESUME=1 \
-  bash scripts/batch_generate.sh 0 100 outputs/stream     # 跳过 bundle_ok 场景
+  bash scripts/batch_generate.sh 0 100 outputs/stream     # 按 manifest 指纹复用
 PANOWORLD_BATCH_SUMMARY_ONLY=1 \
   bash scripts/batch_generate.sh 0 100 outputs/stream     # 只重建汇总表
 PANOWORLD_BATCH_RENDER=1 PANOWORLD_REVIEW=1 \
@@ -162,9 +165,11 @@ REVIEW_CMD="mymodel --json" python blender_agent/review.py <outdir>  # 可插拔
 ### 多样性：这是新户型还是同一条长廊？
 
 `tools/diversity_report.py` 度量一个批次真正覆盖了什么：房间数与类型直方图、
-**带类型的邻接图**（房间*类型*之间的边、环路数，以及忽略家具、尺寸与种子的结构
-哈希）、轮廓长宽比与面积、功能覆盖、各类型房间的家具组合、相机布点与光照。拓扑重复
-按结构哈希分组，因此"同一条长廊换一套家具"只算一种拓扑。
+**带属性的房间图**（每个房间实例一个节点、带功能与楼层，每条门/通道/楼梯/坡道连接
+一条边、带类型，环路数按 `E-V+C` 计算，规范指纹忽略房间名、列表顺序、家具与尺寸）、
+占地并集与分层楼面面积、功能覆盖、各类型房间的家具组合、相机布点（3D/层内/导航三
+种间距）与光照。拓扑重复按规范指纹分组，因此"同一条长廊换一套家具"只算一种拓扑，
+而同样四个房间的链式、星形、环形是三种。
 
 ```bash
 python tools/diversity_report.py specs outputs/stream/scene_*/spec.json

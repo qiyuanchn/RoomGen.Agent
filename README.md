@@ -233,8 +233,13 @@ headroom), each with a machine-readable repair hint; `review_report.json` holds
 the per-check details, the numbers behind them and the hints.  External
 reviewers plug in through `REVIEW_CMD`: it is split with `shlex.split`, gets
 the panorama paths appended, and must print one JSON object
-(`{"pass": ..., "issues": [...]}`); a reviewer that crashes or prints junk is
-recorded as `external.status: "error"` and never fails a scene on its own.
+(`{"pass": ..., "issues": [...]}`); an explicit reject always fails the scene,
+and a reviewer that crashes or prints junk is recorded as
+`external.status: "error"` with `retry: true` — that fails too unless the run
+opts out with `--allow-external-error`.  Every check carries a four-state
+result (`ok` / `issues` / `not_run` / `error`) plus a `required` flag: a
+missing required input is `not_run`, never a pass (`--spec-only` narrows the
+required scopes to the spec).
 
 ```bash
 python blender_agent/review.py outputs/stream/scene_0007            # exit 0 pass, 1 fail
@@ -257,11 +262,15 @@ kept as `spec.pre_review.json` and the actions are recorded in
 ### Diversity: is this a new house or the same corridor?
 
 `tools/diversity_report.py` measures what a batch actually covers: room count
-and type histogram, the **typed adjacency graph** (edges between room *types*,
-cycle rank and a hash that ignores furniture, size and seed), shape and aspect
-ratio, functional coverage, furniture sets per room type, camera placement and
-lighting.  Topology repeats are grouped by that structure hash, so "the same
-railroad flat with other furniture" is one topology, not two.
+and type histogram, the **attributed room graph** (one node per room instance
+carrying its function and storey, one edge per door / passage / stair / ramp
+connection, its `E-V+C` cycle rank and a canonical fingerprint that ignores
+names, list order, furniture and size), union footprint and per-storey floor
+areas, functional coverage, furniture sets per room type, camera placement
+(3D / same-floor / navigation gaps) and lighting.  Topology repeats are
+grouped by that canonical fingerprint, so "the same railroad flat with other
+furniture" is one topology, while a chain, a star and a ring of equal rooms
+are three.
 
 ```bash
 python tools/diversity_report.py specs outputs/stream/scene_*/spec.json
@@ -331,12 +340,16 @@ unchanged (a spec without `floors` is schema_version 1).  A building spec adds
   poses) stays in world coordinates.
 
 `checks.py` verifies the 2.5D building: one walkable grid per storey (slab
-openings are holes unless a stair fills them), a stair/ramp edge joining the
-cell in front of the first riser to the cell in front of the top step, riser /
-tread / width / pitch / landing bands, the fly-through opening in the slab
-above, ≥ 2.0 m headroom over every step, a clear stair mouth, and — because the
-walk bands are per storey — furniture stacked in XY on two floors is never a
-false collision.  `settle.py` drops each piece onto its own storey's floor,
+openings are holes, and a stair footprint is never standable floor), with
+stair/ramp **walk tracks** carrying their own heights — riser / tread / width
+/ pitch / landing bands, monotone climb, ≥ 2.0 m body clearance along the
+track, and the track joining the floor grids only at its two ends.  Cameras
+must stand on real floor with a support surface beneath and the eye height
+above it (`cameras_stand`); the fly-through opening in the slab above, a clear
+stair mouth, and — because the walk bands are per storey — furniture stacked
+in XY on two floors is never a false collision.  Ceilings are computed per
+area: a storey slab replaces only the ceiling it actually covers, so a partial
+upper floor leaves the rest of the room below roofed (`ceiling_regions`).  `settle.py` drops each piece onto its own storey's floor,
 `export_scene.py` writes `topdown_<floor>.png` per storey (plus a stacked
 `topdown.png` and a `connectors.json`), and `map.json` links two viewpoints
 when their rooms share a door **or a stair** — the cross-floor adjacency.
@@ -356,10 +369,9 @@ glass) is not storey-aware, so the details layer is skipped on multi-floor
 specs; `stage.build_window_portals` still places its area lights at the opening
 height without the storey elevation (leave `lighting.window_portal_w` at 0 on a
 multi-floor spec, lamps still work); the ceiling of a room under another storey
-shows the upper floor's material; an upper storey that covers only *part* of a
-room below counts as covering it (the uncovered part gets no ceiling slab); and
-only straight / switchback stairs and solid ramps are implemented — no curved
-flights, no mezzanines, and a ramp that climbs a whole storey needs a long run
+shows the upper floor's material where the slab covers it; and only straight /
+switchback stairs and solid ramps are implemented — no curved flights, no
+mezzanines, and a ramp that climbs a whole storey needs a long run
 (the slope band is a loose 30 %).
 
 ## Layout
