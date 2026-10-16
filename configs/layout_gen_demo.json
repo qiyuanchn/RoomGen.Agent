@@ -1,0 +1,30 @@
+{
+  "_comment": [
+    "Defaults for the autonomous layout generator (blender_agent/layout_gen.py).",
+    "scripts/layout_gen_run.sh and scripts/batch_generate.sh read this file when",
+    "the matching PANOWORLD_* environment variables are not set, so the whole",
+    "demo is reproducible with plain commands:",
+    "  bash scripts/layout_gen_run.sh 0 outputs/layout_gen/seed0000",
+    "  bash scripts/batch_generate.sh 0 20 outputs/layout_gen/sweep20",
+    "  PANOWORLD_BATCH_RENDER=1 PANOWORLD_BATCH_SEEDS=0,7,13 \\",
+    "    bash scripts/batch_generate.sh 0 3 outputs/layout_gen/batch3",
+    "Rooms are drawn from the seed unless PANOWORLD_ROOMS / --rooms pins them."
+  ],
+  "assets_index": "third_party/assets/polyhaven/index.json",
+  "render": {
+    "resolution": "1024x512",
+    "samples": 32,
+    "min_free_mb": 2200,
+    "_comment": [
+      "1024x512 at 32 samples is the iteration profile: fast and ~0.6 GB peak.",
+      "Use 2048x1024 (the canonical PanoWorld size) plus 32 samples for a run",
+      "whose validation_report.json must pass every check including",
+      "canonical_resolution; it peaks near 1.9 GB, so renders stay serial."
+    ]
+  },
+  "acceptance": {
+    "sweep": {"start_seed": 0, "count": 20},
+    "end_to_end_seeds": [0, 7, 13],
+    "canonical_resolution": "2048x1024"
+  }
+}
