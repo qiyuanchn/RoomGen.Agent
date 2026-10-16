@@ -1,0 +1,88 @@
+{
+  "_comment": [
+    "P1 'furnished home' spec: same two-room shell as blender_agent_p0_demo.json,",
+    "same cameras, dressed with CC0 Poly Haven furniture + PBR textures.",
+    "Furniture conventions (see blender_agent/assets.py): the front of an asset faces -Y,",
+    "rot_z_deg turns it counter-clockwise from there (0=-Y, 90=+X, 180=+Y, 270=-X),",
+    "pos is the (x, y) floor position of the asset's bottom-centre and z=0 means the floor.",
+    "Placements are computed from the measured asset bounding boxes:",
+    "  sofa_02 1.81x0.82x0.71, coffee table 1.20x0.60x0.39 (rot 90), armchair 0.82x0.99x1.02,",
+    "  bookshelf 1.37x0.58x2.06 (rot 270), bed 1.49x2.04x1.53, nightstand 0.51x0.51x0.62.",
+    "The bed cannot follow 'head against the east wall' (the room is 4.0 m long, the bed 2.04 m",
+    "and the 0001 camera sits at the room centre) so its head goes against the windowless",
+    "south wall, which also keeps the north window unobstructed."
+  ],
+  "unit": "meter",
+  "wall_height": 2.7,
+  "wall_thickness": 0.12,
+  "rooms": [
+    {"id": "living",  "type": "living_room", "polygon": [[0,0],[5.2,0],[5.2,4.1],[0,4.1]], "floor_color": [0.55,0.38,0.22]},
+    {"id": "bedroom", "type": "bedroom",     "polygon": [[5.2,0.35],[9.2,0.35],[9.2,3.75],[5.2,3.75]], "floor_color": [0.6,0.5,0.4]}
+  ],
+  "openings": [
+    {"kind": "door", "between": ["living","bedroom"], "center": [5.2, 2.05], "width": 0.9, "height": 2.1}
+  ],
+  "windows": [
+    {"room": "living",  "wall": [[2.0,0.0],[3.8,0.0]],   "sill": 0.9, "height": 1.4},
+    {"room": "bedroom", "wall": [[6.7,3.75],[8.5,3.75]], "sill": 0.9, "height": 1.4}
+  ],
+  "cameras": [
+    {"name": "0000", "room": "living",  "pos": [2.6, 2.05, 1.5]},
+    {"name": "0001", "room": "bedroom", "pos": [7.2, 2.05, 1.5]}
+  ],
+  "style": {
+    "sun_elevation_deg": 35,
+    "sun_azimuth_deg": 210,
+    "sky_strength": 1.0,
+    "sun_energy": 3.0,
+    "view_transform": "AgX",
+    "exposure": 1.4
+  },
+  "materials": {
+    "floor": "ph:oak_wood_planks",
+    "wall": "ph:beige_wall_001",
+    "rug": "ph:poly_wool_herringbone",
+    "floor_tile_m": 1.2,
+    "wall_tile_m": 3.0,
+    "rug_tile_m": 0.9,
+    "rug_tint": [0.40, 0.36, 0.32],
+    "rug_tint_mix": 0.55,
+    "normal_strength": {"floor": 0.45, "wall": 0.7, "rug": 0.3}
+  },
+  "details": {
+    "skirting": true,
+    "casings": true,
+    "bevels": true,
+    "glass": true
+  },
+  "lighting": {
+    "window_portal_w": 42.0,
+    "lamp_w": 8.0,
+    "portal_margin": 0.02
+  },
+  "furniture": [
+    {"asset": "ph:sofa_02",                 "room": "living",  "pos": [3.70, 3.631], "rot_z_deg": 0,   "name": "sofa"},
+    {"asset": "ph:modern_coffee_table_01",  "room": "living",  "pos": [3.70, 2.80],  "rot_z_deg": 90,  "name": "coffee_table"},
+    {"asset": "builtin:rug",                "room": "living",  "pos": [3.70, 2.55],  "rot_z_deg": 0,   "size": [2.6, 1.5], "name": "rug"},
+    {"asset": "ph:modern_arm_chair_01",     "room": "living",  "pos": [4.30, 1.20],  "rot_z_deg": 225, "name": "armchair"},
+    {"asset": "ph:wooden_bookshelf_worn",   "room": "living",  "pos": [4.85, 3.35],  "rot_z_deg": 270, "name": "bookshelf"},
+    {"asset": "ph:book_encyclopedia_set_01","room": "living",  "pos": [4.82, 2.95],  "rot_z_deg": 270, "z": 0.52, "name": "books_a"},
+    {"asset": "ph:book_encyclopedia_set_01","room": "living",  "pos": [4.82, 3.60],  "rot_z_deg": 270, "z": 0.52, "name": "books_b"},
+    {"asset": "ph:book_encyclopedia_set_01","room": "living",  "pos": [4.82, 2.95],  "rot_z_deg": 270, "z": 1.08, "name": "books_c"},
+    {"asset": "ph:book_encyclopedia_set_01","room": "living",  "pos": [4.82, 3.60],  "rot_z_deg": 270, "z": 1.08, "name": "books_d"},
+    {"asset": "ph:book_encyclopedia_set_01","room": "living",  "pos": [4.82, 3.60],  "rot_z_deg": 270, "z": 1.62, "name": "books_e"},
+    {"asset": "ph:potted_plant_01",         "room": "living",  "pos": [0.55, 3.55],  "rot_z_deg": 20,  "name": "plant_tall"},
+    {"asset": "ph:potted_plant_02",         "room": "living",  "pos": [0.62, 0.62],  "rot_z_deg": 0,   "name": "plant_corner"},
+    {"asset": "ph:wicker_basket_01",        "room": "living",  "pos": [2.35, 3.86],  "rot_z_deg": 15,  "name": "basket"},
+    {"asset": "ph:modern_ceiling_lamp_01",  "room": "living",  "pos": [3.70, 2.85],  "rot_z_deg": 0,   "mount": "ceiling", "name": "ceiling_lamp"},
+    {"asset": "ph:hanging_picture_frame_01","room": "living",  "pos": [3.70, 4.032], "rot_z_deg": 0,   "z": 1.62, "name": "art_sofa"},
+    {"asset": "ph:hanging_picture_frame_01","room": "living",  "pos": [0.068, 2.05], "rot_z_deg": 90,  "z": 1.55, "name": "art_west"},
+
+    {"asset": "ph:GothicBed_01",            "room": "bedroom", "pos": [8.25, 1.43],  "rot_z_deg": 180, "name": "bed"},
+    {"asset": "ph:painted_wooden_nightstand","room": "bedroom","pos": [7.22, 0.665], "rot_z_deg": 180, "name": "nightstand"},
+    {"asset": "builtin:table_lamp",         "room": "bedroom", "pos": [7.22, 0.70],  "rot_z_deg": 0,   "z": 0.616, "name": "bedside_lamp"},
+    {"asset": "ph:potted_plant_02",         "room": "bedroom", "pos": [8.85, 3.35],  "rot_z_deg": 200, "name": "plant_bedroom"},
+    {"asset": "ph:modern_ceiling_lamp_01",  "room": "bedroom", "pos": [7.50, 1.55],  "rot_z_deg": 0,   "mount": "ceiling", "name": "ceiling_lamp_bed"},
+    {"asset": "ph:hanging_picture_frame_01","room": "bedroom", "pos": [8.25, 0.418], "rot_z_deg": 180, "z": 2.00, "name": "art_bed"}
+  ]
+}
