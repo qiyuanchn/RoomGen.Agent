@@ -189,6 +189,12 @@ def build_wall_segments(rooms: Sequence["RoomSpec"]) -> List[WallSegment]:
                 continue
             mid = 0.5 * (a + b)
             owners = tuple(sorted({room_id for t0, t1, room_id in spans if t0 - 1e-6 <= mid <= t1 + 1e-6}))
+            if not owners:
+                # a gap between two covered spans of the same line: neither side
+                # of it is a room boundary, so there is no wall there (a plan
+                # whose rooms touch the line only at its ends would otherwise
+                # grow a phantom wall across the middle of a room)
+                continue
             p0 = (ux * a + nx * c, uy * a + ny * c)
             p1 = (ux * b + nx * c, uy * b + ny * c)
             segments.append(WallSegment(p0=p0, p1=p1, direction=(ux, uy), owners=owners))

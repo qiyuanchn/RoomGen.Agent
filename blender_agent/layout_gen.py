@@ -1,63 +1,74 @@
 """Autonomous apartment layout generator: seed in, scene spec out.
 
     python blender_agent/layout_gen.py --seed 0 --out spec.json \
-        [--rooms 2..5] [--assets-index third_party/assets/polyhaven/index.json] \
+        [--rooms 2..7] [--shape row|block|auto|<family>] \
+        [--assets-index third_party/assets/polyhaven/index.json] \
         [--report layout_report.json]
 
 The generator turns a random seed into a furnished, multi-room ``scene_spec``
 that the existing pipeline can build, render and validate:
 
-1. *shell*: 2..5 axis-aligned rooms laid out as one row (a "railroad" flat):
-   rooms share the south edge, get depths between 3.65 m and 4.8 m, areas drawn
-   from the realistic bands (living 18-30 m2, bedroom 12-20 m2, kitchen
-   6-12 m2, bathroom 4-8 m2, study 8-14 m2) and a minimum side per type.  Every
-   cut is vertical, so rooms abut on full-height shared walls, the floor plan is
-   a guillotine partition of one rectangle and the room graph is a path.
-2. *openings*: one 0.9 x 2.1 door per shared wall, all centred on a common door
-   line near the south edge.
+1. *shell*: axis-aligned rectangular rooms in a **topology family** (see
+   :data:`ROOM_FAMILIES`): a 2x2 block, an L, a central living room with rooms
+   around it, one- or two-sided corridors and a circulation loop.  ``--shape``
+   picks the arrangement (``row`` is the default railroad flat, ``block`` the
+   same chain wrapped into two rows, ``auto`` draws a family from the seed, and
+   a family name forces one).  Room areas are drawn from the realistic bands
+   (:data:`ROOM_AREA_M2`) with a minimum side per type, so a small service cell
+   becomes a bathroom and never a 3 m2 bedroom.
+2. *doors*: a semantic spanning tree over the shared walls -- a corridor serves
+   the rooms, the kitchen opens onto the dining room, a bathroom is never
+   crossed and a bedroom is never the public way through the flat
+   (:func:`door_semantics` checks the result).  Loop families add one extra
+   door to close their ring.
 3. *windows*: 1-2 per habitable room on its own exterior wall spans
-   (1.2-2.0 m wide, sill 0.9 m, height 1.4 m), kept clear of wall corners.
+   (1.2-2.0 m wide, sill 0.9 m, height 1.4 m), kept clear of wall corners, and
+   allocated by the function of the room (:func:`window_wish`): living rooms,
+   bedrooms, studies and dining rooms get windows, kitchens nearly always one,
+   bathrooms and laundries rarely, corridors and storage none.
 4. *furniture*: Poly Haven assets picked by category from the asset index (the
-   API dimensions are millimetres and become the collision boxes), placed from
-   per room-type templates (sofa against a wall facing the room, coffee table
-   0.4-0.6 m in front of it, rug underneath, bookshelf on another wall, plant
-   in a free corner, ceiling lamp at the centre, art above the sofa; bed head
-   against a wall, nightstand next to it with a lamp on top; kitchen/bathroom
-   stay empty or get a plant).  Every slot resamples its position up to
-   ``SLOT_ATTEMPTS`` times and a failed required slot restarts the layout.
+   API dimensions are millimetres and become the collision boxes) plus the
+   functional ``builtin:`` furniture of :mod:`blender_agent.fixtures` -- a
+   kitchen counter run (cabinets, stove, sink), a fridge, a bathroom set
+   (toilet, basin, shower), desk/chair/bookshelf, dining table with chairs,
+   wardrobe, shoe cabinet, storage shelving, washing machine.  Every fixture
+   claims the clear space its *use* needs (a fridge door swing, a cook's
+   standing spot, a pulled-out desk chair) and the layout refuses to put
+   anything there.  A failed required slot restarts the layout.
 5. *cameras*: 1-2 per room, sampled on the room's **walkable grid** (the free
    cells of :func:`checks.circulation_report`, furniture footprints dilated)
    and picked by what they see: the share of the walkable floor and of the
-   furniture in unobstructed view, the clearance to walls and furniture and the
-   distance to the doorways.  Stands stay in the band around the door line and
-   >= 0.6 m off the furniture, and a two-camera room gets two stands that look
-   at it from different bearings.
-6. *verification*: :mod:`blender_agent.checks` must pass, and the door depth
-   spot check of ``tools/validate_blender_agent_p0.py`` is pre-computed with an
-   analytic shell model (:class:`ShellModel`), so the rendered validation is not
-   a coin flip.
+   furniture in unobstructed view, the clearance to walls and furniture, the
+   distance to the doorways and whether the doorway itself is on a clear sight
+   line.  Stands stay >= 0.6 m off the furniture, and a two-camera room gets
+   two stands that look at it from different bearings.
+6. *verification*: :mod:`blender_agent.checks` must pass, and the door
+   visibility of every camera is pre-computed with an analytic shell model
+   (:class:`ShellModel`) through the same world->camera->pixel projection the
+   validator uses, so the rendered report and the forecast agree.
 
-Why a row, and why one door line
---------------------------------
-``tools/validate_blender_agent_p0.py`` samples its door spot check at the column
-of ``atan2(dy, dx)`` while the ERP convention (``spec.py``, verified against the
-renders) maps a direction to ``atan2(-dy, dx)``.  The sampled ray is therefore
-the mirror image of the door direction about the camera's +X axis, and in a
-general 2-D plan the mirrored ray runs into the nearest wall: the check reports
-a door/wall depth ratio near 1.0 and fails even for a perfectly good room (a
-probe render confirmed this: measured 1.63/1.67 m against the 1.60/1.68 m this
-model predicts).  With every door and every camera on one common Y the mirror
-maps the geometry onto itself, the sample hits the real sight line through the
-doorway, and the measured ratio matches the forecast (2-3.5x, exactly what the
-hand-tuned P1 scene shows).  ``keep_room_open``-style rules (a clear sight
-corridor, tall furniture out of it) are what makes that line stay clear.
+No door line, no camera row
+---------------------------
+This generator used to *force* every door and every camera onto one common Y
+line (and to keep the middle of every room free of furniture), because the
+validator's door spot check located its sample column with ``atan2(dy, dx)``.
+Under the ``R0`` convention of ``spec.py`` a direction becomes the column
+``atan2(-dy, dx)``, so that formula sampled the *mirror image* about the
+camera's +X axis: a target to the north-east (1, 1) was sampled to the
+south-east (0.707, -0.707), a target to the north to the south.  On a row with
+one shared door line the mirror maps the plan onto itself and the check
+measured the real sight line; in a general 2-D plan it sampled a wall and
+reported a ratio near 1.0 for a perfectly good room.
 
-The forecast is only worth trusting because it *measures* the way the validator
-measures: the same column arithmetic, the same pixel rows (``_sample_row``) and
-the same 5x5 window median (:meth:`ShellModel._window_median`).  Both details
-matter at long range -- half a row of rounding is 4 mm at a door 8 m away, and
-the width of that margin decides whether the wall ray grazes over a doorway
-lintel (a 2.2x ratio) or slips under it (1.4x, which fails the render check).
+Both sides are now derived from the camera matrix instead: the validator
+projects a world point with the inverse camera rotation
+(``tools/validate_blender_agent_p0.py``: :func:`world_to_erp`) and this module
+does the same arithmetic in pure Python (:func:`erp_pixel_of_direction`), which
+is what :meth:`ShellModel.ray_for_pixel` uses to pre-compute the door sight
+line.  The door geometry itself is accepted per opening with local rays from
+both sides of the wall, so the plan does not have to be a row for the
+validation to be meaningful.
+
 
 Outputs ``scene_spec.json`` (strictly the schema ``blender_agent/spec.py``
 accepts) plus ``layout_report.json`` (room graph, furniture list, per-slot
@@ -81,6 +92,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from blender_agent import checks as checks_mod  # noqa: E402
+from blender_agent import fixtures as fixtures_mod  # noqa: E402
 from blender_agent import spec as spec_mod  # noqa: E402
 
 DEFAULT_ASSETS_INDEX = checks_mod.DEFAULT_ASSETS_INDEX
@@ -92,28 +104,56 @@ WALL_HEIGHT = 2.7
 WALL_THICKNESS = 0.12
 DOOR_W = 0.9
 DOOR_H = 2.1
+DOOR_JAMB_M = 0.20
 WINDOW_SILL = 0.9
 WINDOW_H = 1.4
 WINDOW_W_RANGE = (1.2, 2.0)
 WINDOW_MARGIN_M = 0.35
 
-HABITABLE = ("living_room", "bedroom", "study", "kitchen")
+HABITABLE = ("living_room", "bedroom", "study", "kitchen", "dining")
+# Room-type contract of the generator.  The bands are the realism envelope the
+# family planners draw within (see ``ROOM_FAMILIES``); a layout whose rectangle
+# lands outside its type's band or below the minimum side fails the attempt and
+# is redrawn, which is what keeps a 2x2 block from squeezing a 3 m2 "bedroom".
 ROOM_AREA_M2 = {
-    "living_room": (18.0, 30.0),
-    "bedroom": (12.0, 20.0),
-    "kitchen": (6.0, 12.0),
-    "bathroom": (4.0, 8.0),
-    "study": (8.0, 14.0),
+    "living_room": (14.0, 30.0),
+    "bedroom": (10.0, 20.0),
+    "kitchen": (5.0, 14.0),
+    "bathroom": (3.2, 8.5),
+    "study": (6.0, 14.0),
+    "dining": (5.0, 16.0),
+    "corridor": (3.0, 16.0),
+    "entry": (2.0, 8.0),
+    "storage": (1.5, 6.0),
+    "balcony": (2.0, 8.0),
+    "laundry": (1.8, 6.0),
 }
-ROOM_MIN_DIM_M = {"living_room": 3.2, "bedroom": 2.7, "kitchen": 2.0, "bathroom": 1.7, "study": 2.4}
+ROOM_MIN_DIM_M = {"living_room": 3.2, "bedroom": 2.7, "kitchen": 2.0, "bathroom": 1.7,
+                  "study": 2.4, "dining": 2.2, "corridor": 1.1, "entry": 1.2,
+                  "storage": 1.0, "balcony": 1.2, "laundry": 1.4}
 ROOM_FLOOR_COLOR = {
     "living_room": [0.55, 0.38, 0.22],
     "bedroom": [0.60, 0.50, 0.40],
     "kitchen": [0.62, 0.61, 0.58],
     "bathroom": [0.72, 0.73, 0.74],
     "study": [0.50, 0.36, 0.24],
+    "dining": [0.56, 0.42, 0.28],
+    "corridor": [0.52, 0.47, 0.40],
+    "entry": [0.66, 0.63, 0.58],
+    "storage": [0.60, 0.56, 0.50],
+    "balcony": [0.45, 0.47, 0.45],
+    "laundry": [0.68, 0.69, 0.70],
 }
 ROOM_FLOOR_COLOR_DEFAULT = [0.58, 0.50, 0.42]
+#: room type -> id stem (a second room of a type becomes ``stem_2``)
+ROOM_ID_BASE = {
+    "living_room": "living", "bedroom": "bedroom", "kitchen": "kitchen",
+    "bathroom": "bathroom", "study": "study", "dining": "dining",
+    "corridor": "corridor", "entry": "entry", "storage": "storage",
+    "balcony": "balcony", "laundry": "laundry",
+}
+#: rooms nobody should have to walk through to reach another room
+PRIVATE_ROOM_TYPES = ("bedroom", "bathroom")
 
 GRID_STEP_M = 0.05
 SNAP_M = 0.05
@@ -121,20 +161,16 @@ MIN_SHARED_WALL_M = 1.4
 ROOM_DEPTH_MIN_M = 3.65
 ROOM_DEPTH_MAX_M = 4.80
 ROOM_AREA_HEADROOM_M = 0.30
-CORRIDOR_HALF_M = 0.35
-CORRIDOR_MAX_H_M = 1.05
 ROOM_OPEN_FRACTION = 0.85
 MAX_LAYOUT_ATTEMPTS = 80
 SLOT_ATTEMPTS = 8
 CAMERA_INSET_M = 0.40
 CAMERA_GRID_M = 0.25
-CAMERA_ROW_STEPS = 3
-CAMERA_BAND_M = 0.35
 CAMERA_Z_M = 1.5
 CAMERA_MIN_GAP_TO_FURNITURE_M = 0.60
 CAMERA_DOOR_GAP_M = 0.60
-CAMERA_RATIO_WEIGHT = 0.35
-DOOR_FORECAST_MIN_RATIO = 1.65
+CAMERA_DOOR_SIGHT_WEIGHT = 0.35
+CAMERA_DOOR_SIGHT_TOLERANCE_M = 0.10
 # camera sampling (step 5): stands are drawn from the room's walkable grid and
 # scored by what they can see -- see ``place_cameras``
 CAMERA_VIS_GRID_M = 0.60
@@ -203,6 +239,11 @@ ASSET_SLOTS: Dict[str, dict] = {
 }
 RUG_ASSET = "builtin:rug"
 LAMP_ASSET = "builtin:table_lamp"
+# fixture geometry lives in blender_agent/fixtures.py as ``builtin:`` parts
+FIXTURE_GAP_M = 0.005          # gap between the modules of a counter run
+USAGE_GAP_M = 0.02             # tolerance of a keep-clear zone in front of a fixture
+USAGE_NEIGHBOUR_M = 0.10       # an item this close to a fixture is beside it, not in front
+UPPER_CABINET_Z_M = 1.62       # wall cupboards start above checks.WALK_BAND_M[1]
 
 BACK_GAP_M = WALL_THICKNESS / 2.0 + 0.02      # wall centre line -> furniture back
 ART_GAP_M = WALL_THICKNESS / 2.0 + 0.01       # wall centre line -> frame centre
@@ -227,6 +268,46 @@ def _round(value: float, step: float = SNAP_M) -> float:
 
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
+
+
+def erp_pixel_of_direction(direction: Sequence[float], rotation: Sequence[Sequence[float]] = None,
+                           width: int = PANO_W, height: int = PANO_H) -> Tuple[int, int]:
+    """Panorama pixel of a world direction: ``(column, row)``.
+
+    The pure-Python twin of ``tools/validate_blender_agent_p0.py``'s
+    :func:`world_to_erp` and the only place here that turns a direction into a
+    column.  The camera matrix is *inverted* (a rotation is orthonormal, so its
+    inverse is its transpose) and ``lon``/``lat`` are read off the local vector
+    that ``spec.py``'s ERP convention defines: a pixel shoots
+    ``R @ (cos(lat) sin(lon), -sin(lat), cos(lat) cos(lon))``.  The old code
+    instead wrote ``atan2(dy, dx)`` by hand, which is the mirror image of that
+    column under ``R0`` -- the reason every door and camera used to sit on one
+    common Y line.
+    """
+    rotation = spec_mod.R0 if rotation is None else rotation
+    dx, dy, dz = float(direction[0]), float(direction[1]), float(direction[2])
+    local = (rotation[0][0] * dx + rotation[1][0] * dy + rotation[2][0] * dz,
+             rotation[0][1] * dx + rotation[1][1] * dy + rotation[2][1] * dz,
+             rotation[0][2] * dx + rotation[1][2] * dy + rotation[2][2] * dz)
+    lon = math.atan2(local[0], local[2])
+    lat = math.atan2(-local[1], math.hypot(local[0], local[2]))
+    column = int(round((lon + math.pi) / (2.0 * math.pi) * width - 0.5)) % width
+    row = int(round((math.pi / 2.0 - lat) / math.pi * height - 0.5))
+    return column, max(0, min(height - 1, row))
+
+
+def erp_ray_direction(lon: float, lat: float,
+                      rotation: Sequence[Sequence[float]] = None) -> Tuple[float, float, float]:
+    """World ray of an ERP pixel centre: the forward direction of the same map."""
+    rotation = spec_mod.R0 if rotation is None else rotation
+    local = (math.cos(lat) * math.sin(lon), -math.sin(lat), math.cos(lat) * math.cos(lon))
+    return tuple(sum(rotation[i][k] * local[k] for k in range(3)) for i in range(3))
+
+
+def erp_lon_lat(column: int, row: int, width: int = PANO_W, height: int = PANO_H):
+    """Pixel centre -> ``(lon, lat)``, exactly as ``spec.py``'s ERP map does."""
+    return ((column + 0.5) / width * 2.0 * math.pi - math.pi,
+            math.pi / 2.0 - (row + 0.5) / height * math.pi)
 
 
 def rotated_half_extents(dims: Sequence[float], rot_z_deg: float) -> Tuple[float, float]:
@@ -368,17 +449,29 @@ class Item:
 # step 1: rooms
 # --------------------------------------------------------------------------- #
 def choose_room_types(rng: random.Random, count: int) -> List[str]:
-    """Living room always, at least one bedroom, then kitchen/study/bathroom picks."""
+    """The functional programme of a home: living room, bedroom, then the rest.
+
+    Every home gets a living room and a bedroom, three rooms and more get a
+    kitchen, four and more a bathroom; the remaining slots are drawn from the
+    optional rooms (a second bedroom, study, dining room, storage, entry hall,
+    laundry, balcony).  Order is drawn from the seed -- the *arrangement* of the
+    programme is the topology family's job (:data:`ROOM_FAMILIES`).
+    """
     types = ["living_room"]
     if count >= 2:
         types.append("bedroom")
-    pool = ["bedroom", "bedroom", "kitchen", "study", "bathroom", "bedroom"]
-    used: Dict[str, int] = {"bedroom": 1 if count >= 2 else 0, "kitchen": 0, "bathroom": 0, "study": 0}
-    while len(types) < count:
+    if count >= 3:
+        types.append("kitchen")
+    if count >= 4:
+        types.append("bathroom")
+    pool = ["bedroom", "bedroom", "study", "study", "dining", "storage", "entry", "laundry", "balcony"]
+    used: Dict[str, int] = {"bedroom": 1 if count >= 2 else 0, "kitchen": 1 if count >= 3 else 0,
+                            "bathroom": 1 if count >= 4 else 0}
+    guard = 0
+    while len(types) < count and guard < 400:
+        guard += 1
         pick = rng.choice(pool)
-        if pick == "bedroom" and used["bedroom"] >= 2:
-            continue
-        if pick in ("kitchen", "bathroom") and used[pick] >= 1:
+        if pick == "bedroom" and used.get("bedroom", 0) >= 2:
             continue
         used[pick] = used.get(pick, 0) + 1
         types.append(pick)
@@ -393,14 +486,13 @@ def plan_rooms(rng: random.Random, types: Sequence[str]) -> List[RoomPlan]:
     plan is a guillotine partition of one rectangle: every cut is vertical, the
     rooms abut on full-height shared walls and the room graph is a path.
 
-    The row is not just a style choice.  ``tools/validate_blender_agent_p0.py``
-    samples its door spot check at the column of ``atan2(dy, dx)`` while the ERP
-    convention of ``spec.py`` maps a direction to ``atan2(-dy, dx)``: the sampled
-    ray is the mirror image of the door direction about the camera's +X axis.
-    With every door and every camera on one common Y the mirror is the identity
-    and the check measures the real sight line through the door; in a general
-    2-D plan the mirrored ray points into a wall and the check fails no matter
-    how the furniture is arranged (see ``ShellModel`` and the layout report).
+    This is the default *arrangement*, not a constraint of the pipeline: it is
+    kept because a 2-5 room flat in one row is a common real plan, and
+    :func:`plan_rooms_block` wraps the same chain of rooms around two rows for
+    an L / block plan (``--shape block``).  Nothing else in the generator (doors,
+    furniture, camera stands, the door forecast) assumes a row any more -- the
+    row used to be forced by the validator's mirrored door column, which is
+    fixed (see the module docstring).
     """
     plans: List[RoomPlan] = []
     depth_base = rng.uniform(3.55, 4.25)
@@ -419,7 +511,14 @@ def plan_rooms(rng: random.Random, types: Sequence[str]) -> List[RoomPlan]:
             raise _AttemptFailed(f"{room_type} area floor {area_low:.2f} leaves no spread below {high}")
         plans.append(RoomPlan(room_id="", room_type=room_type, rect=Rect(0, 0, 0, 0),
                               target_area=area, width=area / depth, depth=depth))
+    # private rooms (bedroom / bathroom) take the ends of the chain wherever the
+    # programme allows it: a middle room of a chain is a passage, so a bedroom
+    # there would be the public way through the flat (see :func:`door_semantics`)
     rng.shuffle(plans)
+    private = [plan for plan in plans if plan.room_type in PRIVATE_ROOM_TYPES]
+    public = [plan for plan in plans if plan.room_type not in PRIVATE_ROOM_TYPES]
+    split = len(private) // 2
+    plans = private[:split] + public + private[split:]
     x = 0.0
     for plan in plans:
         x1 = _round(x + plan.width)
@@ -429,8 +528,7 @@ def plan_rooms(rng: random.Random, types: Sequence[str]) -> List[RoomPlan]:
         raise _AttemptFailed("row too short")
     ids: Dict[str, int] = {}
     for plan in plans:
-        base = {"living_room": "living", "bedroom": "bedroom", "kitchen": "kitchen",
-                "bathroom": "bathroom", "study": "study"}[plan.room_type]
+        base = ROOM_ID_BASE[plan.room_type]
         ids[base] = ids.get(base, 0) + 1
         plan.room_id = base if ids[base] == 1 else f"{base}_{ids[base]}"
     for plan in plans:
@@ -443,6 +541,280 @@ def plan_rooms(rng: random.Random, types: Sequence[str]) -> List[RoomPlan]:
             raise _AttemptFailed(f"room {plan.room_type} area {plan.rect.area:.1f} m2 outside "
                                  f"[{low}, {high}]")
     return plans
+
+
+def plan_rooms_block(rng: random.Random, types: Sequence[str]) -> List[RoomPlan]:
+    """The same chain of rooms as :func:`plan_rooms`, wrapped into two rows.
+
+    The chain -- and with it the room graph, the door graph and every furniture
+    slot -- is untouched: the first half of the chain runs along the south edge
+    as usual, the second half turns the corner at the end of it and runs back
+    *above* the first row, so consecutive rooms still share a full wall
+    (:func:`plan_doors` finds every one of them) and the plan is two-dimensional
+    -- an L for three rooms, a 2x2 block for four, a longer block for five.
+    Rooms keep their drawn area; each row gets one depth (the deepest room of
+    the row) and the widths are recomputed from the areas, which is what makes
+    the two rows share a straight wall.
+
+    This is the "no door line" shape's reason to exist: with the validator
+    measuring doors per opening, a plan no longer has to put every room on one X
+    axis for the door check to be meaningful.
+    """
+    plans = plan_rooms(rng, types)
+    bottom_count = max(1, len(plans) // 2)
+    bottom, top = plans[:bottom_count], plans[bottom_count:]
+    if not top:  # a single room cannot be wrapped; keep the row
+        return plans
+
+    def row_depth(row: Sequence[RoomPlan]) -> float:
+        low, high = ROOM_DEPTH_MIN_M, ROOM_DEPTH_MAX_M
+        depth = _clamp(max(plan.depth for plan in row), low, high)
+        for plan in row:
+            width = plan.target_area / depth
+            if width < ROOM_MIN_DIM_M[plan.room_type] - 1e-9:
+                raise _AttemptFailed(f"{plan.room_type} cannot keep its area in a {depth:.2f} m row")
+        return depth
+
+    placements: List[Tuple[RoomPlan, Rect]] = []
+    x = 0.0
+    depth = row_depth(bottom)
+    for plan in bottom:
+        x1 = _round(x + plan.target_area / depth)
+        placements.append((plan, Rect(x, 0.0, x1, _round(depth, 0.01))))
+        x = x1
+    if x < 6.0:
+        raise _AttemptFailed("the ground row is too short")
+    corner = placements[-1][1]
+    x, y0 = corner.x1, corner.y1
+    depth = row_depth(top)
+    for plan in top:
+        width = _round(plan.target_area / depth)
+        placements.append((plan, Rect(x - width, y0, x, _round(y0 + depth, 0.01))))
+        x -= width
+
+    for plan, rect in placements:
+        plan.rect = rect
+        low, high = ROOM_AREA_M2[plan.room_type]
+        if plan.rect.w < ROOM_MIN_DIM_M[plan.room_type] - 1e-9 or \
+                plan.rect.h < ROOM_MIN_DIM_M[plan.room_type] - 1e-9:
+            raise _AttemptFailed(f"room {plan.room_type} too small "
+                                 f"({plan.rect.w:.2f}x{plan.rect.h:.2f} m)")
+        if not (low - 1e-9 <= plan.rect.area <= high + 1e-9):
+            raise _AttemptFailed(f"room {plan.room_type} area {plan.rect.area:.1f} m2 outside "
+                                 f"[{low}, {high}] after the block snap")
+    return plans
+
+
+# --------------------------------------------------------------------------- #
+# step 1b: topology families
+# --------------------------------------------------------------------------- #
+# A room is always a rectangle; a family builds the *arrangement* -- a 2x2
+# block, an L, a middle living room, one- or two-sided corridors, a circulation
+# loop -- as a small grid of cells (columns x rows) with one room per span of
+# cells.  The pattern is fixed, the cell sizes are drawn per attempt, so the
+# same family gives a different flat for every seed; the room bands of
+# ``ROOM_AREA_M2`` are the envelope a draw has to land in or the attempt is
+# retried.
+
+#: role -> room types it can host (the first entry is the usual reading)
+ROLE_POOLS: Dict[str, Tuple[str, ...]] = {
+    "public": ("living_room",),
+    "cook": ("kitchen",),
+    "sleep": ("bedroom",),
+    "sleep2": ("bedroom", "study"),
+    "wet": ("bathroom",),
+    "wash": ("laundry", "storage"),
+    "work": ("study", "storage"),
+    "eat": ("dining", "study"),
+    "flow": ("corridor", "entry"),
+    "entry": ("entry", "storage"),
+    "outdoor": ("balcony", "laundry"),
+}
+
+
+@dataclass(frozen=True)
+class _Slot:
+    """One room of a family template, in grid coordinates.
+
+    ``col``/``row`` are 0-based cell indices, ``col_span``/``row_span`` how many
+    cells the room covers (a living room spanning two rows is one rectangle).
+    """
+
+    role: str
+    col: int
+    row: int
+    col_span: int = 1
+    row_span: int = 1
+
+
+@dataclass(frozen=True)
+class _Family:
+    """A topology template: cell size ranges plus one slot per room."""
+
+    name: str
+    cols: Tuple[Tuple[float, float], ...]
+    rows: Tuple[Tuple[float, float], ...]
+    slots: Tuple[_Slot, ...]
+    extra_doors: int = 0           # doors beyond the spanning tree (ring layouts)
+
+    @property
+    def count(self) -> int:
+        return len(self.slots)
+
+
+ROOM_FAMILIES: Dict[str, _Family] = {
+    # 4 rooms in a 2x2 block: living with kitchen beside it, bedroom and
+    # bathroom behind (the bathroom's only allowed wall is the bedroom's --
+    # no door runs from a kitchen into a bathroom, see door_semantics)
+    "compact_2x2": _Family(
+        name="compact_2x2",
+        cols=((3.7, 4.3), (2.1, 2.6)),
+        rows=((3.5, 4.0), (2.9, 3.4)),
+        slots=(_Slot("public", 0, 0), _Slot("cook", 1, 0),
+                _Slot("sleep", 0, 1), _Slot("wet", 1, 1)),
+    ),
+    # an L: a dining room and a narrow kitchen column beside it, the living room
+    # below the dining room, the bathroom off the living room and the bedroom
+    # closing the far end
+    "l_shape": _Family(
+        name="l_shape",
+        cols=((4.0, 5.0), (2.2, 2.8)),
+        rows=((3.2, 3.8), (3.0, 3.6), (3.0, 3.6)),
+        slots=(_Slot("eat", 0, 0), _Slot("cook", 1, 0),
+                _Slot("public", 0, 1), _Slot("wet", 1, 1),
+                _Slot("sleep", 0, 2)),
+    ),
+    # central living room spanning the middle band, rooms north and south of it
+    # -- every room opens off the living room (the "radiating" plan)
+    "central_living": _Family(
+        name="central_living",
+        cols=((3.4, 4.4), (2.0, 2.6)),
+        rows=((2.9, 3.6), (3.2, 4.0), (2.9, 3.6)),
+        slots=(_Slot("cook", 0, 0), _Slot("eat", 1, 0),
+                _Slot("public", 0, 1, col_span=2),
+                _Slot("sleep", 0, 2), _Slot("wet", 1, 2)),
+        extra_doors=1,           # kitchen <-> dining as well as via the living room
+    ),
+    # single-loaded corridor: a hall strip along the south edge, rooms over it,
+    # the living room closing the end
+    "corridor_single": _Family(
+        name="corridor_single",
+        cols=((1.9, 2.6), (3.0, 3.8), (2.5, 3.2), (4.0, 5.0)),
+        rows=((1.1, 1.6), (2.9, 3.6)),
+        slots=(_Slot("flow", 0, 0, col_span=3),
+                _Slot("wet", 0, 1), _Slot("sleep", 1, 1), _Slot("cook", 2, 1),
+                _Slot("public", 3, 0, row_span=2)),
+    ),
+    # double-loaded corridor: rooms on both sides of a middle hall
+    "corridor_double": _Family(
+        name="corridor_double",
+        cols=((3.4, 4.2), (2.2, 2.8)),
+        rows=((3.4, 4.2), (1.1, 1.6), (2.9, 3.6)),
+        slots=(_Slot("public", 0, 0), _Slot("cook", 1, 0),
+                _Slot("flow", 0, 1, col_span=2),
+                _Slot("sleep", 0, 2), _Slot("wet", 1, 2)),
+    ),
+    # circulation loop: living -> hall -> kitchen -> dining -> living is a ring
+    # (four doors) around a 2x2 block, with the bedroom off the hall and its
+    # bathroom as the en-suite leaf
+    "loop": _Family(
+        name="loop",
+        cols=((3.4, 4.2), (2.8, 3.4), (3.0, 3.6)),
+        rows=((2.4, 2.9), (3.4, 4.0)),
+        slots=(_Slot("eat", 0, 0), _Slot("cook", 1, 0),
+                _Slot("public", 0, 1), _Slot("flow", 1, 1),
+                _Slot("sleep", 2, 1), _Slot("wet", 2, 0)),
+        extra_doors=1,           # the ring's fourth edge, the tree drops one
+    ),
+}
+
+
+def _check_room_bands(plan: RoomPlan, where: str) -> None:
+    """The shared contract: a room rectangle must land in its type's band."""
+    low, high = ROOM_AREA_M2[plan.room_type]
+    if plan.rect.w < ROOM_MIN_DIM_M[plan.room_type] - 1e-9 or \
+            plan.rect.h < ROOM_MIN_DIM_M[plan.room_type] - 1e-9:
+        raise _AttemptFailed(f"room {plan.room_type} too small "
+                             f"({plan.rect.w:.2f}x{plan.rect.h:.2f} m{where})")
+    if not (low - 1e-9 <= plan.rect.area <= high + 1e-9):
+        raise _AttemptFailed(f"room {plan.room_type} area {plan.rect.area:.1f} m2 outside "
+                             f"[{low}, {high}]{where}")
+
+
+def _rect_fits_type(rect: Rect, room_type: str) -> bool:
+    """Would a room of this rectangle satisfy its type's band and minimum side?"""
+    low, high = ROOM_AREA_M2[room_type]
+    if rect.w < ROOM_MIN_DIM_M[room_type] - 1e-9 or rect.h < ROOM_MIN_DIM_M[room_type] - 1e-9:
+        return False
+    return low - 1e-9 <= rect.area <= high + 1e-9
+
+
+def build_family(rng: random.Random, family: _Family) -> List[RoomPlan]:
+    """One draw of a family: cell sizes, an optional mirror, the room rectangles.
+
+    Column widths and row depths are drawn once for the family's grid and every
+    room takes the span of cells its slot covers, so neighbouring cells share
+    exactly one boundary line (the shared wall).  A random mirror in X and Y
+    varies the orientation without touching the adjacency pattern.  The room
+    *type* of a slot is drawn from its role's pool, restricted to the types
+    whose area band and minimum side the drawn rectangle satisfies -- a small
+    service cell becomes a bathroom, never a 3 m2 bedroom.
+    """
+    widths = [rng.uniform(low, high) for low, high in family.cols]
+    depths = [rng.uniform(low, high) for low, high in family.rows]
+    mirror_x, mirror_y = rng.random() < 0.5, rng.random() < 0.5
+    n_cols, n_rows = len(widths), len(depths)
+    if mirror_x:
+        widths.reverse()
+    if mirror_y:
+        depths.reverse()
+    xs = [0.0]
+    for width in widths:
+        xs.append(_round(xs[-1] + width))
+    ys = [0.0]
+    for depth in depths:
+        ys.append(_round(ys[-1] + depth))
+
+    plans: List[RoomPlan] = []
+    used_types: List[str] = []
+    for slot in family.slots:
+        col = (n_cols - slot.col - slot.col_span) if mirror_x else slot.col
+        row = (n_rows - slot.row - slot.row_span) if mirror_y else slot.row
+        rect = Rect(xs[col], ys[row], xs[col + slot.col_span], ys[row + slot.row_span])
+        fitting = [room_type for room_type in ROLE_POOLS[slot.role] if _rect_fits_type(rect, room_type)]
+        if not fitting:
+            raise _AttemptFailed(f"no {slot.role} room fits {rect.w:.2f}x{rect.h:.2f} m "
+                                 f"({rect.area:.1f} m2) in family '{family.name}'")
+        # a type the flat does not have yet beats a second one when both fit
+        fresh = [room_type for room_type in fitting if room_type not in used_types]
+        room_type = rng.choice(fresh or fitting)
+        used_types.append(room_type)
+        plan = RoomPlan(room_id="", room_type=room_type, rect=rect, target_area=rect.area,
+                        width=rect.w, depth=rect.h)
+        _check_room_bands(plan, f" in family '{family.name}'")
+        plans.append(plan)
+    ids: Dict[str, int] = {}
+    for plan in plans:
+        base = ROOM_ID_BASE[plan.room_type]
+        ids[base] = ids.get(base, 0) + 1
+        plan.room_id = base if ids[base] == 1 else f"{base}_{ids[base]}"
+    return plans
+
+
+def _shapes_for_count(count: int) -> Tuple[str, ...]:
+    """Every arrangement that can host a flat of ``count`` rooms."""
+    names = ["row"]
+    if count >= 3:
+        names.append("block")
+    names += sorted(name for name, family in ROOM_FAMILIES.items() if family.count == count)
+    return tuple(names)
+
+
+def _pick_auto_shape(rng: random.Random, room_count: Optional[int]) -> Tuple[int, str]:
+    """Draw a room count and one of its families from the seed ("--shape auto")."""
+    draw = [2, 3, 3, 4, 4, 4, 5, 5, 6]
+    count = int(_clamp(room_count if room_count is not None else rng.choice(draw), 2, 7))
+    return count, rng.choice(_shapes_for_count(count))
 
 
 # --------------------------------------------------------------------------- #
@@ -470,16 +842,19 @@ def shared_wall_span(a: Rect, b: Rect) -> Optional[Tuple[Wall, Tuple[float, floa
     return None
 
 
-def plan_doors(rng: random.Random, plans: Sequence[RoomPlan]) -> List[DoorPlan]:
-    """One door per shared wall of the row, all centred on a common Y line.
+def plan_doors(rng: random.Random, plans: Sequence[RoomPlan],
+               chain: Optional[Sequence[RoomPlan]] = None) -> List[DoorPlan]:
+    """One door per shared wall between consecutive rooms of the chain.
 
-    The row's rooms are neighbours in X, so the shared-wall graph is a path and
-    a spanning tree is simply "every shared wall gets a door".  Every door sits
-    at ``y_star`` (plus a little jitter) so that a camera anywhere in the row can
-    see straight down the row through the doorways -- the sight line the depth
-    validation measures.
+    The rooms are a chain (a row, or the two-row L of :func:`plan_rooms_block`),
+    so the shared-wall graph is a path and a spanning tree is simply "every
+    shared wall gets a door".  Each door is sampled anywhere along its shared
+    wall span (with a jamb's margin to the corners), *not* on a common door
+    line: the position used to be pinned to one Y so that the validator's
+    mirrored sample column could see through it, and the validator now projects
+    the door itself (see the module docstring).
     """
-    ordered = sorted(plans, key=lambda plan: plan.rect.x0)
+    ordered = list(chain) if chain is not None else sorted(plans, key=lambda plan: plan.rect.x0)
     pairs: List[Tuple[int, int, Wall, float, float]] = []
     for index in range(len(ordered) - 1):
         shared = shared_wall_span(ordered[index].rect, ordered[index + 1].rect)
@@ -490,29 +865,291 @@ def plan_doors(rng: random.Random, plans: Sequence[RoomPlan]) -> List[DoorPlan]:
             continue
         pairs.append((index, index + 1, wall, lo, hi))
     if len(pairs) != len(ordered) - 1:
-        raise _AttemptFailed("the row is not a chain of rooms")
-    min_depth = min(plan.rect.h for plan in ordered)
-    if min_depth < ROOM_DEPTH_MIN_M - 1e-9:
-        raise _AttemptFailed("row too shallow for a shared door line")
-    # Door line near the south wall: it keeps the enfilade corridor (and the
-    # 0.85 m door approach) out of the way of the tall furniture that needs the
-    # north half of a room (a 2.04 m bed against a side wall).
-    y_star = rng.uniform(1.05, 1.20)
-    y_star = _clamp(y_star, 0.9, min_depth - 0.9)
+        raise _AttemptFailed("the rooms are not a chain of shared walls")
     doors: List[DoorPlan] = []
     for index, _next, wall, lo, hi in pairs:
         margin = DOOR_W / 2.0 + 0.20
         if hi - lo < DOOR_W + 2 * 0.20:
             raise _AttemptFailed("shared wall too short for a door")
-        low, high = max(lo + margin, y_star - 0.12), min(hi - margin, y_star + 0.12)
-        if low > high:
-            raise _AttemptFailed("door line does not fit the shared wall")
-        center_along = _round(rng.uniform(low, high), 0.01)
+        center_along = _round(rng.uniform(lo + margin, hi - margin), 0.01)
+        # the door centre is a point *on the wall line*: for a north/south wall the
+        # line is a Y and the position along it is an X (the old code, which only
+        # ever saw east/west walls of the row, wrote the two swapped)
+        center = (center_along, wall.line) if wall.side in ("N", "S") else (wall.line, center_along)
+        direction = (1.0, 0.0) if wall.side in ("N", "S") else (0.0, 1.0)
         doors.append(DoorPlan(a=ordered[index].room_id, b=ordered[index + 1].room_id,
-                              center=(wall.line, center_along),
+                              center=center,
                               span=(center_along - DOOR_W / 2.0, center_along + DOOR_W / 2.0),
-                              wall=wall, direction=(0.0, 1.0)))
+                              wall=wall, direction=direction))
     return doors
+
+
+# --------------------------------------------------------------------------- #
+# step 2b: doors on a general adjacency graph (the topology families)
+# --------------------------------------------------------------------------- #
+#: doorway preference between room classes: the score Kruskal picks the spanning
+#: tree with.  Keys are sorted ``(class_a, class_b)`` pairs; negative pairs are
+#: never connected (a bedroom is not entered from a kitchen, two bedrooms do not
+#: open into each other).
+DOOR_CLASS_SCORE: Dict[Tuple[str, str], float] = {
+    ("hall", "sleep"): 4.0, ("hall", "wet"): 4.0, ("hall", "living"): 3.4,
+    ("dining", "hall"): 3.2, ("hall", "kitchen"): 3.0, ("hall", "other"): 3.4,
+    ("hall", "hall"): 0.5,
+    ("kitchen", "living"): 3.2, ("dining", "living"): 3.0, ("living", "sleep"): 3.0,
+    ("living", "wet"): 2.2, ("living", "other"): 2.2, ("living", "living"): 0.4,
+    ("dining", "kitchen"): 4.2, ("kitchen", "other"): 1.0,
+    ("kitchen", "wet"): -1.0, ("kitchen", "sleep"): -1.0, ("kitchen", "kitchen"): 0.4,
+    ("dining", "sleep"): 2.0, ("dining", "wet"): 1.2, ("dining", "other"): 1.6,
+    ("dining", "dining"): 0.4,
+    ("sleep", "wet"): 1.6, ("other", "wet"): 1.4, ("wet", "wet"): -1.0,
+    ("other", "sleep"): 0.4, ("sleep", "sleep"): -1.0, ("other", "other"): 0.6,
+}
+
+
+def _door_class(room_type: str) -> str:
+    """The vocabulary :data:`DOOR_CLASS_SCORE` is written in."""
+    if room_type in ("corridor", "entry"):
+        return "hall"
+    if room_type == "living_room":
+        return "living"
+    if room_type == "bedroom":
+        return "sleep"
+    if room_type == "bathroom":
+        return "wet"
+    if room_type in ("kitchen", "dining"):
+        return room_type
+    return "other"
+
+
+def _door_score(a_type: str, b_type: str) -> float:
+    return DOOR_CLASS_SCORE.get(tuple(sorted((_door_class(a_type), _door_class(b_type)))), 0.5)
+
+
+def _plans_by_id(plans: Sequence[RoomPlan]) -> Dict[str, RoomPlan]:
+    return {plan.room_id: plan for plan in plans}
+
+
+def _wall_segments_for(plans: Sequence[RoomPlan]):
+    room_specs = [spec_mod.RoomSpec(id=plan.room_id, type=plan.room_type, polygon=plan.rect.polygon())
+                  for plan in plans]
+    return spec_mod.build_wall_segments(room_specs)
+
+
+def _segment_offset(segments, a_id: str, b_id: str, point):
+    """``(segment, offset of ``point`` from its start)`` on a wall owning both rooms."""
+    for segment in segments:
+        if a_id in segment.owners and b_id in segment.owners and segment.contains_point(point):
+            base = spec_mod.line_parameter(segment.p0, segment.direction)
+            return segment, spec_mod.line_parameter(point, segment.direction) - base
+    return None, None
+
+
+def plan_doors_graph(rng: random.Random, plans: Sequence[RoomPlan],
+                     extra_doors: int = 0) -> List[DoorPlan]:
+    """Doors of an arbitrary rectangle plan: a semantic spanning tree + a loop.
+
+    Every pair of rooms that shares a wall long enough is a candidate; Kruskal
+    over the doorway preference (:data:`DOOR_CLASS_SCORE`) builds the spanning
+    tree, so a corridor serves the rooms, the kitchen opens onto the dining
+    room, and bedrooms / bathrooms are only ever *entered* -- their degree is
+    capped at one, which is what keeps them off every public path
+    (:func:`door_semantics` re-checks it).  ``extra_doors`` adds the
+    best-scoring remaining connection between two non-private rooms, which is
+    how the loop families get their second way round.
+    """
+    by_id = _plans_by_id(plans)
+    candidates: List[Tuple[float, float, str, str]] = []
+    for index, first in enumerate(plans):
+        for second in plans[index + 1:]:
+            shared = shared_wall_span(first.rect, second.rect)
+            if shared is None:
+                continue
+            _wall, (lo, hi) = shared
+            if hi - lo < DOOR_W + 2 * DOOR_JAMB_M:
+                continue
+            score = _door_score(first.room_type, second.room_type)
+            if score < 0.0:
+                continue
+            jitter = rng.random() * 0.5
+            candidates.append((score, jitter, first.room_id, second.room_id))
+    candidates.sort(key=lambda entry: (-entry[0], -entry[1], entry[2], entry[3]))
+    if len(plans) == 1:
+        return []
+
+    degrees = {plan.room_id: 0 for plan in plans}
+    parent = {plan.room_id: plan.room_id for plan in plans}
+
+    def find(room_id: str) -> str:
+        while parent[room_id] != room_id:
+            parent[room_id] = parent[parent[room_id]]
+            room_id = parent[room_id]
+        return room_id
+
+    def cap(room_id: str) -> int:
+        """How many doors a room may have: private rooms are entered, not crossed.
+
+        A bedroom gets a second door only when it leads to its own bathroom (an
+        en-suite): that bathroom is a leaf itself, so the bedroom still carries
+        nobody from one public room to another (:func:`door_semantics` checks
+        the result).
+        """
+        return 1 if by_id[room_id].room_type in PRIVATE_ROOM_TYPES else 4
+
+    def allowed(a: str, b: str) -> bool:
+        if degrees[a] >= cap(a) or degrees[b] >= cap(b):
+            en_suite = ((by_id[a].room_type, by_id[b].room_type, degrees[a]) == ("bedroom", "bathroom", 1)
+                        or (by_id[b].room_type, by_id[a].room_type, degrees[b]) == ("bedroom", "bathroom", 1))
+            if not en_suite:
+                return False
+        return True
+
+    edges: List[Tuple[str, str]] = []
+    for _score, _jitter, a, b in candidates:
+        if len(edges) >= len(plans) - 1:
+            break
+        if not allowed(a, b):
+            continue
+        if find(a) == find(b):
+            continue
+        parent[find(a)] = find(b)
+        degrees[a] += 1
+        degrees[b] += 1
+        edges.append((a, b))
+    if len(edges) != len(plans) - 1:
+        raise _AttemptFailed(f"no spanning door tree over {len(plans)} rooms "
+                             f"({len(edges)} of {len(plans) - 1} edges)")
+    # extra connections (a circulation loop) close a cycle between public rooms
+    used_pairs = {tuple(sorted(edge)) for edge in edges}
+    for _score, _jitter, a, b in candidates:
+        if len(edges) >= len(plans) - 1 + extra_doors:
+            break
+        if tuple(sorted((a, b))) in used_pairs:
+            continue
+        if by_id[a].room_type in PRIVATE_ROOM_TYPES or by_id[b].room_type in PRIVATE_ROOM_TYPES:
+            continue
+        if not allowed(a, b):
+            continue
+        used_pairs.add(tuple(sorted((a, b))))
+        degrees[a] += 1
+        degrees[b] += 1
+        edges.append((a, b))
+
+    # place every door on its shared wall, keeping jambs and other doors clear
+    segments = _wall_segments_for(plans)
+    used_spans: Dict[Tuple[Tuple[float, float], Tuple[float, float]], List[Tuple[float, float]]] = {}
+    doors: List[DoorPlan] = []
+    for a, b in edges:
+        first, second = by_id[a], by_id[b]
+        shared = shared_wall_span(first.rect, second.rect)
+        if shared is None:
+            raise _AttemptFailed(f"edge {a}|{b} no longer shares a wall")
+        wall, (lo, hi) = shared
+        door = _place_graph_door(rng, first, second, wall, lo, hi, segments, used_spans)
+        if door is None:
+            raise _AttemptFailed(f"no free place for the door between {a} and {b}")
+        doors.append(door)
+    return doors
+
+
+def _place_graph_door(rng: random.Random, first: RoomPlan, second: RoomPlan, wall: Wall,
+                      lo: float, hi: float, segments, used_spans) -> Optional[DoorPlan]:
+    """Sample one door position on the shared wall that fits the wall segment."""
+    low, high = lo + DOOR_W / 2.0 + DOOR_JAMB_M, hi - DOOR_W / 2.0 - DOOR_JAMB_M
+    if low > high:
+        return None
+    for _attempt in range(24):
+        along = _round(rng.uniform(low, high), 0.01)
+        center = (along, wall.line) if wall.side in ("N", "S") else (wall.line, along)
+        segment, offset = _segment_offset(segments, first.room_id, second.room_id, center)
+        if segment is None or offset is None:
+            continue
+        if offset - DOOR_W / 2.0 < DOOR_JAMB_M - 1e-9 or offset + DOOR_W / 2.0 > segment.length - DOOR_JAMB_M + 1e-9:
+            continue
+        span = (offset - DOOR_W / 2.0, offset + DOOR_W / 2.0)
+        key = (segment.p0, segment.p1)
+        taken = used_spans.setdefault(key, [])
+        if any(span[0] < other[1] - 1e-6 and other[0] < span[1] - 1e-6 for other in taken):
+            continue
+        taken.append(span)
+        return DoorPlan(a=first.room_id, b=second.room_id, center=center,
+                        span=(along - DOOR_W / 2.0, along + DOOR_W / 2.0),
+                        wall=wall,
+                        direction=(1.0, 0.0) if wall.side in ("N", "S") else (0.0, 1.0))
+    return None
+
+
+def door_semantics(plans: Sequence[RoomPlan], doors: Sequence[DoorPlan]) -> dict:
+    """The semantic rules the door graph has to satisfy, as a report.
+
+    * every room is reachable (has a door);
+    * a bathroom is private: exactly one door, so nobody crosses it;
+    * a bedroom is not a public thoroughfare: with all bedrooms and bathrooms
+      removed, the remaining (public) rooms are still connected -- a bedroom
+      may carry the only door to *its own* en-suite bathroom, but it is never
+      the way from one public room to another;
+    * the kitchen is next to the dining room when there is one (a shared wall,
+      and a door between them whenever the topology offers one).
+    """
+    by_id = _plans_by_id(plans)
+    adjacency = {plan.room_id: set() for plan in plans}
+    for door in doors:
+        adjacency[door.a].add(door.b)
+        adjacency[door.b].add(door.a)
+    violations: List[str] = []
+    for plan in plans:
+        if not adjacency[plan.room_id]:
+            violations.append(f"room '{plan.room_id}' ({plan.room_type}) has no door")
+    for plan in plans:
+        if plan.room_type == "bathroom" and len(adjacency[plan.room_id]) > 1:
+            violations.append(f"bathroom '{plan.room_id}' has {len(adjacency[plan.room_id])} doors "
+                              f"(a bathroom must stay private)")
+
+    public = [plan.room_id for plan in plans if plan.room_type not in PRIVATE_ROOM_TYPES]
+    if public:
+        seen = {public[0]}
+        frontier = [public[0]]
+        while frontier:
+            room_id = frontier.pop()
+            for peer in adjacency[room_id]:
+                if peer in seen or peer not in public:
+                    continue
+                seen.add(peer)
+                frontier.append(peer)
+        missing = [room_id for room_id in public if room_id not in seen]
+        if missing:
+            violations.append("public rooms are only reachable through a bedroom/bathroom: "
+                              + ", ".join(missing))
+
+    dining = [plan.room_id for plan in plans if plan.room_type == "dining"]
+    kitchen = [plan.room_id for plan in plans if plan.room_type == "kitchen"]
+    kitchen_next_to: Optional[str] = None
+    kitchen_door_to: Optional[str] = None
+    target = dining[0] if dining else (next((plan.room_id for plan in plans
+                                             if plan.room_type == "living_room"), None))
+    if kitchen and target:
+        shared = shared_wall_span(by_id[kitchen[0]].rect, by_id[target].rect)
+        if shared is not None:
+            kitchen_next_to = by_id[target].room_type
+        if by_id[target].room_id in adjacency[kitchen[0]]:
+            kitchen_door_to = by_id[target].room_type
+        if dining and kitchen_next_to is None:
+            violations.append(f"kitchen '{kitchen[0]}' does not share a wall with dining '{target}'")
+    for plan in plans:
+        if plan.room_type == "bedroom":
+            for peer in adjacency[plan.room_id]:
+                if by_id[peer].room_type == "kitchen":
+                    violations.append(f"bedroom '{plan.room_id}' is entered from the kitchen")
+
+    return {
+        "pass": not violations,
+        "violations": violations,
+        "degrees": {room_id: len(peers) for room_id, peers in sorted(adjacency.items())},
+        "bathrooms_are_leaves": all(len(adjacency[plan.room_id]) <= 1
+                                    for plan in plans if plan.room_type == "bathroom"),
+        "public_rooms_connected": not any("only reachable through" in entry for entry in violations),
+        "kitchen_next_to": kitchen_next_to,
+        "kitchen_door_to": kitchen_door_to,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -531,8 +1168,30 @@ def exterior_spans(plans: Sequence[RoomPlan]):
     return spans
 
 
+def window_wish(rng: random.Random, room_type: str, candidates: Sequence) -> int:
+    """How many of its exterior spans a room wants a window on.
+
+    Windows follow the real exterior walls (only single-owner spans reach here)
+    and the function of the room: living rooms, bedrooms, studies and dining
+    rooms are habitable (1-2 windows), a kitchen nearly always has one, a
+    bathroom or laundry rarely (0-1), circulation, storage and the entrance hall
+    none, and a balcony is a glazed outdoor room (its own window).
+    """
+    if room_type in HABITABLE:
+        return 2 if len(candidates) > 1 and rng.random() < 0.4 else 1
+    if room_type == "kitchen":
+        return 1 if rng.random() < 0.75 else 0
+    if room_type == "bathroom":
+        return 1 if rng.random() < 0.25 else 0
+    if room_type == "laundry":
+        return 1 if rng.random() < 0.30 else 0
+    if room_type == "balcony":
+        return 1 if rng.random() < 0.9 else 0
+    return 0                                   # corridor / entry / storage
+
+
 def plan_windows(rng: random.Random, plans: Sequence[RoomPlan]) -> Dict[str, List[dict]]:
-    """One window per exterior span, 1-2 per habitable room (bathrooms rarely)."""
+    """One window per exterior span, per room function (:func:`window_wish`)."""
     spans = exterior_spans(plans)
     windows: Dict[str, List[dict]] = {plan.room_id: [] for plan in plans}
     for plan in plans:
@@ -544,12 +1203,7 @@ def plan_windows(rng: random.Random, plans: Sequence[RoomPlan]) -> Dict[str, Lis
                 candidates.append((length, (ax, ay), (bx, by)))
         if not candidates:
             continue
-        if plan.room_type in HABITABLE:
-            want = 2 if len(candidates) > 1 and rng.random() < 0.4 else 1
-        elif plan.room_type == "bathroom":
-            want = 1 if rng.random() < 0.25 else 0
-        else:
-            want = 0
+        want = window_wish(rng, plan.room_type, candidates)
         rng.shuffle(candidates)
         candidates.sort(key=lambda entry: -entry[0])
         for _, start, end in candidates:
@@ -602,6 +1256,41 @@ def door_rects_for(rect: Rect, doors: Sequence[DoorPlan]) -> List[Tuple[float, f
     return rects
 
 
+def _dims_of(asset: str, index: Dict[str, dict],
+             size: Optional[Sequence[float]] = None) -> Optional[Tuple[float, float, float]]:
+    """Measured footprint of any asset the generator may place.
+
+    ``checks.item_dims`` covers the Poly Haven / MIDI-3D / generated libraries
+    and the ``builtin:`` props of ``checks.BUILTIN_DIMS_M``; the functional
+    furniture of :mod:`blender_agent.fixtures` is registered there too, and this
+    fallback keeps the generator working even when a caller passes its own index.
+    """
+    dims = checks_mod.item_dims(asset, index, size)
+    if dims is None and asset.startswith("builtin:"):
+        part = fixtures_mod.FIXTURE_PARTS.get(asset.split(":", 1)[1])
+        if part is not None:
+            dims = tuple(part["dims"])
+    return dims
+
+
+def usage_rect(item: Item, depth: float,
+               behind: bool = False) -> Tuple[float, float, float, float]:
+    """The clear space a fixture needs in front of it (door swing / standing spot).
+
+    ``behind`` puts the zone at the item's back instead -- how a chair is pulled
+    out from the table it faces.
+    """
+    aabb = item.aabb
+    dir_x, dir_y = _facing_of(item)
+    if behind:
+        dir_x, dir_y = -dir_x, -dir_y
+    if dir_x != 0.0:
+        return (aabb[2], aabb[1], aabb[2] + depth, aabb[3]) if dir_x > 0 else \
+               (aabb[0] - depth, aabb[1], aabb[0], aabb[3])
+    return (aabb[0], aabb[3], aabb[2], aabb[3] + depth) if dir_y > 0 else \
+           (aabb[0], aabb[1] - depth, aabb[2], aabb[1])
+
+
 class Placer:
     """Rejection sampling for one room: keeps the layout contract of checks.py."""
 
@@ -617,6 +1306,8 @@ class Placer:
         self.report = report
         self.walls = room.walls
         self.rejections: Dict[str, int] = {}
+        #: keep-clear zones in front of fixtures (fridge door, pulled-out chair)
+        self.usages: List[dict] = []
 
     # -- helpers --------------------------------------------------------- #
     def pick_asset(self, slot: str) -> Optional[str]:
@@ -649,7 +1340,7 @@ class Placer:
         return None
 
     def dims_of(self, asset: str) -> Optional[Tuple[float, float, float]]:
-        return checks_mod.item_dims(asset, self.index)
+        return _dims_of(asset, self.index)
 
     def door_rects(self) -> List[Tuple[float, float, float, float]]:
         """Door approach rectangles of this room, using the shared contract."""
@@ -670,28 +1361,35 @@ class Placer:
         return (aabb[0] >= self.rect.x0 + gap - 1e-9 and aabb[2] <= self.rect.x1 - gap + 1e-9
                 and aabb[1] >= self.rect.y0 + gap - 1e-9 and aabb[3] <= self.rect.y1 - gap + 1e-9)
 
-    def corridor_band(self) -> Optional[Tuple[float, float]]:
-        """Y band the door sight lines travel through (see ``fits``)."""
-        if not self.doors:
-            return None
-        low = min(door.center[1] for door in self.doors) - CORRIDOR_HALF_M
-        high = max(door.center[1] for door in self.doors) + CORRIDOR_HALF_M
-        return (low, high)
-
     def fits(self, item: Item, gap: float, keep_doors: bool = True) -> bool:
         aabb = item.aabb
         if not self.inside(aabb, gap):
             self.reject("outside_room")
             return False
-        if item.dims[2] > CORRIDOR_MAX_H_M:
-            band = self.corridor_band()
-            if band is not None and aabb[1] < band[1] - 1e-9 and aabb[3] > band[0] + 1e-9:
-                self.reject("sight_corridor")
+        # the wall-gap class of checks.check_spec: wall hugging (<= 0.35 m) or
+        # free standing (>= 0.60 m), nothing in between -- a fixture placed by
+        # hand (the desk chair, a dining chair) has to land on one side of it
+        if item.placement not in (checks_mod.FLOOR_FLAT, checks_mod.CEILING, checks_mod.MOUNTED):
+            wall_gap = checks_mod.wall_gap(aabb, self.rect.polygon())
+            if wall_gap < checks_mod.WALL_GAP_MIN_M - 1e-9:
+                self.reject("wall_gap")
+                return False
+            if checks_mod.WALL_GAP_HUG_MAX_M + 1e-9 < wall_gap < checks_mod.WALL_GAP_FREE_MIN_M - 1e-9:
+                self.reject("wall_gap_band")
                 return False
         if keep_doors:
             for rect in self.door_rects():
                 if checks_mod.rect_distance(aabb, rect) < checks_mod.DOOR_CLEARANCE_M + 0.05:
                     self.reject("door_zone")
+                    return False
+        if _blocks_walking(item):
+            for usage in self.usages:
+                if item.slot and item.slot in usage["allow"]:
+                    continue
+                if checks_mod.rect_distance(aabb, usage["aabb"]) < USAGE_NEIGHBOUR_M:
+                    continue      # this item is beside the fixture, not in its zone
+                if checks_mod.rect_distance(aabb, usage["rect"]) < USAGE_GAP_M:
+                    self.reject(f"usage:{usage['slot']}")
                     return False
         z_range = item.z_range
         for other in self.placed:
@@ -741,19 +1439,54 @@ class Placer:
     def reject(self, reason: str) -> None:
         self.rejections[reason] = self.rejections.get(reason, 0) + 1
 
-    def add(self, item: Item) -> Item:
+    def add(self, item: Item, usage: float = 0.0, allow: Sequence[str] = (),
+            behind: bool = False) -> Optional[Item]:
+        """Place the item; ``usage`` registers the keep-clear zone in front of it.
+
+        The zone is claimed *before* the item joins the room: a placement whose
+        use would already be blocked by something standing there (a fridge
+        behind a shelf) is refused instead of placed with a warning.  ``allow``
+        names the slots that may stand in the zone -- the desk's pull-out space
+        is exactly where its chair goes; ``behind`` flips the zone to the item's
+        back (a chair is pulled out away from the table it faces).
+        """
+        if usage > 0.0 and _blocks_walking(item):
+            rect = usage_rect(item, usage, behind=behind)
+            for other in self.placed:
+                if not _blocks_walking(other) or (other.slot and other.slot in allow):
+                    continue
+                if checks_mod.rect_distance(other.aabb, item.aabb) < USAGE_NEIGHBOUR_M:
+                    continue      # standing beside the fixture, not in front of it
+                if checks_mod.rect_distance(other.aabb, rect) < USAGE_GAP_M:
+                    self.reject(f"usage_occupied:{item.slot}")
+                    return None
         self.placed.append(item)
+        if usage > 0.0 and _blocks_walking(item):
+            self.usages.append({"rect": usage_rect(item, usage, behind=behind), "slot": item.slot,
+                                "name": item.name, "aabb": item.aabb, "allow": tuple(allow)})
         self.report.setdefault("slots", []).append({
             "slot": item.slot, "name": item.name, "asset": item.asset, "room": item.room,
             "placement": item.placement, "pos": [round(item.pos[0], 3), round(item.pos[1], 3)],
             "rot_z_deg": item.rot_z_deg, "size_m": [round(v, 3) for v in item.dims],
+            "usage_m": round(usage, 3) if usage else 0.0,
+            "usage_behind": bool(behind),
         })
         return item
+
+    def rollback(self, items: Sequence[Item]) -> None:
+        """Undo the placements of a failed group (a counter run that did not fit)."""
+        names = {item.name for item in items}
+        if not names:
+            return
+        self.placed[:] = [item for item in self.placed if item.name not in names]
+        self.usages[:] = [usage for usage in self.usages if usage["name"] not in names]
+        self.report["slots"] = [entry for entry in self.report.get("slots", [])
+                                if entry.get("name") not in names]
 
     def make(self, slot: str, name: str, asset: str, pos, rot, placement: str,
              z: Optional[float] = None, size: Optional[Sequence[float]] = None,
              attached_to: Optional[str] = None) -> Optional[Item]:
-        dims = checks_mod.item_dims(asset, self.index, size)
+        dims = _dims_of(asset, self.index, size)
         if dims is None:
             return None
         return Item(name=name, asset=asset, room=self.room.room_id, pos=[float(pos[0]), float(pos[1])],
@@ -765,7 +1498,7 @@ class Placer:
     def against_wall(self, slot: str, name: str, asset: str, wall: Wall, along: float,
                      placement: str = checks_mod.WALL_HUG, z: Optional[float] = None,
                      gap: float = BACK_GAP_M, size=None, attached_to=None) -> Optional[Item]:
-        dims = checks_mod.item_dims(asset, self.index, size)
+        dims = _dims_of(asset, self.index, size)
         if dims is None:
             return None
         half_x, half_y = rotated_half_extents(dims, wall.rot_deg)
@@ -791,32 +1524,18 @@ class Placer:
 
     def along_intervals(self, wall: Wall, extent_along: float, extent_across: float,
                         height: float, margin: float = 0.10) -> List[Tuple[float, float]]:
-        """Positions along ``wall`` where the item clears the door sight corridor.
+        """Positions along ``wall`` where the item fits, with the wall margin.
 
-        A tall item (taller than the eye-height ray that the door check casts)
-        must stay out of the Y band between the doors, otherwise it cuts the
-        enfilade line: on a side wall that is a condition on the position along
-        the wall, on a north/south wall it depends only on the wall itself.
+        ``extent_across`` and ``height`` are kept in the signature because every
+        furniture slot passes them; they no longer restrict anything.  They used
+        to encode the enfilade rule -- a tall item had to stay out of the Y band
+        between the doorways so that the validator's mirrored column could see a
+        door -- which is gone now that the validator projects the door itself.
         """
         limits = self.along_limits(wall, extent_along / 2.0, margin)
         if limits is None:
             return []
-        low, high = limits
-        band = self.corridor_band()
-        if band is None or height <= CORRIDOR_MAX_H_M:
-            return [(low, high)]
-        if wall.side in ("N", "S"):
-            inner = wall.line - BACK_GAP_M - extent_across if wall.side == "N" else wall.line + BACK_GAP_M
-            if inner < band[1] and inner + extent_across > band[0]:
-                return []
-            return [(low, high)]
-        forbidden = (band[0] - extent_along / 2.0, band[1] + extent_along / 2.0)
-        out = []
-        if low < forbidden[0] - 1e-9:
-            out.append((low, min(high, forbidden[0])))
-        if high > forbidden[1] + 1e-9:
-            out.append((max(low, forbidden[1]), high))
-        return [(a, b) for a, b in out if b - a > 1e-9]
+        return [limits]
 
     def sample_along(self, intervals: Sequence[Tuple[float, float]]) -> float:
         """Pick a position from the intervals, weighted by interval length."""
@@ -835,9 +1554,10 @@ def _place_on_wall(placer: Placer, slot: str, name: str, asset: str, walls: List
                    gap: float = BACK_GAP_M, placement: str = checks_mod.WALL_HUG,
                    z: Optional[float] = None,
                    avoid: Sequence[Tuple[float, float, float, float]] = (), size=None,
-                   attached_to=None, window_penalty: bool = True) -> Optional[Item]:
+                   attached_to=None, window_penalty: bool = True,
+                   usage: float = 0.0, allow: Sequence[str] = ()) -> Optional[Item]:
     """Try each wall (and positions along it) until the item fits."""
-    dims = checks_mod.item_dims(asset, placer.index, size)
+    dims = _dims_of(asset, placer.index, size)
     if dims is None:
         return None
     scored = []
@@ -861,13 +1581,15 @@ def _place_on_wall(placer: Placer, slot: str, name: str, asset: str, walls: List
             if any(checks_mod.rect_distance(item.aabb, rect) < 0.10 for rect in avoid):
                 continue
             if placer.fits(item, checks_mod.WALL_GAP_MIN_M) and placer.keeps_room_open(item):
-                return placer.add(item)
+                placed = placer.add(item, usage=usage, allow=allow)
+                if placed is not None:
+                    return placed
     return None
 
 
 def _place_free(placer: Placer, slot: str, name: str, asset: str, candidates,
                 placement: str = checks_mod.FREE_STAND, size=None, attempts: int = 26,
-                rot_fn=None) -> Optional[Item]:
+                rot_fn=None, usage: float = 0.0, allow: Sequence[str] = ()) -> Optional[Item]:
     """Grid/random search for a free standing spot (>= 0.6 m off every wall)."""
     tried = list(candidates)
     placer.rng.shuffle(tried)
@@ -882,7 +1604,9 @@ def _place_free(placer: Placer, slot: str, name: str, asset: str, candidates,
         for rot in rot_choices:
             item.rot_z_deg = rot
             if placer.fits(item, checks_mod.WALL_GAP_FREE_MIN_M) and placer.keeps_room_open(item):
-                return placer.add(item)
+                placed = placer.add(item, usage=usage, allow=allow)
+                if placed is not None:
+                    return placed
     return None
 
 
@@ -1116,6 +1840,11 @@ def furnish_bedroom(placer: Placer, want_extras: bool) -> None:
                                    placement=checks_mod.MOUNTED, z=1.62, gap=ART_GAP_M)
         if item is not None and placer.fits(item, checks_mod.WALL_GAP_MIN_M, keep_doors=False):
             placer.add(item)
+    if rect.area >= 11.5 and rng.random() < 0.7:
+        walls = [wall for wall in placer.walls.values() if not _same_wall(wall, bed)]
+        walls.sort(key=lambda wall: (placer.wall_has_window(wall), -wall.length, rng.random()))
+        _place_on_wall(placer, "wardrobe", "wardrobe", _fixture("wardrobe"), walls,
+                       usage=fixtures_mod.usage_m("wardrobe"), avoid=[bed.aabb])
     if want_extras:
         plant_asset = placer.pick_asset("plant_small")
         if plant_asset and rng.random() < 0.7:
@@ -1144,53 +1873,338 @@ def furnish_bedroom(placer: Placer, want_extras: bool) -> None:
             placer.add(item)
 
 
-def furnish_plain(placer: Placer) -> None:
-    """Kitchen / bathroom / study: a plant when it fits, no cabinetry in v1."""
+def _fixture(part: str) -> str:
+    """Asset reference of a :mod:`blender_agent.fixtures` part."""
+    return f"builtin:{part}"
+
+
+def _fixture_walls(placer: Placer, prefer_window: bool = False) -> List[Wall]:
+    """Walls ordered for fixture placement: without a door first, longest first."""
+    door_sides = {door.wall.side for door in placer.doors}
+    return sorted(placer.walls.values(),
+                  key=lambda wall: (wall.side in door_sides,
+                                    0 if placer.wall_has_window(wall) == prefer_window else 1,
+                                    -wall.length))
+
+
+def _place_run(placer: Placer, wall: Wall, parts: Sequence[str], start: float,
+               name_prefix: str) -> Optional[List[Item]]:
+    """Tile fixture parts along a wall at exact offsets (one straight counter).
+
+    Every part is placed against the wall with ``FIXTURE_GAP_M`` between its
+    neighbours, so the worktop of a kitchen run is continuous; the whole run is
+    rolled back when any part does not fit, and a part's standing space
+    (``fixtures.usage_m``) is claimed before the next part goes down.
+    """
+    placed: List[Item] = []
+    along = float(start)
+    for part in parts:
+        width = fixtures_mod.dims(part)[0]
+        along += width / 2.0
+        item = placer.against_wall(part, f"{name_prefix}_{part}", _fixture(part), wall, along)
+        if item is None:
+            placer.rollback(placed)
+            return None
+        item.slot = part
+        if not placer.fits(item, checks_mod.WALL_GAP_MIN_M) or not placer.keeps_room_open(item):
+            placer.rollback(placed)
+            return None
+        added = placer.add(item, usage=fixtures_mod.usage_m(part))
+        if added is None:
+            placer.rollback(placed)
+            return None
+        placed.append(added)
+        along += width / 2.0 + FIXTURE_GAP_M
+    return placed
+
+
+def _add_ceiling_lamp(placer: Placer, name: str) -> Optional[Item]:
+    """A pendant near the room's centre, retried when a tall piece stands there.
+
+    A windowless room (bathroom, hall, storage) is lit by its doorways alone and
+    renders black without a lamp, so this retries a few positions instead of
+    giving up when the first spot collides with something like a shower cabin.
+    """
     rng = placer.rng
     rect = placer.rect
-    if placer.room.room_type == "study":
-        furnish_study(placer)
-        return
-    chance = 0.75 if placer.room.room_type == "kitchen" else 0.35
-    if rng.random() > chance:
-        return
-    asset = placer.pick_asset("plant_small")
-    if asset is None:
-        return
-    dims = placer.dims_of(asset)
-    inset = checks_mod.WALL_GAP_FREE_MIN_M + 0.10
-    corners = []
+    lamp_asset = placer.pick_asset("ceiling_lamp")
+    if lamp_asset is None:
+        return None
+    for attempt in range(10):
+        offsets = ((0.0, 0.0), (0.30, 0.0), (-0.30, 0.0), (0.0, 0.30), (0.0, -0.30))[attempt % 5]
+        center = (rect.center[0] + offsets[0] + rng.uniform(-0.10, 0.10),
+                  rect.center[1] + offsets[1] + rng.uniform(-0.10, 0.10))
+        item = placer.make("ceiling_lamp", name, lamp_asset, center, 0.0, checks_mod.CEILING)
+        if item is not None and placer.fits(item, checks_mod.WALL_GAP_MIN_M, keep_doors=False):
+            return placer.add(item)
+    return None
+
+
+def _corner_candidates(placer: Placer, dims, inset: Optional[float] = None):
+    rect = placer.rect
+    inset = checks_mod.WALL_GAP_FREE_MIN_M + 0.10 if inset is None else inset
+    out = []
     for sx in (1, -1):
         for sy in (1, -1):
-            corners.append((rect.x0 + inset + dims[0] / 2.0 if sx > 0 else rect.x1 - inset - dims[0] / 2.0,
-                            rect.y0 + inset + dims[1] / 2.0 if sy > 0 else rect.y1 - inset - dims[1] / 2.0))
-    _place_free(placer, "plant", "plant", asset, corners, attempts=4)
+            out.append((rect.x0 + inset + dims[0] / 2.0 if sx > 0 else rect.x1 - inset - dims[0] / 2.0,
+                        rect.y0 + inset + dims[1] / 2.0 if sy > 0 else rect.y1 - inset - dims[1] / 2.0))
+    return out
+
+
+def furnish_kitchen(placer: Placer) -> None:
+    """A counter run (cabinets + stove + sink) and a fridge, with standing space.
+
+    The run is tiled module by module along the longest door-free wall so the
+    worktop reads as one line; the stove and the sink sit in it, the fridge
+    closes the line or takes another wall.  Every part claims the clear space
+    its use needs (a fridge door swing, a cook's standing spot) -- the generator
+    refuses to put anything there, so the fixture stays usable (the render
+    validator cannot see intent, which is why the report carries ``usage_m``).
+    """
+    rng = placer.rng
+    widths = {part: fixtures_mod.dims(part)[0] for part in
+              ("kitchen_cabinet", "kitchen_stove", "kitchen_sink", "kitchen_fridge")}
+    for wall in _fixture_walls(placer, prefer_window=False):
+        usable = wall.length - 2.0 * 0.10
+        for modules in (4, 3, 2, 1, 0):
+            run = ["kitchen_cabinet"] * modules + ["kitchen_stove", "kitchen_sink"]
+            run_length = sum(widths[part] for part in run) + FIXTURE_GAP_M * (len(run) - 1)
+            fridge_length = widths["kitchen_fridge"] + FIXTURE_GAP_M
+            if run_length > usable:
+                continue
+            with_fridge = run_length + fridge_length <= usable
+            total = run_length + fridge_length if with_fridge else run_length
+            for _attempt in range(4):
+                start = wall.lo + 0.10 + rng.uniform(0.0, max(0.0, usable - total))
+                items = _place_run(placer, wall, run, start, "kitchen")
+                if items is None:
+                    continue
+                if with_fridge:
+                    _place_run(placer, wall, ["kitchen_fridge"], start + run_length, "kitchen")
+                if modules > 0 and not placer.wall_has_window(wall) and rng.random() < 0.5:
+                    _place_upper_cabinets(placer, wall, start, run_length)
+                _add_ceiling_lamp(placer, "ceiling_lamp_kitchen")
+                return
+    raise _AttemptFailed("no kitchen run fits on any wall")
+
+
+def _place_upper_cabinets(placer: Placer, wall: Wall, start: float, length: float) -> None:
+    """Wall cupboards above a counter run, high enough to stay out of the walk band."""
+    count = 2 if length >= 1.3 else 1
+    along = start + length / 2.0
+    for index in range(count):
+        offset = along + (index - (count - 1) / 2.0) * 0.65
+        item = placer.against_wall("kitchen_upper", f"kitchen_upper_{index}", _fixture("kitchen_upper"),
+                                   wall, offset, placement=checks_mod.MOUNTED, z=UPPER_CABINET_Z_M)
+        if item is not None and placer.fits(item, checks_mod.WALL_GAP_MIN_M, keep_doors=False):
+            item.mount = "wall"
+            placer.add(item)
+
+
+def furnish_bathroom(placer: Placer) -> None:
+    """Toilet, washbasin and (when the room allows it) a shower cabin."""
+    rect = placer.rect
+    walls = _fixture_walls(placer, prefer_window=False)
+    shower_first = rect.area >= 5.5
+    order = ["bath_shower"] if shower_first else []
+    order += ["bath_toilet", "bath_basin"]
+    if not shower_first and rect.area >= 4.2:
+        order += ["bath_shower"]
+    for part in order:
+        placed = _place_on_wall(placer, part, part, _fixture(part), walls,
+                                usage=fixtures_mod.usage_m(part))
+        if placed is None and part in ("bath_toilet", "bath_basin"):
+            raise _AttemptFailed(f"bathroom fixture {part} does not fit")
+    if not any(item.slot == "bath_toilet" for item in placer.placed):
+        raise _AttemptFailed("bathroom got no toilet")
+    # a windowless bathroom is lit by its door alone and renders black
+    _add_ceiling_lamp(placer, "ceiling_lamp_bath")
+
+
+def _table_spots(table: Item, chair_dims: Sequence[float]):
+    """Chair positions + yaws around a table, facing it (world coordinates)."""
+    theta = math.radians(table.rot_z_deg)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    half_l = table.dims[0] / 2.0
+    half_d = table.dims[1] / 2.0
+    spots = []
+    for sign in (-1.0, 1.0):
+        for offset in (-0.36, 0.36):
+            v = sign * (half_d + 0.06 + chair_dims[1] / 2.0)
+            rot = table.rot_z_deg + (0.0 if sign > 0 else 180.0)
+            spots.append((offset, v, rot))
+        u = sign * (half_l + 0.06 + chair_dims[1] / 2.0)
+        rot = table.rot_z_deg + (270.0 if sign > 0 else 90.0)
+        spots.append((u, 0.0, rot))
+    world = []
+    for u, v, rot in spots:
+        world.append((table.pos[0] + cos_t * u - sin_t * v,
+                      table.pos[1] + sin_t * u + cos_t * v, rot % 360.0))
+    return world
+
+
+def furnish_dining(placer: Placer) -> None:
+    """A dining table with chairs on its long sides and ends."""
+    rng = placer.rng
+    table_dims = fixtures_mod.dims("dining_table")
+    table = _place_free(placer, "dining_table", "dining_table", _fixture("dining_table"),
+                        _free_candidates(placer, table_dims, step=0.3), attempts=30)
+    if table is None:
+        table = _place_on_wall(placer, "dining_table", "dining_table", _fixture("dining_table"),
+                               _fixture_walls(placer), window_penalty=False)
+    if table is None:
+        raise _AttemptFailed("no room for a dining table")
+    chair_dims = fixtures_mod.dims("dining_chair")
+    chairs = 0
+    for pos_x, pos_y, rot in _table_spots(table, chair_dims):
+        item = placer.make("dining_chair", f"dining_chair_{chairs}", _fixture("dining_chair"),
+                           (pos_x, pos_y), rot, checks_mod.FREE_STAND)
+        if item is None or not placer.fits(item, checks_mod.WALL_GAP_MIN_M):
+            continue
+        added = placer.add(item, usage=0.40, allow=("dining_chair",), behind=True)
+        if added is not None:
+            chairs += 1
+    if chairs < 2:
+        raise _AttemptFailed(f"only {chairs} dining chairs fit")
+    _add_ceiling_lamp(placer, "ceiling_lamp_dining")
+
+
+def furnish_entry(placer: Placer) -> None:
+    """Shoe cabinet (and a rug) in the entrance hall."""
+    _place_on_wall(placer, "entry_shoe_cabinet", "shoe_cabinet", _fixture("entry_shoe_cabinet"),
+                   _fixture_walls(placer), usage=fixtures_mod.usage_m("entry_shoe_cabinet"))
+    rect = placer.rect
+    rug_size = [min(1.6, rect.w - 0.8), min(0.9, rect.h - 0.8)]
+    if min(rug_size) > 0.4 and placer.rng.random() < 0.5:
+        item = placer.make("rug", "entry_rug", RUG_ASSET, rect.center, 0.0,
+                           checks_mod.FLOOR_FLAT, size=rug_size)
+        if item is not None and placer.fits(item, checks_mod.WALL_GAP_MIN_M, keep_doors=False):
+            placer.add(item)
+    _add_ceiling_lamp(placer, "ceiling_lamp_entry")
+
+
+def furnish_storage(placer: Placer) -> None:
+    """Shelving units for a storeroom."""
+    walls = _fixture_walls(placer)
+    _place_on_wall(placer, "storage_shelf", "storage_shelf", _fixture("storage_shelf"),
+                   walls, usage=fixtures_mod.usage_m("storage_shelf"))
+    if placer.rect.area >= 4.0:
+        _place_on_wall(placer, "storage_shelf", "storage_shelf_2", _fixture("storage_shelf"),
+                       list(reversed(walls)), usage=fixtures_mod.usage_m("storage_shelf"))
+    _add_ceiling_lamp(placer, "ceiling_lamp_storage")
+
+
+def furnish_laundry(placer: Placer) -> None:
+    """Washing machine (and a dryer when the wall has room)."""
+    walls = _fixture_walls(placer)
+    washer = _place_on_wall(placer, "laundry_washer", "washer", _fixture("laundry_washer"),
+                            walls, usage=fixtures_mod.usage_m("laundry_washer"))
+    if washer is not None and placer.rect.area >= 3.6:
+        wall = _facing_wall(placer, washer)
+        along = washer.pos[0] if wall.side in ("N", "S") else washer.pos[1]
+        offset = along + (washer.dims[0] + fixtures_mod.dims("laundry_washer")[0]) / 2.0 + 0.10
+        item = placer.against_wall("laundry_washer", "dryer", _fixture("laundry_washer"), wall, offset)
+        if item is not None and placer.fits(item, checks_mod.WALL_GAP_MIN_M):
+            placer.add(item, usage=fixtures_mod.usage_m("laundry_washer"))
+    _add_ceiling_lamp(placer, "ceiling_lamp_laundry")
+
+
+def furnish_balcony(placer: Placer) -> None:
+    """Plants on a balcony (it is the outdoor room, so no furniture to block it)."""
+    rng = placer.rng
+    for index in range(3):
+        asset = placer.pick_asset("plant_small") or placer.pick_asset("plant_tall")
+        if asset is None:
+            break
+        dims = placer.dims_of(asset)
+        if dims is None:
+            continue
+        candidates = _corner_candidates(placer, dims, inset=0.35)
+        _place_free(placer, "plant", f"plant_balcony_{index}", asset, candidates, attempts=4)
+    if rng.random() < 0.5:
+        basket_asset = placer.pick_asset("basket")
+        if basket_asset:
+            dims = placer.dims_of(basket_asset)
+            _place_free(placer, "basket", "basket_balcony", basket_asset,
+                        _corner_candidates(placer, dims, inset=0.35), attempts=4)
+
+
+def furnish_corridor(placer: Placer) -> None:
+    """A runner rug and a plant at the end: a corridor is circulation, not a room."""
+    rng = placer.rng
+    rect = placer.rect
+    if rng.random() < 0.5:
+        size = [max(0.5, rect.w - 0.5), max(0.4, rect.h - 0.35)] if rect.w >= rect.h else \
+               [max(0.4, rect.w - 0.35), max(0.5, rect.h - 0.5)]
+        item = placer.make("rug", "corridor_runner", RUG_ASSET, rect.center,
+                           0.0 if size[0] >= size[1] else 90.0, checks_mod.FLOOR_FLAT, size=size)
+        if item is not None and min(size) >= 0.4 and placer.fits(item, checks_mod.WALL_GAP_MIN_M, keep_doors=False):
+            placer.add(item)
+    asset = placer.pick_asset("plant_small") or placer.pick_asset("basket")
+    if asset is not None and rng.random() < 0.6:
+        dims = placer.dims_of(asset)
+        _place_free(placer, "plant", "plant_corridor", asset, _corner_candidates(placer, dims),
+                    attempts=4)
+    # a windowless hall is lit by its doorways alone and renders black
+    _add_ceiling_lamp(placer, "ceiling_lamp_corridor")
+
+
+def furnish_plain(placer: Placer) -> None:
+    """Dispatch of the more functional rooms; rooms without a handler stay bare."""
+    room_type = placer.room.room_type
+    if room_type == "kitchen":
+        furnish_kitchen(placer)
+    elif room_type == "bathroom":
+        furnish_bathroom(placer)
+    elif room_type == "study":
+        furnish_study(placer)
+    elif room_type == "dining":
+        furnish_dining(placer)
+    elif room_type == "entry":
+        furnish_entry(placer)
+    elif room_type == "storage":
+        furnish_storage(placer)
+    elif room_type == "laundry":
+        furnish_laundry(placer)
+    elif room_type == "balcony":
+        furnish_balcony(placer)
+    elif room_type == "corridor":
+        furnish_corridor(placer)
 
 
 def furnish_study(placer: Placer) -> None:
+    """Desk (with its chair and its pull-out space), bookshelf and a lamp."""
     rng = placer.rng
     rect = placer.rect
+    walls = _fixture_walls(placer, prefer_window=True)
+    desk = _place_on_wall(placer, "study_desk", "desk", _fixture("study_desk"), walls,
+                          usage=fixtures_mod.usage_m("study_desk"), allow=("study_chair",),
+                          window_penalty=False)
+    if desk is not None:
+        chair_dims = fixtures_mod.dims("study_chair")
+        facing = _facing_of(desk)
+        gap = desk.dims[1] / 2.0 + 0.06 + chair_dims[1] / 2.0
+        along = desk.pos[0] if abs(facing[1]) > 0 else desk.pos[1]
+        for index, offset in enumerate((0.0, 0.35, -0.35)):
+            pos = ((along + offset, desk.pos[1] + facing[1] * gap) if abs(facing[1]) > 0
+                   else (desk.pos[0] + facing[0] * gap, along + offset))
+            item = placer.make("study_chair", f"desk_chair_{index}", _fixture("study_chair"),
+                               pos, (desk.rot_z_deg + 180.0) % 360.0, checks_mod.WALL_HUG)
+            if item is not None and placer.fits(item, checks_mod.WALL_GAP_MIN_M) \
+                    and placer.keeps_room_open(item) and placer.add(item) is not None:
+                break
     shelf_asset = placer.pick_asset("bookshelf")
     if shelf_asset:
-        shelf_dims = placer.dims_of(shelf_asset)
-        walls = sorted(placer.walls.values(), key=lambda wall: (placer.wall_has_window(wall), -wall.length))
-        _place_on_wall(placer, "bookshelf", "bookshelf_study", shelf_asset, walls)
+        avoid = [desk.aabb] if desk is not None else []
+        others = [wall for wall in placer.walls.values() if desk is None or not _same_wall(wall, desk)]
+        others.sort(key=lambda wall: (placer.wall_has_window(wall), -wall.length))
+        _place_on_wall(placer, "bookshelf", "bookshelf_study", shelf_asset, others, avoid=avoid)
     plant_asset = placer.pick_asset("plant_small")
     if plant_asset and rng.random() < 0.6:
         dims = placer.dims_of(plant_asset)
-        inset = checks_mod.WALL_GAP_FREE_MIN_M + 0.10
-        corners = []
-        for sx in (1, -1):
-            for sy in (1, -1):
-                corners.append((rect.x0 + inset + dims[0] / 2.0 if sx > 0 else rect.x1 - inset - dims[0] / 2.0,
-                                rect.y0 + inset + dims[1] / 2.0 if sy > 0 else rect.y1 - inset - dims[1] / 2.0))
-        _place_free(placer, "plant", "plant_study", plant_asset, corners, attempts=4)
-    lamp_asset = placer.pick_asset("ceiling_lamp")
-    if lamp_asset:
-        center = (rect.center[0] + rng.uniform(-0.25, 0.25), rect.center[1] + rng.uniform(-0.25, 0.25))
-        item = placer.make("ceiling_lamp", "ceiling_lamp_study", lamp_asset, center, 0.0, checks_mod.CEILING)
-        if item is not None:
-            placer.add(item)
+        _place_free(placer, "plant", "plant_study", plant_asset, _corner_candidates(placer, dims),
+                    attempts=4)
+    _add_ceiling_lamp(placer, "ceiling_lamp_study")
 
 
 def furnish_rooms(rng: random.Random, plans: Sequence[RoomPlan], doors: Sequence[DoorPlan],
@@ -1246,18 +2260,6 @@ class _Box:
             if hole(origin, direction, t0, t1):
                 return None
         return max(t0, t_min)
-
-
-def _sample_row(lat: float, height: int) -> int:
-    """The pixel row the validator samples for ``lat``.
-
-    ``tools/validate_blender_agent_p0.py`` maps a latitude to a row with
-    ``(pi/2 - lat) / pi * height - 0.5``, rounds it and clamps it to
-    ``[2, height - 3]``; the model has to do the same or its rays drift from the
-    sampled ones by up to half a row (0.09 deg at 1024 rows), which is exactly
-    the margin that decides whether a wall ray grazes over a doorway lintel.
-    """
-    return max(2, min(height - 3, int(round((math.pi / 2.0 - lat) / math.pi * height - 0.5))))
 
 
 def _door_hole(door_span_xy, door_height):
@@ -1332,79 +2334,112 @@ class ShellModel:
                     best = t
         return best
 
-    def _row_depth(self, origin, lon: float, row: int, height: int) -> float:
-        """Depth along the ERP ray of one pixel row (measured at the row centre)."""
-        lat = math.pi / 2.0 - (row + 0.5) / height * math.pi
-        ray = (math.cos(lat) * math.cos(lon), -math.cos(lat) * math.sin(lon), math.sin(lat))
-        return self.cast(tuple(origin), ray)
+    def _pixel_depth(self, origin, column: int, row: int, height: int, width: int = PANO_W) -> float:
+        """Depth along the ERP ray of one pixel centre."""
+        lon, lat = erp_lon_lat(column, row, width, height)
+        return self.cast(tuple(origin), erp_ray_direction(lon, lat))
 
-    def _window_median(self, origin, lon: float, row: int, height: int, half: int = 2) -> float:
-        """Median row depth over the validator's pixel window.
+    def _window_median(self, origin, column: int, row: int, height: int, half: int = 2) -> float:
+        """Median depth over the validator's 5x5 pixel window (its sampling rule).
 
-        The validator takes the median depth of a 5x5 pixel neighbourhood around
-        the sampled column and row, so the forecast has to be the median of those
-        *rows* too -- a single centre ray can slide under a doorway lintel that
-        most of the window still sees, and then predicts a wall depth the render
-        never reports.  The column spread is left out: at 2 px it is a ~7 cm
-        lateral offset, while the rows decide the lintel.
+        ``tools/validate_blender_agent_p0.py`` reads a rendered depth as the
+        median of the 5x5 pixels around the projected door point, so the
+        forecast has to do the same: one pixel can sit on the door jamb or under
+        a lintel while the window still sees the opening, and then the forecast
+        would disagree with the render by the width of one pixel.
         """
-        rows = [max(0, min(height - 1, row + offset)) for offset in range(-half, half + 1)]
-        depths = sorted(self._row_depth(origin, lon, value, height) for value in rows)
+        depths = []
+        for row_offset in range(-half, half + 1):
+            r = max(0, min(height - 1, row + row_offset))
+            for column_offset in range(-half, half + 1):
+                c = (column + column_offset) % PANO_W
+                depths.append(self._pixel_depth(origin, c, r, height))
+        depths.sort()
         return depths[len(depths) // 2]
+
+    def door_sight(self, door: DoorPlan, camera_pos: Sequence[float],
+                   height: int = PANO_H) -> Optional[dict]:
+        """Where the camera's ray towards this door goes: through it or into a wall.
+
+        The door's mid-height point is projected into the panorama with the
+        inverse camera rotation (:func:`erp_pixel_of_direction`), the ERP ray of
+        that pixel is cast through the analytic shell, and the hit is compared
+        with the distance to the door plane: a sight line that passes through
+        the opening arrives at or behind the door plane (the tunnel is a hole in
+        the wall box), one that is blocked by the wall, a lintel or furniture
+        arrives in front of it.  This is exactly what
+        ``tools/validate_blender_agent_p0.py``'s ``door_visibility_check``
+        measures on the render, on the same pixel and with the same arithmetic.
+        """
+        if door.key() not in self.door_segments:
+            return None
+        point = (door.center[0], door.center[1], min(DOOR_H / 2.0, DOOR_H - 0.10))
+        offset = (point[0] - camera_pos[0], point[1] - camera_pos[1], point[2] - camera_pos[2])
+        expected = math.sqrt(sum(value * value for value in offset))
+        if expected < 1e-6:
+            return None
+        column, row = erp_pixel_of_direction(offset, height=height)
+        return {"door": door.key(),
+                "column": column,
+                "row": row,
+                "expected_m": expected,
+                "depth_m": self._pixel_depth(camera_pos, column, row, height),
+                "visible": None}
 
     def ray_for_pixel(self, door: DoorPlan, camera_pos: Sequence[float],
                       height: int = PANO_H) -> Optional[dict]:
-        """Depths of the validator's door/wall rows for the column it samples.
+        """The validator's door visibility check, pre-computed on the analytic shell.
 
-        ``tools/validate_blender_agent_p0.py`` computes the column from
-        ``atan2(dy, dx)`` while the ERP convention (``spec.py``) maps a direction
-        to ``atan2(-dy, dx)``: the sampled column is the mirror image about the
-        camera's +X axis.  The model reproduces that, so the forecast matches the
-        render even where the column is mirrored, and it samples the same pixel
-        rows (:func:`_sample_row`) with the same window median.
+        Same projection (:func:`erp_pixel_of_direction`), same pixel window
+        (:meth:`_window_median`) and the same "the ray arrives behind the door
+        plane" rule as ``tools/validate_blender_agent_p0.py``, so the layout
+        report can say what the render will show.  The old version reproduced the
+        validator's *mirrored* column arithmetic instead, which only predicted
+        the render for plans whose doors and cameras shared one Y line.
         """
-        segment = self.door_segments.get(door.key())
-        if segment is None:
+        sight = self.door_sight(door, camera_pos, height)
+        if sight is None:
             return None
-        direction_xy = segment[1][0] - segment[0][0], segment[1][1] - segment[0][1]
-        norm = math.hypot(*direction_xy)
-        direction_xy = (direction_xy[0] / norm, direction_xy[1] / norm)
-        normal = (-direction_xy[1], direction_xy[0])
-        to_door = (door.center[0] - camera_pos[0], door.center[1] - camera_pos[1])
-        length = math.hypot(*to_door)
-        if length < 1e-6:
-            return None
-        unit = (to_door[0] / length, to_door[1] / length)
-        denominator = unit[0] * normal[0] + unit[1] * normal[1]
-        if abs(denominator) < 1e-6:
-            return None
-        horizontal = ((door.center[0] - camera_pos[0]) * normal[0]
-                      + (door.center[1] - camera_pos[1]) * normal[1]) / denominator
-        if horizontal <= 1e-6:
-            return None
-        column = int(round((math.atan2(to_door[1], to_door[0]) + math.pi) / (2.0 * math.pi) * PANO_W - 0.5)) % PANO_W
-        lon = (column + 0.5) / PANO_W * 2.0 * math.pi - math.pi
-        row_door = _sample_row(math.atan2(DOOR_H / 2.0 - camera_pos[2], horizontal), height)
-        row_wall = _sample_row(
-            math.atan2(((DOOR_H + 0.1 + self.wall_height - 0.05) / 2.0) - camera_pos[2], horizontal), height)
-        depths = {}
-        for name, row in (("door", row_door), ("wall", row_wall)):
-            depths[name] = self._window_median(camera_pos, lon, row, height)
-        if not (0 < depths["door"] < float("inf") and 0 < depths["wall"] < float("inf")):
-            return None
-        return {"column": column, "horizontal_m": horizontal, "door_depth_m": depths["door"],
-                "wall_depth_m": depths["wall"], "ratio": depths["door"] / depths["wall"]}
+        depth = self._window_median(camera_pos, sight["column"], sight["row"], height)
+        visible = bool(depth >= sight["expected_m"] - CAMERA_DOOR_SIGHT_TOLERANCE_M)
+        sight["depth_m"] = depth
+        sight["visible"] = visible
+        sight["ratio"] = (depth / sight["expected_m"]) if sight["expected_m"] > 0 else None
+        return sight
 
 def door_forecast(model: ShellModel, door: DoorPlan, camera_pos: Sequence[float]) -> Optional[dict]:
-    """The validator's door spot check, pre-computed on the analytic shell."""
+    """The validator's door visibility check, pre-computed on the analytic shell."""
     return model.ray_for_pixel(door, tuple(camera_pos))
+
+
+def door_sight_line(model: ShellModel, door: DoorPlan, camera_pos: Sequence[float]) -> Optional[bool]:
+    """Cheap door sight check for the camera search: centre ray only."""
+    sight = model.door_sight(door, tuple(camera_pos))
+    if sight is None:
+        return None
+    return sight["depth_m"] >= sight["expected_m"] - CAMERA_DOOR_SIGHT_TOLERANCE_M
+
+
+def _walk_z(item: Item) -> Tuple[float, float]:
+    """The Z range ``checks.ItemBox`` sees: a ceiling item is lifted to the top.
+
+    ``Item.z_range`` is the *authored* range, and a ``mount: "ceiling"`` piece
+    keeps ``z = None`` there; ``checks.item_boxes`` lifts it so its top touches
+    the ceiling, and the generator's blocking tests have to do the same or a
+    pendant lamp counts as furniture standing on the floor.
+    """
+    if item.placement == checks_mod.CEILING:
+        z0 = WALL_HEIGHT - item.dims[2]
+        return (z0, z0 + item.dims[2])
+    return item.z_range
 
 
 def _blocks_walking(item: Item) -> bool:
     """Mirror of ``checks.ItemBox.blocks_walking``: does the item block walkers?"""
     if item.placement == checks_mod.FLOOR_FLAT:
         return False
-    return item.z_range[0] < checks_mod.WALK_BAND_M[1] and item.z_range[1] > checks_mod.WALK_BAND_M[0]
+    z0, z1 = _walk_z(item)
+    return z0 < checks_mod.WALK_BAND_M[1] and z1 > checks_mod.WALK_BAND_M[0]
 
 
 def _blocks_camera(item: Item) -> bool:
@@ -1533,30 +2568,31 @@ def _mark_reachable(grid: dict, starts: Sequence[Sequence[float]]) -> None:
 
 
 def _camera_stands(plan: RoomPlan, items: Sequence[Item], grid: dict,
-                   rows: Sequence[float]) -> List[Tuple[float, float]]:
-    """Candidate stands: the walkable grid sampled every ``CAMERA_GRID_M`` in X
-    and on the given door-line rows in Y.
+                   step: float = CAMERA_GRID_M) -> List[Tuple[float, float]]:
+    """Candidate stands: the room's walkable grid, sampled every ``CAMERA_GRID_M``.
 
-    A stand has to sit on a free cell the room's doorway BFS reaches (so the
+    The whole walkable area is sampled, not a band around a common door line: a
+    stand has to sit on a free cell the room's doorway BFS reaches (so the
     circulation check passes), keep ``CAMERA_INSET_M`` off the wall centre lines
-    and ``CAMERA_MIN_GAP_TO_FURNITURE_M`` off every blocking footprint.
+    and ``CAMERA_MIN_GAP_TO_FURNITURE_M`` off every blocking footprint, and what
+    it sees then decides where it goes (see :func:`place_cameras`).
     """
     rect = plan.rect
     blockers = [item for item in items if _blocks_camera(item)]
     stands: List[Tuple[float, float]] = []
-    x = rect.x0 + CAMERA_INSET_M
-    while x <= rect.x1 - CAMERA_INSET_M + 1e-9:
-        for row in rows:
-            point = (round(x, 3), round(row, 3))
-            if not (rect.y0 + CAMERA_INSET_M - 1e-9 <= point[1] <= rect.y1 - CAMERA_INSET_M + 1e-9):
-                continue
+    y = rect.y0 + CAMERA_INSET_M
+    while y <= rect.y1 - CAMERA_INSET_M + 1e-9:
+        x = rect.x0 + CAMERA_INSET_M
+        while x <= rect.x1 - CAMERA_INSET_M + 1e-9:
+            point = (round(x, 3), round(y, 3))
             if _walkable(grid, point[0], point[1], reachable=True):
                 box = (point[0], point[1], point[0], point[1])
                 if checks_mod.wall_gap(box, rect.polygon()) >= CAMERA_INSET_M - 1e-9 and \
                         all(checks_mod.rect_distance(box, item.aabb) >= CAMERA_MIN_GAP_TO_FURNITURE_M - 1e-9
                             for item in blockers):
                     stands.append(point)
-        x += CAMERA_GRID_M
+            x += step
+        y += step
     return stands
 
 
@@ -1688,16 +2724,34 @@ def _camera_score(view: dict) -> float:
             + CAMERA_DOOR_WEIGHT * min(view["door_gap"], CAMERA_DOOR_GAP_M) / CAMERA_DOOR_GAP_M)
 
 
-def _forecast_entry(plan: RoomPlan, door: DoorPlan, pick: dict) -> dict:
-    """One ``door_visual_forecast`` row: the pre-computed door check plus what the
-    stand was picked for."""
+def _forecast_entry(plan: RoomPlan, pick: dict, model: ShellModel) -> dict:
+    """One ``door_visual_forecast`` row: what the stand was picked for, plus the
+    pre-computed visibility of every doorway of the room."""
     view = pick["view"]
     clearance = view["furniture_clearance"]
+    doors = []
+    for door in pick["doors"]:
+        sight = model.ray_for_pixel(door, (pick["pos"][0], pick["pos"][1], CAMERA_Z_M))
+        if sight is None:
+            continue
+        doors.append({
+            "between": [door.a, door.b],
+            "column": sight["column"],
+            "row": sight["row"],
+            "door_distance_m": round(sight["expected_m"], 3),
+            "rendered_depth_m": round(sight["depth_m"], 3),
+            "ratio": None if sight["ratio"] is None else round(sight["ratio"], 3),
+            "visible": bool(sight["visible"]),
+        })
+    seen = sum(1 for door in doors if door["visible"])
     return {
         "room": plan.room_id,
-        "ratio": round(pick["ratio"], 3),
-        "opening0": door.key(),
         "score": round(view["score"], 3),
+        "doors": doors,
+        "doors_visible": seen,
+        "doors_checked": len(doors),
+        "visible_fraction": round(seen / len(doors), 3) if doors else None,
+        "door_sight_score": round(pick["sight"], 3),
         "coverage": {
             "visible_area_fraction": round(view["coverage"], 3),
             "visible_cells": view["visible_cells"],
@@ -1720,51 +2774,46 @@ def _second_camera_entry(entry: dict, pick: dict) -> dict:
 
 def place_cameras(rng: random.Random, plans: Sequence[RoomPlan], doors: Sequence[DoorPlan],
                   items: Sequence[Item], model: ShellModel,
-                  want_second: bool) -> Tuple[List[dict], DoorPlan, dict]:
+                  want_second: bool) -> Tuple[List[dict], Optional[DoorPlan], dict]:
     """Pick 1-2 cameras per room by sampling the walkable area.
 
     Every room contributes at least one camera.  Stands come from the room's
     *walkable grid* (the free-cell lattice of :func:`_walkable_grid`, furniture
     footprints dilated as in :mod:`blender_agent.checks`) and are scored by what
     they see: the share of the walkable floor in unobstructed view, how much of
-    the furniture is visible, the clearance to walls and furniture and the
-    distance to the doorways.  The old rule -- the point closest to the room
-    centre -- put a camera in the middle of the room or in a corner behind the
-    sofa; the view score picks the stand that shows the room.
+    the furniture is visible, the clearance to walls and furniture, the distance
+    to the doorways and whether a doorway is itself on a clear sight line.  The
+    old rule -- the point closest to the room centre -- put a camera in the
+    middle of the room or in a corner behind the sofa; the view score picks the
+    stand that shows the room.
 
-    Two constraints survive from the previous design, because the render
-    validator depends on them:
+    Nothing here is tied to a row any more.  The previous design kept stands in
+    a band around one *common door line* and rejected every stand whose
+    pre-computed door ratio fell below ``DOOR_FORECAST_MIN_RATIO``: that mirror
+    -column forecast only reached a doorway from that band (see
+    :meth:`ShellModel.ray_for_pixel`), so a 2-D plan had no usable stand at all.
+    Door visibility is now a term in the score, not a filter: a room whose
+    doorways are all hidden behind furniture still gets its best stand.
 
-    * a stand only counts when the pre-computed door check
-      (:func:`door_forecast`) still sees the opening at
-      ``DOOR_FORECAST_MIN_RATIO`` -- the validator samples the *mirrored*
-      column of the door direction (see :meth:`ShellModel.ray_for_pixel`), which
-      only reaches the doorway from the band around the door line, hence
-      ``CAMERA_BAND_M``; the opening is chosen to maximise the worst forecast
-      over all cameras;
-    * the second camera in the living room has to stand
-      ``CAMERA_SECOND_MIN_GAP_M`` away from the first and look at the room from a
-      different bearing (``CAMERA_SECOND_MIN_ANGLE_DEG``), so a two-camera room
-      is really seen from two sides.
+    The second camera in the living room has to stand
+    ``CAMERA_SECOND_MIN_GAP_M`` away from the first and look at the room from a
+    different bearing (``CAMERA_SECOND_MIN_ANGLE_DEG``), so a two-camera room is
+    really seen from two sides.
     """
     items_by_room: Dict[str, List[Item]] = {plan.room_id: [] for plan in plans}
     for item in items:
         items_by_room[item.room].append(item)
-    # stands are sampled on the rows around the common door line (half the grid
-    # step apart); the forecast filter below then keeps the ones whose mirrored
-    # column really reaches the doorway
-    door_line = sum(door.center[1] for door in doors) / max(1, len(doors))
-    rows = [door_line + index * CAMERA_GRID_M / 2.0
-            for index in range(-CAMERA_ROW_STEPS, CAMERA_ROW_STEPS + 1)]
     contexts: Dict[str, dict] = {}
     for plan in plans:
         context = _room_camera_context(plan, items_by_room[plan.room_id], doors)
-        context["stands"] = _camera_stands(plan, items_by_room[plan.room_id], context["grid"], rows)
+        context["stands"] = _camera_stands(plan, items_by_room[plan.room_id], context["grid"])
+        context["doors"] = [door for door in doors if plan.room_id in (door.a, door.b)]
         if not context["stands"]:
             raise _AttemptFailed(f"no walkable camera stand in room {plan.room_id}")
         contexts[plan.room_id] = context
 
     views: Dict[Tuple[str, float, float], dict] = {}
+    sights: Dict[Tuple[str, float, float], float] = {}
 
     def view_of(plan: RoomPlan, pos: Sequence[float]) -> dict:
         key = (plan.room_id, pos[0], pos[1])
@@ -1772,78 +2821,67 @@ def place_cameras(rng: random.Random, plans: Sequence[RoomPlan], doors: Sequence
             views[key] = _camera_view(model, plan, contexts[plan.room_id], pos)
         return views[key]
 
-    def feasible(plan: RoomPlan, door: DoorPlan, pos: Sequence[float]):
-        if abs(pos[1] - door.center[1]) > CAMERA_BAND_M + 1e-9:
-            return None
-        forecast = door_forecast(model, door, (pos[0], pos[1], CAMERA_Z_M))
-        ratio = forecast["ratio"] if forecast else 0.0
-        if ratio < DOOR_FORECAST_MIN_RATIO:
-            return None
-        return ratio
+    def sight_of(plan: RoomPlan, pos: Sequence[float]) -> float:
+        """Share of the room's doorways this stand has a clear sight line to."""
+        key = (plan.room_id, pos[0], pos[1])
+        if key not in sights:
+            room_doors = contexts[plan.room_id]["doors"]
+            seen = sum(1 for door in room_doors
+                       if door_sight_line(model, door, (pos[0], pos[1], CAMERA_Z_M)))
+            sights[key] = (seen / len(room_doors)) if room_doors else 0.0
+        return sights[key]
 
-    best_door = None
-    best_worst = None
-    order = list(doors)
-    rng.shuffle(order)  # deterministic tie-break when several openings score alike
-    for door in order:
-        picks: Dict[str, dict] = {}
-        worst = float("inf")
-        for plan in plans:
-            best = None
-            for pos in contexts[plan.room_id]["stands"]:
-                ratio = feasible(plan, door, pos)
-                if ratio is None:
-                    continue
-                # the door sight line decides *whether* a stand is usable, the
-                # view score decides which one is picked
-                value = view_of(plan, pos)["score"] + CAMERA_RATIO_WEIGHT * min(ratio, 3.0)
-                if best is None or value > best["value"] + 1e-9:
-                    best = {"pos": pos, "ratio": ratio, "view": view_of(plan, pos), "value": value}
-            if best is None:
-                picks = {}
-                break
-            picks[plan.room_id] = best
-            worst = min(worst, best["ratio"])
-        if picks and (best_worst is None or worst > best_worst + 1e-9):
-            best_worst = worst
-            best_door = (door, picks)
-    if best_door is None:
-        raise _AttemptFailed("no opening is visible from every camera candidate")
+    def stand_value(plan: RoomPlan, pos: Sequence[float]) -> float:
+        return view_of(plan, pos)["score"] + CAMERA_DOOR_SIGHT_WEIGHT * sight_of(plan, pos)
 
-    door, picks = best_door
+    def best_stand(plan: RoomPlan, candidates, value_fn) -> Optional[dict]:
+        best = None
+        for pos in candidates:
+            value = value_fn(plan, pos)
+            if value is None:
+                continue
+            if best is None or value > best["value"] + 1e-9:
+                best = {"pos": pos, "view": view_of(plan, pos), "sight": sight_of(plan, pos),
+                        "doors": contexts[plan.room_id]["doors"], "value": value}
+        return best
+
     cameras: List[dict] = []
     camera_forecast: Dict[str, dict] = {}
+    picks: Dict[str, dict] = {}
     index = 0
     for plan in plans:
-        pick = picks[plan.room_id]
+        pick = best_stand(plan, contexts[plan.room_id]["stands"], stand_value)
+        if pick is None:
+            raise _AttemptFailed(f"no camera stand in room {plan.room_id}")
+        picks[plan.room_id] = pick
         name = f"{index:04d}"
         index += 1
         cameras.append({"name": name, "room": plan.room_id,
                         "pos": [round(pick["pos"][0], 3), round(pick["pos"][1], 3), CAMERA_Z_M]})
-        camera_forecast[name] = _forecast_entry(plan, door, pick)
+        camera_forecast[name] = _forecast_entry(plan, pick, model)
+
     if want_second:
         living = next((plan for plan in plans if plan.room_type == "living_room"), None)
         if living is not None:
             first = picks[living.room_id]
 
             def second(plan: RoomPlan, min_angle: float) -> Optional[dict]:
-                best = None
-                for pos in contexts[plan.room_id]["stands"]:
+                def value(plan: RoomPlan, pos: Sequence[float]):
                     gap = math.dist(pos, first["pos"])
                     if gap < CAMERA_SECOND_MIN_GAP_M - 1e-9:
-                        continue
-                    ratio = feasible(plan, door, pos)
-                    if ratio is None:
-                        continue
+                        return None
                     view = view_of(plan, pos)
                     angle = _bearing_angle(first["view"]["bearing"], view["bearing"])
                     if angle < min_angle - 1e-9:
-                        continue
-                    value = (view["score"] + CAMERA_SECOND_GAP_WEIGHT * min(gap, 3.0)
-                             + CAMERA_SECOND_ANGLE_WEIGHT * angle / 180.0)
-                    if best is None or value > best["value"] + 1e-9:
-                        best = {"pos": pos, "ratio": ratio, "view": view, "value": value,
-                                "angle": angle, "gap": gap}
+                        return None
+                    return (view["score"] + CAMERA_SECOND_GAP_WEIGHT * min(gap, 3.0)
+                            + CAMERA_SECOND_ANGLE_WEIGHT * angle / 180.0
+                            + CAMERA_DOOR_SIGHT_WEIGHT * sight_of(plan, pos)) * 1.0
+
+                best = best_stand(plan, contexts[plan.room_id]["stands"], value)
+                if best is not None:
+                    best["gap"] = math.dist(best["pos"], first["pos"])
+                    best["angle"] = _bearing_angle(first["view"]["bearing"], best["view"]["bearing"])
                 return best
 
             # a second camera is only worth it if it really looks at the room from
@@ -1854,8 +2892,24 @@ def place_cameras(rng: random.Random, plans: Sequence[RoomPlan], doors: Sequence
                 name = f"{index:04d}"
                 cameras.append({"name": name, "room": living.room_id,
                                 "pos": [round(best["pos"][0], 3), round(best["pos"][1], 3), CAMERA_Z_M]})
-                camera_forecast[name] = _second_camera_entry(_forecast_entry(living, door, best), best)
-    return cameras, door, camera_forecast
+                camera_forecast[name] = _second_camera_entry(
+                    _forecast_entry(living, best, model), best)
+    return cameras, _most_visible_opening(doors, cameras, camera_forecast), camera_forecast
+
+
+def _most_visible_opening(doors: Sequence[DoorPlan], cameras: Sequence[dict],
+                          forecast: Dict[str, dict]) -> Optional[DoorPlan]:
+    """The opening the most cameras see through (a report label, not a rule)."""
+    counts = {door.key(): 0 for door in doors}
+    for camera in cameras:
+        for sight in forecast.get(camera["name"], {}).get("doors", []):
+            key = "|".join(sight["between"])
+            if sight["visible"] and key in counts:
+                counts[key] += 1
+    if not counts:
+        return None
+    best_key = max(counts, key=lambda key: counts[key])
+    return next(door for door in doors if door.key() == best_key)
 
 
 # --------------------------------------------------------------------------- #
@@ -1881,11 +2935,12 @@ def _spec_dict(seed: int, plans: Sequence[RoomPlan], doors: Sequence[DoorPlan],
     return {
         "_comment": [
             f"generated by blender_agent/layout_gen.py --seed {seed}",
-            "a row of axis-aligned rooms (repeated vertical guillotine cuts), one door per",
-            "shared wall on a common door line near the south edge, windows on exterior wall",
-            "spans only, furniture placed by room type with rot_z_deg on the 90 degree grid",
-            "(front faces -Y at 0, see assets.py).  See the layout report for the door",
-            "visibility forecast that the depth validation measures after the render.",
+            "axis-aligned rectangular rooms (one row, or a topology family: 2x2 block, L,",
+            "central living, corridors, loop), doors from a semantic spanning tree over the",
+            "shared walls, windows on exterior wall spans allocated by room function, furniture",
+            "from the asset index plus the builtin: fixtures of blender_agent/fixtures.py with",
+            "rot_z_deg on the 90 degree grid (front faces -Y at 0, see assets.py).  See the",
+            "layout report for the per-camera door visibility forecast the validator measures.",
         ],
         "unit": "meter",
         "wall_height": WALL_HEIGHT,
@@ -1909,22 +2964,45 @@ class Scene:
 
 
 def _build_attempt(rng: random.Random, room_count: Optional[int], index: Dict[str, dict],
-                   attempt: int, seed: int = 0) -> Tuple[dict, dict]:
-    count = room_count or rng.choice([2, 3, 3, 4, 4, 4, 5, 5])
-    count = int(_clamp(count, 2, 5))
-    types = choose_room_types(rng, count)
-    plans = plan_rooms(rng, types)
-    doors = plan_doors(rng, plans)
+                   attempt: int, seed: int = 0, shape: str = "row") -> Tuple[dict, dict]:
+    if shape == "auto":
+        room_count, shape = _pick_auto_shape(rng, room_count)
+    family = ROOM_FAMILIES.get(shape)
+    if family is not None:
+        count = family.count if room_count is None else int(room_count)
+        if family.count != count:
+            raise _AttemptFailed(f"layout '{shape}' needs {family.count} rooms, not {count}")
+    else:
+        count = room_count or rng.choice([2, 3, 3, 4, 4, 4, 5, 5])
+        count = int(_clamp(count, 2, 5))
+    if family is not None:
+        plans = build_family(rng, family)
+        doors = plan_doors_graph(rng, plans, extra_doors=family.extra_doors)
+        semantics = door_semantics(plans, doors)
+        if not semantics["pass"]:
+            raise _AttemptFailed(f"topology {shape}: " + "; ".join(semantics["violations"][:2]))
+    else:
+        types = choose_room_types(rng, count)
+        if shape == "block":
+            plans = plan_rooms_block(rng, types)
+            doors = plan_doors(rng, plans, chain=plans)
+        else:
+            plans = plan_rooms(rng, types)
+            doors = plan_doors(rng, plans)
+        semantics = door_semantics(plans, doors)
     windows = plan_windows(rng, plans)
     items, slot_report = furnish_rooms(rng, plans, doors, windows, index)
     rooms_by_id = {plan.room_id: plan.rect for plan in plans}
     model = ShellModel(rooms_by_id, doors, items)
     want_second = count <= 3
     cameras, opening0, forecast = place_cameras(rng, plans, doors, items, model, want_second)
-    order = [opening0] + [door for door in doors if door is not opening0]
+    order = ([opening0] if opening0 is not None else []) + [door for door in doors if door is not opening0]
     spec = _spec_dict(seed, plans, doors, windows, cameras, items, order)
-    spec["_comment"].append(f"rooms={count} attempt={attempt} furniture={len(items)}")
+    spec["_comment"].append(f"rooms={count} attempt={attempt} furniture={len(items)} shape={shape}")
     report = {
+        "shape": shape,
+        "family": shape if family is not None else None,
+        "door_semantics": semantics,
         "rooms": [{"id": plan.room_id, "type": plan.room_type,
                    "rect": [plan.rect.x0, plan.rect.y0, plan.rect.x1, plan.rect.y1],
                    "area_m2": round(plan.rect.area, 2),
@@ -1942,7 +3020,7 @@ def _build_attempt(rng: random.Random, room_count: Optional[int], index: Dict[st
                        "size_m": [round(v, 3) for v in item.dims], "placement": item.placement,
                        "slot": item.slot, "attached_to": item.attached_to} for item in items],
         "furniture_slots": slot_report,
-        "opening_0": opening0.key(),
+        "opening_0": opening0.key() if opening0 is not None else None,
         "door_visual_forecast": forecast,
     }
     return spec, report
@@ -1950,15 +3028,29 @@ def _build_attempt(rng: random.Random, room_count: Optional[int], index: Dict[st
 
 def generate(seed: int, room_count: Optional[int] = None,
              assets_index: Optional[Dict[str, dict]] = None,
-             attempts: int = MAX_LAYOUT_ATTEMPTS, verbose: bool = True) -> Scene:
-    """Generate one layout; returns the spec dict plus the layout report."""
+             attempts: int = MAX_LAYOUT_ATTEMPTS, verbose: bool = True,
+             shape: str = "row") -> Scene:
+    """Generate one layout; returns the spec dict plus the layout report.
+
+    ``shape`` is ``"row"`` (the default single row), ``"block"`` (the same chain
+    of rooms wrapped into two rows, see :func:`plan_rooms_block`), ``"auto"``
+    (the seed draws the room count and one of :data:`ROOM_FAMILIES`), or any
+    family name -- ``compact_2x2``, ``l_shape``, ``central_living``,
+    ``corridor_single``, ``corridor_double``, ``loop``.
+    """
+    if shape not in ("row", "block", "auto") and shape not in ROOM_FAMILIES:
+        raise ValueError(f"unknown layout shape '{shape}' (row, block, auto or a topology family)")
+    if shape in ROOM_FAMILIES and room_count is not None and \
+            ROOM_FAMILIES[shape].count != room_count:
+        raise ValueError(f"layout '{shape}' has {ROOM_FAMILIES[shape].count} rooms, "
+                         f"--rooms {room_count} does not match")
     index = assets_index if assets_index is not None else checks_mod.load_assets_index()
     started = time.time()
     last_error = "unknown"
     for attempt in range(attempts):
         rng = random.Random(seed * 1000003 + attempt)
         try:
-            spec_dict, report = _build_attempt(rng, room_count, index, attempt, seed)
+            spec_dict, report = _build_attempt(rng, room_count, index, attempt, seed, shape)
             spec = spec_mod.parse_spec(spec_dict)
         except (_AttemptFailed, spec_mod.SpecError) as error:
             last_error = f"{type(error).__name__}: {error}"
@@ -1973,6 +3065,7 @@ def generate(seed: int, room_count: Optional[int] = None,
             "attempt": attempt,
             "attempts_used": attempt + 1,
             "generation_seconds": round(time.time() - started, 3),
+            "shape": shape,
             "rooms": len(spec.rooms),
             "doors": len(spec.openings),
             "windows": len(spec.windows),
@@ -1990,18 +3083,31 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Generate a furnished apartment scene spec from a seed")
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--out", required=True, help="scene_spec JSON to write")
-    parser.add_argument("--rooms", type=int, default=None, help="2..5, default: drawn from the seed")
+    parser.add_argument("--rooms", type=int, default=None,
+                        help="2..7, default: drawn from the seed")
+    parser.add_argument("--shape", default=os.environ.get("PANOWORLD_LAYOUT_SHAPE", "row"),
+                        choices=("row", "block", "auto") + tuple(sorted(ROOM_FAMILIES)),
+                        help="room arrangement: 'row' (one row along +X, default), 'block' (the same "
+                             "chain of rooms wrapped into two rows), 'auto' (the seed draws the room "
+                             "count and a topology family) or a family name: "
+                             + ", ".join(sorted(ROOM_FAMILIES))
+                             + " -- also settable with PANOWORLD_LAYOUT_SHAPE, which is what "
+                               "scripts/layout_gen_run.sh passes through")
     parser.add_argument("--assets-index", default=DEFAULT_ASSETS_INDEX)
     parser.add_argument("--report", default=None, help="layout report (default: next to --out)")
     parser.add_argument("--attempts", type=int, default=MAX_LAYOUT_ATTEMPTS)
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
-    if args.rooms is not None and not 2 <= args.rooms <= 5:
-        parser.error("--rooms must be between 2 and 5")
+    if args.rooms is not None and not 2 <= args.rooms <= 7:
+        parser.error("--rooms must be between 2 and 7")
 
     index = checks_mod.load_assets_index(args.assets_index)
     try:
-        scene = generate(args.seed, args.rooms, index, attempts=args.attempts, verbose=not args.quiet)
+        scene = generate(args.seed, args.rooms, index, attempts=args.attempts,
+                         verbose=not args.quiet, shape=args.shape)
+    except ValueError as error:                 # a room count or shape the CLI cannot honour
+        print(f"[layout_gen] FAILED: {error}", file=sys.stderr)
+        return 2
     except LayoutError as error:
         print(f"[layout_gen] FAILED: {error}", file=sys.stderr)
         return 1

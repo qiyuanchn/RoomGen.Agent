@@ -183,7 +183,11 @@ P0 fields plus optional blocks (a P0 spec keeps working unchanged):
 ```
 
 `mount: "ceiling"` lifts an asset so its top touches the ceiling;
-`builtin:rug` / `builtin:table_lamp` are generated props (`size` = [length, width]).
+`builtin:rug` / `builtin:table_lamp` are generated props (`size` = [length, width]),
+and the functional `builtin:` furniture of `blender_agent/fixtures.py` (kitchen
+run, bathroom set, desk, dining set, wardrobe, ...) is placed the same way -- its
+footprint is the box union the builder emits, so `checks.py` sizes exactly what
+the render shows.
 
 The P3 replay extends the same schema (a P0/P1 spec keeps working unchanged):
 
@@ -192,6 +196,58 @@ The P3 replay extends the same schema (a P0/P1 spec keeps working unchanged):
               "texture_root": "/data/3D-FRONT-textures", "shell": "shell_mesh"},
 "furniture": [{"asset": "front3d:<jid>", "room": "BedRoom-151355", "pos": [5.4, -1.7],
                "z": 0.0, "rot_z_deg": 90.0, "scale_xyz": [1.0, 0.8, 1.1]}]
+```
+
+## Layout generation: topology families and functional furniture
+
+`blender_agent/layout_gen.py` turns a seed into a furnished spec.  The shell is
+a **topology family** -- a small room pattern with seed-drawn cell sizes, so the
+same family gives a different flat for every seed:
+
+| `--shape` | plan |
+|---|---|
+| `row` (default) | the railroad flat: 2-7 rooms in one row along +X |
+| `block` | the same chain wrapped into two rows, an L / block outline |
+| `compact_2x2` | 4 rooms in a 2x2 block (living with the kitchen beside it, bedroom and bathroom behind) |
+| `l_shape` | an L: dining and kitchen together, living below, bathroom off it, bedroom at the end |
+| `central_living` | the living room spans the middle band, rooms open off it north and south (radiating) |
+| `corridor_single` | a hall strip along one side, rooms over it, living closing the end |
+| `corridor_double` | rooms on both sides of a middle hall |
+| `loop` | a circulation ring (living -> hall -> kitchen -> dining -> living) with bedroom and bathroom as leaves |
+| `auto` | the seed draws the room count and one of the families (`PANOWORLD_LAYOUT_SHAPE=auto bash scripts/layout_gen_run.sh <seed> <out>`) |
+
+Rooms are rectangles (a family's outline can be an L); the functional programme
+covers living room, bedroom(s), kitchen, bathroom plus dining, study, entry,
+corridor, storage, laundry and balcony.  The room *type* of a cell follows the
+drawn size, so a small service cell becomes a bathroom and never a 3 m2 bedroom.
+
+**Semantics** (enforced, and reported in `layout_report.json` -> `door_semantics`):
+
+* doors come from a spanning tree over the shared walls scored by function: a
+  corridor serves the rooms, the kitchen opens onto the dining room, and a
+  bedroom is never entered from a kitchen (`DOOR_CLASS_SCORE`);
+* a bathroom has exactly one door -- it is entered, never crossed;
+* with all bedrooms and bathrooms removed the remaining (public) rooms are still
+  connected, so a bedroom is never the public way through the flat (an en-suite
+  bathroom hanging off its bedroom is fine);
+* windows follow the real exterior wall spans *and* the room function: living /
+  bedroom / study / dining get 1-2, kitchens nearly always one, bathrooms and
+  laundries rarely, corridors / storage / entry none.
+
+**Functional furniture** (`blender_agent/fixtures.py`, spec assets
+`builtin:<part>`): a kitchen counter run (cabinet modules, stove, sink) with a
+fridge, wall cupboards above it; a bathroom set (toilet, washbasin, shower
+cabin); desk, chair and bookshelf for the study; dining table with chairs;
+wardrobe, shoe cabinet, storage shelving and a washing machine.  Each fixture
+claims the clear space its use needs -- the fridge door swing, the cook's
+standing spot, the pulled-out desk chair (`usage_m` in the layout report) -- and
+the layout refuses to place blocking furniture there.  A windowless bathroom or
+hall gets a ceiling lamp, because a door alone leaves those rooms black.
+
+```bash
+python blender_agent/layout_gen.py --seed 3 --shape loop --out /tmp/spec.json
+python blender_agent/layout_gen.py --seed 3 --shape auto --rooms 5 --out /tmp/spec.json
+python blender_agent/checks.py /tmp/spec.json          # placement + circulation
 ```
 
 ## Furniture settling (drop to rest)

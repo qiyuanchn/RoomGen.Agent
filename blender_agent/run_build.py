@@ -295,6 +295,22 @@ def place_furniture(spec: spec_mod.SceneSpec, libraries: dict, scene_materials: 
                                    "pos": item.pos, "rot_z_deg": item.rot_z_deg, "z": base_z,
                                    "size_m": [0.22, 0.22, 0.34]})
                 continue
+            # functional furniture (kitchen run, bathroom set, desk ...) built as
+            # box assemblies by blender_agent/fixtures.py; the placement records
+            # the created objects, which is how settle.resolve_targets finds them
+            from blender_agent import fixtures as fixtures_mod
+            if fixtures_mod.is_fixture(kind):
+                base_z = float(item.z or 0.0)
+                objects = fixtures_mod.build(kind, item.pos, item.rot_z_deg, collection,
+                                             name=f"fixture_{name}", base_z=base_z)
+                placements.append({"name": name, "asset": item.asset, "kind": "builtin",
+                                   "pos": item.pos, "rot_z_deg": item.rot_z_deg, "z": base_z,
+                                   "mount": item.mount,
+                                   "size_m": [round(v, 4) for v in fixtures_mod.dims(kind)],
+                                   "bbox_z": [round(base_z, 4),
+                                              round(base_z + fixtures_mod.dims(kind)[2], 4)],
+                                   "objects": [obj.name for obj in objects]})
+                continue
             raise SystemExit(f"[run_build] unknown builtin prop '{kind}'")
         asset_id = item.asset.split(":", 1)[1]
         asset_collection = assets.append_asset(libraries[asset_id], asset_id)

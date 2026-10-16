@@ -70,17 +70,35 @@ builder is the only code that touches Blender, and validators close the loop.
 ## Layout generation (seed → spec)
 
 `blender_agent/layout_gen.py --seed N --out spec.json` turns a seed into a
-furnished spec that passes `checks.py` and the render validator: 2–5 rooms in a
-row (one door per shared wall, all on a common door line near the south edge),
-windows on exterior spans, furniture placed from the asset index by room-type
-templates, and **cameras sampled on the room's walkable grid** — at least one per
-room, scored by what a stand sees (share of the walkable floor in unobstructed
-view, furniture in sight, wall and furniture clearance, distance to the
-doorways).  Small flats get a second living-room camera at least 1.2 m away
-whose bearing differs by ≥ 45°.  Stands stay in the band around the door line
-and ≥ 0.6 m off the furniture — the depth validator samples the *mirrored* door
-column, which only reaches the doorway from there (`blender_agent/layout_gen.py`
-explains why).
+furnished spec that passes `checks.py` and the render validator: 2–7 rooms,
+arranged by a **topology family** — `row` (the default railroad flat), `block`
+(the same chain wrapped into two rows), `compact_2x2`, `l_shape`,
+`central_living` (a radiating plan), `corridor_single` / `corridor_double` and
+`loop` (a circulation ring), or `auto` to let the seed draw the room count and
+the family — doors from a semantic spanning tree over the shared walls
+(kitchen next to dining, bathroom private, bedroom never a public way through),
+windows on exterior spans allocated by room function, furniture from the asset
+index **plus the functional `builtin:` fixtures** (kitchen counter run with
+stove and sink, fridge, bathroom set, desk / chair / bookshelf, dining set —
+each with the clear space its use needs), and **cameras sampled on the room's
+walkable grid** — at least one per room, scored by what a stand sees
+(share of the walkable floor in unobstructed view, furniture in sight, wall and
+furniture clearance, distance to the doorways, and whether a doorway is on a
+clear sight line).  Small flats get a second living-room camera at least 1.2 m
+away whose bearing differs by ≥ 45°; stands stay ≥ 0.6 m off the furniture.
+See `blender_agent/README.md` for the family table and the semantics rules.
+
+Nothing pins doors or cameras to a line any more.  The validator used to locate
+its door sample column with `atan2(dy, dx)`, which under the `R0` convention is
+the *mirror* of the ERP column (a target to the north-east was sampled to the
+south-east), so the generator had to keep every door and camera on one common Y
+for the check to land on the real sight line.  The projection is now derived
+from the camera matrix (`world_to_erp` in `tools/validate_blender_agent_p0.py`,
+and the pure-Python twin in `layout_gen.py`), and the door acceptance is local
+instead: every opening is measured with horizontal rays from both sides of its
+wall — really open, wall really there beside it, width and height against the
+spec — while how many doorways a camera sees through is an informational
+coverage number that never fails a scene.
 
 ```bash
 bash scripts/layout_gen_run.sh 7 outputs/layout_gen/seed7   # spec -> checks -> render -> validate
@@ -116,7 +134,6 @@ PANOWORLD_BATCH_RENDER=1 PANOWORLD_BATCH_RESUME=1 \
 PANOWORLD_BATCH_SUMMARY_ONLY=1 \
   bash scripts/batch_generate.sh 0 100 outputs/stream     # rebuild the table only
 ```
-
 
 ## Layout
 

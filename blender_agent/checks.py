@@ -57,6 +57,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+from blender_agent import fixtures as fixtures_mod  # noqa: E402
 from blender_agent import spec as spec_mod  # noqa: E402
 
 _MERGED_INDEX = os.path.join(REPO_ROOT, "third_party", "assets", "merged_index.json")
@@ -81,6 +82,10 @@ ROOM_REACH_MIN_FRACTION = 0.25
 BUILTIN_DIMS_M: Dict[str, Tuple[float, float, float]] = {
     "builtin:table_lamp": (0.22, 0.22, 0.34),
 }
+# functional furniture (blender_agent/fixtures.py: kitchen run, bathroom set,
+# desk ...) registers its measured parts the same way, so a ``builtin:`` item
+# sizes exactly like the geometry the builder emits
+BUILTIN_DIMS_M.update(fixtures_mod.BUILTIN_DIMS_M)
 RUG_THICKNESS_M = 0.04
 
 FLOOR_FLAT, WALL_HUG, FREE_STAND, CEILING, MOUNTED = (
