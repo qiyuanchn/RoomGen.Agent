@@ -111,7 +111,6 @@ PANOWORLD_BATCH_SUMMARY_ONLY=1 \
   bash scripts/batch_generate.sh 0 100 outputs/stream     # 只重建汇总表
 ```
 
-
 ## 目录结构
 
 ```
