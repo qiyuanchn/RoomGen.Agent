@@ -57,6 +57,11 @@ layout_gen.py ──► scene_spec.json ◄── front3d.py（数据集回放�
                      │
                      ▼
         tools/validate_blender_agent_p0.py  逐像素投射数值校验
+                     │
+                     ▼
+        blender_agent/review.py  空房、功能缺失、悬浮家具、相机贴墙、
+        过曝全景 → review_report.json（附可落地的修复建议）
+        tools/diversity_report.py  结构多样性指标与批量基准
 ```
 
 `scene_spec.json` 是唯一契约：规划层只输出 JSON，构建层是唯一接触 Blender 的代码，校验层闭环反馈。
@@ -93,15 +98,16 @@ bash scripts/batch_generate.sh 0 20 outputs/layout_gen/sweep20
 | `layout_ok` | spec 已生成且 `checks.py` 通过 |
 | `render_ok` | 构建 + 渲染 + 导出产出了完整视点集 |
 | `validation_ok` | `validation_report.json` 在请求分辨率下通过（低于标准 2048x1024 时只允许 `canonical_resolution` 失败） |
-| `bundle_ok` | 本次请求的产物完整：只跑布局时为 `layout_ok`；`PANOWORLD_BATCH_RENDER=1` 时要求上面三层全过 |
+| `review_ok` | `PANOWORLD_REVIEW=1` 时，`blender_agent/review.py` 没有发现 *fail* 级问题（见下节） |
+| `bundle_ok` | 本次请求的产物完整：只跑布局时为 `layout_ok`；`PANOWORLD_BATCH_RENDER=1` 时要求上面三层全过；请求了评审时再加 `review_ok` |
 
 请求了渲染但没跑完的场景记为 `pending_retry`（内存不足）或 `failed`，**不计入
 passed**；`failure_reasons` / `failed_checks` 给出失败原因分布。`layout_gen_run.sh`
-按失败阶段退出（`0` 成功、`2` 布局、`3` 检查、`4` 渲染、`5` 验证），并把 `run_id`
-写进 `run_summary.json`，批次据此拒绝复用旧报告；内存失败会降参重跑一次（分辨率减
-半、`min(samples, 16)`，可用 `PANOWORLD_RETRY_RES` / `PANOWORLD_RETRY_SAMPLES`
-覆盖）。`batch_generate.sh` 只有在所有场景都 `bundle_ok` 时才退出 0；批量中断后可以
-跳过已完成种子继续跑：
+按失败阶段退出（`0` 成功、`2` 布局、`3` 检查、`4` 渲染、`5` 验证、`6` 评审），并把
+`run_id` 写进 `run_summary.json`，批次据此拒绝复用旧报告；内存失败会降参重跑一次
+（分辨率减半、`min(samples, 16)`，可用 `PANOWORLD_RETRY_RES` /
+`PANOWORLD_RETRY_SAMPLES` 覆盖）。`batch_generate.sh` 只有在所有场景都 `bundle_ok`
+时才退出 0；批量中断后可以跳过已完成种子继续跑：
 
 ```bash
 PANOWORLD_BATCH_RENDER=1 bash scripts/batch_generate.sh 0 100 outputs/stream
@@ -109,14 +115,83 @@ PANOWORLD_BATCH_RENDER=1 PANOWORLD_BATCH_RESUME=1 \
   bash scripts/batch_generate.sh 0 100 outputs/stream     # 跳过 bundle_ok 场景
 PANOWORLD_BATCH_SUMMARY_ONLY=1 \
   bash scripts/batch_generate.sh 0 100 outputs/stream     # 只重建汇总表
+PANOWORLD_BATCH_RENDER=1 PANOWORLD_REVIEW=1 \
+  bash scripts/batch_generate.sh 0 20 outputs/stream      # 附带视觉/规则评审
 ```
+
+### 视觉评审与修复闭环
+
+数值校验回答的是*几何*问题；一个场景可以全部通过却依然不适合入库：空厨房、沙发和
+自己重叠、沉降后悬浮的家具、贴进墙里的相机、被窗户冲成一整片白斑的全景。
+`blender_agent/review.py` 读取场景包（`spec.json`、`build/build_manifest.json`、
+`build/settle_report.json`、导出的全景图与深度图），在无模型、无 GPU、无 Blender
+的前提下把这些算出来（单场景几百毫秒）：
+
+| 检查 | 读什么 | 抓什么 |
+|---|---|---|
+| `rooms_furnished` | spec | 可居住房间被留空（灯 + 盆栽不算家具） |
+| `functional_coverage` | spec | 厨房无橱柜/灶台/水槽、卫生间无马桶、卧室无床、客厅无座位 |
+| `no_duplicate_furniture` | spec | 同一资产叠在同一位置；一屋子四件同款 |
+| `camera_clearance` | spec | 相机在墙里、贴在家具上、没有站位 |
+| `furniture_grounding` | manifest + settle | 沉降后悬浮 / 沉地 / 互穿 |
+| `build_matches_spec` | manifest | 构建产物用的不是当前 spec（陈旧构建） |
+| `exposure` | 全景图 + 深度 | 过曝像素比例与最大亮斑、极暗视点 |
+| `camera_framing` | spec | *提示级*：站位背对本房间家具 |
+| `camera_coverage` | spec | 除走廊外的房间没有相机 |
+
+问题分 **fail**（场景不可用）与 **warn**（质量余量）两级，每条都带机器可读的修复
+建议；`review_report.json` 记录逐项细节、支撑数值与建议。外部评审通过 `REVIEW_CMD`
+接入：它会被 `shlex.split` 拆分并追加全景图路径，需要向 stdout 打印一个 JSON 对象
+（`{"pass": ..., "issues": [...]}`）；崩溃或输出非 JSON 只记为
+`external.status: "error"`，不会单独判死场景。
+
+```bash
+python blender_agent/review.py outputs/stream/scene_0007            # 退出 0 通过 / 1 失败
+python blender_agent/review.py outputs/stream/scene_0007 --strict   # warn 也算失败
+python blender_agent/review.py outputs/stream/scene_0007 --apply-repair   # 微调 spec.json
+REVIEW_CMD="mymodel --json" python blender_agent/review.py <outdir>  # 可插拔外部评审
+```
+
+闭环已接进脚本入口：`PANOWORLD_REVIEW=1` 时，渲染前先做一次仅 spec 的评审（很便宜，
+能在花渲染时间之前拦住空房），渲染后做完整评审。评审失败且
+`PANOWORLD_REVIEW_REPAIR=1` 时，`review.py --apply-repair` 把建议落地为 spec 微调
+——用资产索引或 `builtin:` 功能家具补齐空房、把相机移到房间内最优站位——**每个
+候选都会先用 `checks.py` 校验再写入 spec**，随后重新检查、重新渲染、重新评审，只做
+一次。原始 spec 另存为 `spec.pre_review.json`，动作记录在 `review_repair.json`。
+
+### 多样性：这是新户型还是同一条长廊？
+
+`tools/diversity_report.py` 度量一个批次真正覆盖了什么：房间数与类型直方图、
+**带类型的邻接图**（房间*类型*之间的边、环路数，以及忽略家具、尺寸与种子的结构
+哈希）、轮廓长宽比与面积、功能覆盖、各类型房间的家具组合、相机布点与光照。拓扑重复
+按结构哈希分组，因此"同一条长廊换一套家具"只算一种拓扑。
+
+```bash
+python tools/diversity_report.py specs outputs/stream/scene_*/spec.json
+python tools/diversity_report.py seeds --seeds 0-99 --shape auto --out /tmp/div.json
+```
+
+它还带批量基准：先跑满 100 个种子的布局扫描并出多样性统计，再**分层抽样**（每个拓扑
+族至少 1 景，其余优先选能带来新结构哈希的种子）按 1024x512 渲染并评审，汇总成一份
+报告：
+
+```bash
+python tools/diversity_report.py benchmark --seeds 0-99 --sample 10 \
+  --root outputs/benchmark100 --shape auto --resolution 1024x512 --samples 24 --repair
+# -> outputs/benchmark100/{layout,sample}/、diversity.json、report.json
+```
+
+`report.json` 含分级成功率（layout / render / validation / review / bundle）、各阶段
+与单场景耗时、多样性摘要与重复率、抽样名单与抽样原因，以及失败与评审问题分布。
+渲染前若发现另有 `blender` 进程在跑会拒绝启动（`--force` 可覆盖），`--resume`
+会复用已完成场景。
 
 ## 目录结构
 
 ```
-blender_agent/    spec、构建、渲染、导出、布局生成、约束校验
+blender_agent/    spec、构建、渲染、导出、布局生成、约束校验、视觉评审
 scripts/          一键入口（含 fetch_assets.sh 资产下载）
-tools/            资产索引/合并、数值校验
+tools/            资产索引/合并、数值校验、多样性指标与批量基准
 configs/          demo 规格（手写与生成）
 tests/            单元测试 + 端到端测试（含 3D-FRONT 回放 fixture）
 demo/             渲染成品 + 校验报告
@@ -252,6 +327,7 @@ bash  tests/test_front3d_replay.sh                      # 回放端到端
 python tests/test_layout_gen.py                         # 布局生成单元测试
 python tests/test_settle.py                             # 家具物理沉降：单元测试 + 盒子自检
 python tests/test_batch_stats.py                        # 批次分级、退出码、重试与断点续跑
+python tests/test_review.py                             # 评审检查、修复闭环与评审钩子
 bash  scripts/blender_agent_run.sh configs/blender_agent_p0_demo.json outputs/p0
 ```
 

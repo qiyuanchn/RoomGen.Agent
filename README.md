@@ -62,6 +62,11 @@ layout_gen.py ──► scene_spec.json ◄── front3d.py (dataset replay)
                      │
                      ▼
         tools/validate_blender_agent_p0.py  per-pixel raycast validation
+                     │
+                     ▼
+        blender_agent/review.py  empty rooms, missing fixtures, floating
+        furniture, cameras in walls, blown panoramas -> review_report.json
+        (+ spec tweaks it can apply itself)   tools/diversity_report.py
 ```
 
 `scene_spec.json` is the single contract: the planner only emits JSON, the
@@ -100,6 +105,14 @@ wall — really open, wall really there beside it, width and height against the
 spec — while how many doorways a camera sees through is an informational
 coverage number that never fails a scene.
 
+`--floors 2` turns the generator into a **duplex**: two storeys on one
+footprint, each a row of 2–4 rooms, joined by one switchback stair through a
+slab opening.  The spec carries the multi-floor block (`floors`,
+`room.floor_id`, `connectors`, `slab_openings`, world-z furniture/cameras), the
+stair shaft and its walk-off strip are reserved *before* any furniture is
+placed, and `checks.py` validates per storey: the same-floor door graph plus
+the stair link, stair geometry, sloped-headroom and a clear stair mouth.
+
 ```bash
 bash scripts/layout_gen_run.sh 7 outputs/layout_gen/seed7   # spec -> checks -> render -> validate
 bash scripts/batch_generate.sh 0 20 outputs/layout_gen/sweep20
@@ -115,17 +128,19 @@ pass count:
 | `layout_ok` | spec written and `checks.py` passed |
 | `render_ok` | build + render + export produced the complete viewpoint set |
 | `validation_ok` | `validation_report.json` passed at the requested resolution (below the canonical 2048x1024 only `canonical_resolution` may fail) |
-| `bundle_ok` | the run produced what it was asked for: `layout_ok` for a layout-only sweep, all three levels when `PANOWORLD_BATCH_RENDER=1` |
+| `review_ok` | `PANOWORLD_REVIEW=1`: `blender_agent/review.py` found no *failing* issue (see below) |
+| `bundle_ok` | the run produced what it was asked for: `layout_ok` for a layout-only sweep, all three levels when `PANOWORLD_BATCH_RENDER=1`, plus `review_ok` when the review was requested |
 
 A render that was requested but did not complete is `pending_retry` (out of
 memory) or `failed` — never a pass — and `failure_reasons` / `failed_checks`
 carry the distribution.  `layout_gen_run.sh` exits with the failing stage
-(`0` ok, `2` layout, `3` checks, `4` render, `5` validation) and stamps a
-`run_id` into `run_summary.json` so a batch can refuse a stale report; a memory
-failure is retried once at a reduced profile (half resolution, `min(samples,
-16)`; override with `PANOWORLD_RETRY_RES` / `PANOWORLD_RETRY_SAMPLES`).
-`batch_generate.sh` exits 0 only when every scene reached `bundle_ok`, and an
-interrupted run can be finished without repeating completed seeds:
+(`0` ok, `2` layout, `3` checks, `4` render, `5` validation, `6` review) and
+stamps a `run_id` into `run_summary.json` so a batch can refuse a stale report;
+a memory failure is retried once at a reduced profile (half resolution,
+`min(samples, 16)`; override with `PANOWORLD_RETRY_RES` /
+`PANOWORLD_RETRY_SAMPLES`).  `batch_generate.sh` exits 0 only when every scene
+reached `bundle_ok`, and an interrupted run can be finished without repeating
+completed seeds:
 
 ```bash
 PANOWORLD_BATCH_RENDER=1 bash scripts/batch_generate.sh 0 100 outputs/stream
@@ -133,7 +148,89 @@ PANOWORLD_BATCH_RENDER=1 PANOWORLD_BATCH_RESUME=1 \
   bash scripts/batch_generate.sh 0 100 outputs/stream     # skip bundle_ok scenes
 PANOWORLD_BATCH_SUMMARY_ONLY=1 \
   bash scripts/batch_generate.sh 0 100 outputs/stream     # rebuild the table only
+PANOWORLD_BATCH_RENDER=1 PANOWORLD_REVIEW=1 \
+  bash scripts/batch_generate.sh 0 20 outputs/stream      # + the visual review
 ```
+
+### Visual review and the repair loop
+
+The numeric validators answer *geometric* questions, and a scene can pass all
+of them while still being a bad sample: an empty kitchen, a sofa duplicated on
+top of itself, furniture that settled floating, a camera pressed into a wall,
+a window blown out into a white blob.  `blender_agent/review.py` reads the
+package (`spec.json`, `build/build_manifest.json`, `build/settle_report.json`,
+the exported panoramas and depth maps) and computes those without a model, a
+GPU or Blender — a few hundred milliseconds per scene:
+
+| check | reads | catches |
+|---|---|---|
+| `rooms_furnished` | spec | a habitable room left empty (a lamp and a plant are not furniture) |
+| `functional_coverage` | spec | kitchen without counter/stove/sink, bathroom without a toilet, bedroom without a bed, living room without seating |
+| `no_duplicate_furniture` | spec | the same asset placed twice on one spot; four identical repeats in a room |
+| `camera_clearance` | spec | a camera in a wall, on the furniture, or with no stand |
+| `furniture_grounding` | manifest + settle | furniture floating, sunk or interpenetrating after the settle pass |
+| `build_matches_spec` | manifest | a stale build: the render was made from a different spec |
+| `exposure` | panoramas + depth | clipped highlight fractions and blobs, very dark viewpoints |
+| `camera_framing` | spec | *advisory*: the stand faces away from the room's furniture |
+| `camera_coverage` | spec | a room (other than a corridor) without a viewpoint |
+
+Issues are split into **fail** (the scene is unusable) and **warn** (quality
+headroom), each with a machine-readable repair hint; `review_report.json` holds
+the per-check details, the numbers behind them and the hints.  External
+reviewers plug in through `REVIEW_CMD`: it is split with `shlex.split`, gets
+the panorama paths appended, and must print one JSON object
+(`{"pass": ..., "issues": [...]}`); a reviewer that crashes or prints junk is
+recorded as `external.status: "error"` and never fails a scene on its own.
+
+```bash
+python blender_agent/review.py outputs/stream/scene_0007            # exit 0 pass, 1 fail
+python blender_agent/review.py outputs/stream/scene_0007 --strict   # warnings fail too
+python blender_agent/review.py outputs/stream/scene_0007 --apply-repair   # patch spec.json
+REVIEW_CMD="mymodel --json" python blender_agent/review.py <outdir>  # pluggable reviewer
+```
+
+The closed loop is wired into the shell entry points: with
+`PANOWORLD_REVIEW=1` a spec-only review runs *before* the render (cheap, it
+catches an empty room before a render is paid for) and a full review after it.
+When a review fails and `PANOWORLD_REVIEW_REPAIR=1`, `review.py --apply-repair`
+turns its hints into spec tweaks — furnish an empty room from the asset index
+or the `builtin:` fixtures, move a camera stand to the best free spot in its
+room — **validating every candidate with `checks.py` before writing the spec**,
+then the run re-checks, re-renders and re-reviews once.  The original spec is
+kept as `spec.pre_review.json` and the actions are recorded in
+`review_repair.json`.
+
+### Diversity: is this a new house or the same corridor?
+
+`tools/diversity_report.py` measures what a batch actually covers: room count
+and type histogram, the **typed adjacency graph** (edges between room *types*,
+cycle rank and a hash that ignores furniture, size and seed), shape and aspect
+ratio, functional coverage, furniture sets per room type, camera placement and
+lighting.  Topology repeats are grouped by that structure hash, so "the same
+railroad flat with other furniture" is one topology, not two.
+
+```bash
+python tools/diversity_report.py specs outputs/stream/scene_*/spec.json
+python tools/diversity_report.py seeds --seeds 0-99 --shape auto --out /tmp/div.json
+```
+
+It also carries the batch benchmark: a 100-seed layout sweep, the diversity
+statistics over every seed, then a **stratified sample** (at least one scene
+per topology family, then seeds that add a new structure hash) rendered at
+1024x512 with the review enabled, collated into one report:
+
+```bash
+python tools/diversity_report.py benchmark --seeds 0-99 --sample 10 \
+  --root outputs/benchmark100 --shape auto --resolution 1024x512 --samples 24 --repair
+# -> outputs/benchmark100/{layout,sample}/, diversity.json, report.json
+```
+
+`report.json` carries the graded success rates (layout / render / validation /
+review / bundle), wall-clock seconds per stage and per scene, the diversity
+summary with its duplicate rates, the sample and why each seed was drawn, and
+the failure and review-issue distributions.  It refuses to start renders while
+another `blender` process is running (use `--force` to override) and reuses
+completed scenes with `--resume`.
 
 ## Two-storey buildings (multi-floor contract)
 
@@ -214,9 +311,9 @@ flights, no mezzanines, and a ramp that climbs a whole storey needs a long run
 ## Layout
 
 ```
-blender_agent/    spec, builder, render, export, layout generation, checks
+blender_agent/    spec, builder, render, export, layout generation, checks, review
 scripts/          one-command entry points (incl. fetch_assets.sh)
-tools/            asset indexing/merging, numeric validation
+tools/            asset indexing/merging, numeric validation, diversity benchmark
 configs/          demo specs (hand-authored and generated)
 tests/            unit + end-to-end tests (incl. 3D-FRONT replay fixture)
 demo/             rendered scenes + validation reports
@@ -371,6 +468,7 @@ python tests/test_layout_gen.py                         # layout generator units
 python tests/test_settle.py                             # furniture settling units + box self-check
 python tests/test_multifloor.py                         # storey contract, stairs, 2.5D checks, probes
 python tests/test_batch_stats.py                        # batch grading, exit codes, retry, resume
+python tests/test_review.py                             # review checks, repair, the review hooks
 bash  scripts/blender_agent_run.sh configs/blender_agent_p0_demo.json outputs/p0
 ```
 

@@ -100,6 +100,7 @@ PANOWORLD_RES=2048x1024 bash tests/test_front3d_replay.sh   # canonical size
 | `panorama.py` | equirect camera, Position-pass depth, strip/binary PLY export, OIDN pass |
 | `render_selftest.py` | renders emissive markers along known world axes and checks the ERP mapping |
 | `settle.py` | physics settling: rigid bodies + drop-to-rest, bakes the settled transforms (see below) |
+| `review.py` | host: low-cost visual/rule review of a package (`review_report.json`) + the spec repair the review hints imply |
 | `export_glb.py` | Blender-side GLB export for the browser 3D viewer (`run_build.py --export-glb`): `scene.glb` + `scene3d_manifest.json` |
 | `run_build.py` | Blender entry point (build, render, denoise, asset prep, 3D-FRONT replay, GLB export) |
 | `export_scene.py` | host: build output → `scene/viewpoints/<cam>/*`, `map.json`, `topdown.png` |
@@ -247,8 +248,102 @@ hall gets a ceiling lamp, because a door alone leaves those rooms black.
 ```bash
 python blender_agent/layout_gen.py --seed 3 --shape loop --out /tmp/spec.json
 python blender_agent/layout_gen.py --seed 3 --shape auto --rooms 5 --out /tmp/spec.json
+python blender_agent/layout_gen.py --seed 3 --floors 2 --out /tmp/duplex.json   # two storeys
 python blender_agent/checks.py /tmp/spec.json          # placement + circulation
 ```
+
+### Two-floor duplexes (`--floors 2`)
+
+`--floors 2` (also `PANOWORLD_LAYOUT_FLOORS=2` for the scripts) turns the
+generator into a duplex: **two floors on one footprint**, each a row of 2–4
+rooms, joined by one switchback stair through a slab opening.  `--rooms` then
+means the total (4–8, split between the floors) and `--shape` must stay
+`row`/`auto` — the duplex draws its own arrangement.
+
+* **Floor programmes**: floor 1 is the public floor (living room and kitchen
+  always, plus an entrance hall, dining room or bathroom); floor 2 is the
+  sleeping floor — an upstairs **hall** (the stair lands there, which is also
+  what leaves a bed or sofa room to stand beside the shaft), a bedroom, a
+  bathroom, optionally a study or a second bedroom / small living room.  The
+  whole home always has at least one bedroom and one bathroom.
+* **One stair**: a switchback of 16 risers (2.90 m floor-to-floor at 0.18 m a
+  step), 0.95 m wide flights, a 0.85 m half landing, leaning on the south wall
+  inside one room of each storey.  The stair shaft and its walk-off strip are
+  **reserved before any furniture is placed** (`Placer.reserved`), a pendant
+  lamp may hang over the strip but never over the stair itself, and the host
+  room's placements must keep the stair mouth connected to its doorways.
+* **Spec block** (the multi-floor contract of `spec.py`, schema version 2):
+  `floors` with `elevation`/`height`/`slab_thickness`, `room.floor_id`,
+  `connectors` (the stair: kind, rooms, floors, width, run, rise, steps,
+  landing_m, centre and climbing direction), `slab_openings` (the shaft cut out
+  of the upper slab) and world-z furniture/cameras.  Doors and windows stay in
+  the single-floor format, floor-local; wall segments merge per floor only.
+* **Verification**: every duplex must pass `checks.py`'s per-storey rule set
+  (same-floor doors plus the stair link, stair geometry / opening coverage /
+  headroom / clear mouth) *and* `layout_gen.check_duplex_spec`, the
+  generator-side twin that additionally pins the programme, the world-z rules,
+  furniture outside the reserved shaft and reachability from the entrance.
+
+```bash
+PANOWORLD_LAYOUT_FLOORS=2 bash scripts/layout_gen_run.sh 3 outputs/layout_gen/duplex3
+python blender_agent/layout_gen.py --seed 3 --floors 2 --out /tmp/duplex.json
+python blender_agent/checks.py /tmp/duplex.json        # per-storey + stairs, exit 0
+```
+
+## Visual review (`review.py`)
+
+`checks.py` and the render validator answer geometric questions; `review.py`
+answers the "would a person keep this sample?" ones.  It is host-side and
+cheap (no Blender, no model, no GPU; a few hundred ms per scene) and reads what
+the pipeline already wrote:
+
+* **spec scope** -- `rooms_furnished` (a habitable room holding only a lamp and
+  a plant is *empty*), `functional_coverage` (kitchen without a counter, stove
+  or sink; bathroom without a toilet; bedroom without a bed; living room
+  without seating; study without a desk or shelving), `no_duplicate_furniture`
+  (the same asset twice on one spot, or four identical repeats in a room),
+  `camera_clearance` (a stand in a wall, on the furniture, or inside its
+  comfort band: `checks.py` allows 0.10 m, the review warns under 0.35 m),
+  `camera_framing` (advisory -- a panorama sees the whole sphere, so a stand
+  facing the emptiest side of its room is a quality note, not a defect), and
+  `camera_coverage` (a room other than a corridor without a viewpoint);
+* **build scope** -- `furniture_grounding` reads `furniture[i].settle` from
+  `build/build_manifest.json` and flags a piece that settled more than 2 cm up
+  (warn) / 5 cm up or 2 cm down (fail) or is still interpenetrating, with
+  `builtin:rug`-style floor finish and ceiling/wall mounts exempt;
+  `build_matches_spec` fails a build whose manifest carries a *different* spec
+  (the stale-build trap after a repair);
+* **render scope** -- `exposure` decodes every `panoImage_2048.png`,
+  measures the clipped-pixel fraction and the largest clipped blob (35 % / 25 %
+  fails, 15 % / 8 % warns -- shipped scenes sit at 0-25 %), and warns on a very
+  dark viewpoint; the depth maps add median depth and the near-content share of
+  the horizon band as context;
+* **external** -- `REVIEW_CMD` (env) is split with `shlex.split`, gets the
+  panorama paths appended and must print one JSON object; a broken hook is
+  reported as `external.status: "error"` and never fails a scene by itself.
+
+`--strict` promotes warnings to failures.  Every issue carries a `repair` hint,
+and `--apply-repair` applies the ones that are safe as **spec tweaks**:
+
+```bash
+python blender_agent/review.py outputs/stream/scene_0007             # report + exit code
+python blender_agent/review.py outputs/stream/scene_0007 --spec-only # no build/render reads
+python blender_agent/review.py outputs/stream/scene_0007 --apply-repair
+```
+
+* `add_furniture` -- a fixture (or an index asset from the matching
+  `layout_gen` slot: sofa for the living room, bed for the bedroom) placed
+  against a wall of the empty room, keeping the clear space its use needs;
+* `move_camera` -- the best free stand in the room (furniture in front, off the
+  walls, 0.60 m from the furniture, clear of the door zones);
+* `reduce_exposure` -- a blown-out panorama lowers `style.exposure` a little.
+
+Each candidate is validated with `checks.check_spec` *before* the spec is
+written, so a repair can never publish a layout the placement checks reject;
+the previous spec is kept as `spec.pre_review.json`, the actions are recorded
+in `review_repair.json`, and `scripts/layout_gen_run.sh` drives the loop
+(`PANOWORLD_REVIEW=1`, plus `PANOWORLD_REVIEW_REPAIR=1` for one repair retry,
+graded as `review_ok` in the summary and exit code 6 when it fails).
 
 ## Furniture settling (drop to rest)
 
@@ -338,6 +433,9 @@ sunk is reported in `report.checks.violations`.
   (`front3d.window_lights`), which is what lights a dataset room: its shell has
   no `windows` entries for the spec-driven portal code to use.
 * Lamps (pendant + table) carry a point light; shades have a slight emission.
+  The point-light wattage is `lighting.lamp_w`, **12 W** by default: at the old
+  8 W the windowless service rooms (bathroom, hall, storage) rendered visibly
+  dark even with their pendant on.
 * The enclosing **sky dome** is what a camera sees through a window and what
   guarantees no ray escapes to the world background (that would leave invalid
   depth pixels).  It is invisible to shadow/diffuse rays, so the room is lit by
