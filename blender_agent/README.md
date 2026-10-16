@@ -128,7 +128,14 @@ out. `--skip-render --export-glb` is the fast (geometry only) path, and
 
 `furnished.ply` is the ground truth for the depth check: the validator raycasts
 every ERP ray against it and compares with `place_depth.png / scale`
-(valid ≥ 99.5 %, median |Δ| < 5 mm, p95 < 2 cm, door-opening spot check).
+(valid ≥ 99.5 %, median |Δ| < 5 mm, p95 < 2 cm).  Doors are checked separately
+and per opening: `shell.ply` is measured with horizontal rays cast from both
+sides of every wall, so each doorway has to be really open, really surrounded by
+wall, and as wide and as high as the spec says (`door_openings_geometry`).
+Which doorways a camera sees through is projected into the ERP frame with the
+camera matrix inverse (`world_to_erp`) and reported as
+`door_visibility_coverage` -- an informational metric: reasonable occlusion is a
+number there, not a scene failure.
 
 ## Assets (Poly Haven, CC0)
 

@@ -9,9 +9,18 @@ Checks, in order:
 2. image / depth / extrinsics formats and value ranges
 3. camera poses match the spec exactly
 4. **depth numerics**: for every camera, all ERP rays are cast against
-   ``build/shell.ply`` and compared with ``place_depth.png / scale``
-5. the door opening is deeper than the wall next to it in the same column
-6. ``map.json`` is a symmetric graph over the supplied cameras
+   ``build/furnished.ply`` (the manifest's ``visible_geometry``) and compared
+   with ``place_depth.png / scale``
+5. **door geometry**, per opening and independent of the cameras: local rays
+   from *both* sides of every door measure the hole in the wall (is it really
+   open, is the wall really there beside it, is the opening as wide and as high
+   as the spec says) -- see :func:`check_door_openings`
+6. **door visibility coverage** (informational, never fails a scene): for every
+   camera the doors of its own room are projected into the ERP frame with the
+   matrix-inverse projection of :func:`world_to_erp` and compared with the
+   rendered depth, so a scene report says how many doorways each viewpoint
+   actually sees through; reasonable occlusion is a number here, not a verdict
+7. ``map.json`` is a symmetric graph over the supplied cameras
 
 Ground truth ray casting note: trimesh's own ``RayMeshIntersector`` needs the
 optional ``rtree`` package, which is not part of this environment.  The caster
@@ -27,7 +36,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import sys
 import time
@@ -316,8 +324,10 @@ class MeshRayCaster:
         for start in range(0, candidates.size, step):
             index = candidates[start : start + step]
             t_exit = t_sphere[index]
-            points = origins[index] + directions[index] * t_exit[:, None]
             bad = ~np.isfinite(t_exit)
+            points = np.empty_like(origins[index])
+            good = ~bad
+            points[good] = origins[index][good] + directions[index][good] * t_exit[good, None]
             if bad.any():
                 points[bad] = self.sphere_center[None, :] + directions[index][bad] * self.sphere_radius
             _, neighbours = self.facet_tree.query(points, k=self.facet_k)
@@ -435,15 +445,47 @@ def erp_rays(c2w: np.ndarray, width: int, height: int):
     return origins, directions / norms
 
 
+def world_to_erp(points, c2w: np.ndarray, width: int, height: int):
+    """World point(s) -> ERP pixel coordinates ``(u, v)`` and camera distance.
+
+    The inverse of :func:`erp_rays`, and the only place in the repo where a
+    world direction becomes a panorama column: a pixel centre ``(u, v)`` shoots
+    the ray ``R @ (cos(lat) sin(lon), -sin(lat), cos(lat) cos(lon))``, so the
+    point is transformed into the camera frame with ``R.T`` (the rotation is
+    orthonormal) and ``lon``/``lat`` are read off that local vector.  Nothing
+    here re-states the sign convention by hand, which is what the old
+    ``atan2(dy, dx)`` column did -- mirrored about the camera's +X axis under
+    the ``R0`` convention of ``spec.py`` (a target to the north-east was
+    sampled to the south-east, a target to the north to the south).
+
+    Returns ``(u, v, depth)``: fractional pixel coordinates (``x = u`` is the
+    column, ``y = v`` the row, both counted from 0 with the pixel *centre* at
+    ``round(u)``) and the straight-line distance from the camera.
+    """
+    points = np.atleast_2d(np.asarray(points, dtype=np.float64))
+    c2w = np.asarray(c2w, dtype=np.float64)
+    local = (points - c2w[:3, 3]) @ c2w[:3, :3]
+    depth = np.linalg.norm(local, axis=1)
+    lon = np.arctan2(local[:, 0], local[:, 2])
+    lat = np.arctan2(-local[:, 1], np.hypot(local[:, 0], local[:, 2]))
+    u = (lon + np.pi) / (2.0 * np.pi) * width - 0.5
+    v = (np.pi / 2.0 - lat) / np.pi * height - 0.5
+    return u, v, depth
+
+
+def erp_pixel_of_point(point, c2w: np.ndarray, width: int, height: int):
+    """``(column, row, distance)`` of one world point, with the seam wrapped."""
+    u, v, depth = world_to_erp([point], c2w, width, height)
+    column = int(round(float(u[0]))) % width
+    row = int(round(float(v[0])))
+    return column, row, float(depth[0])
+
+
 def read_depth_meters(path: str, scale: float):
     array = np.array(Image.open(path))
     if array.dtype != np.uint16:
         raise ValueError(f"{path}: expected uint16 PNG, got {array.dtype}")
     return array.astype(np.float64) / scale, array > 0
-
-
-def lat_row_to_pixel(lat_rad: float, height: int) -> float:
-    return (math.pi / 2.0 - lat_rad) / math.pi * height - 0.5
 
 
 def resolve_render_size(build_dir: str) -> tuple:
@@ -458,56 +500,206 @@ def resolve_render_size(build_dir: str) -> tuple:
     return spec_mod.PANO_WIDTH, spec_mod.PANO_HEIGHT
 
 
-def door_spot_check(spec: spec_mod.SceneSpec, camera: spec_mod.CameraSpec, rendered: np.ndarray) -> dict:
-    """Compare the depth through the door with the wall above it, same column."""
-    opening = spec.openings[0] if spec.openings else None
-    if opening is None:
-        return {"pass": True, "skipped": "spec has no openings"}
-    segment = spec_mod.wall_segment_for_point(spec.wall_segments(), opening.center, opening.between[0])
-    if segment is None:
-        return {"pass": True, "skipped": "door wall segment not found"}
-    height, width = rendered.shape
-    cam = np.array(camera.pos, dtype=np.float64)
-    direction = np.array(segment.direction, dtype=np.float64)
-    normal = np.array([-direction[1], direction[0]])
-    door = np.array(opening.center, dtype=np.float64)
+def check_door_openings(spec: spec_mod.SceneSpec, caster, probe_m: float = 0.35,
+                        step_m: float = 0.02, width_tol_m: float = 0.06,
+                        height_tol_m: float = 0.08) -> dict:
+    """Geometry acceptance for **every** opening, measured with local rays.
 
-    to_door = door - cam[:2]
-    length = float(np.linalg.norm(to_door))
-    if length < 1e-6:
-        return {"pass": True, "skipped": "camera sits on the door centre"}
-    unit = to_door / length
-    denominator = float(np.dot(unit, normal))
-    if abs(denominator) < 1e-6:
-        return {"pass": True, "skipped": "camera looks along the door wall"}
-    # horizontal distance from the camera to the wall plane along this column
-    horizontal = float(np.dot(door - cam[:2], normal)) / denominator
+    A door is a hole through a wall, so the acceptance is local and needs no
+    camera: stand ``probe_m`` in front of the wall on *each* side of the opening
+    and cast horizontal rays perpendicular to it.
 
-    column = int(round((math.atan2(to_door[1], to_door[0]) + math.pi) / (2 * math.pi) * width - 0.5))
-    column = column % width
+    * rays that cross the declared opening must leave the wall slab on the far
+      side (``hit >= probe + thickness / 2``) -- the hole is really open, i.e.
+      the ray travels *through* the wall instead of into it;
+    * rays that cross the wall beside the opening must stop *inside* the slab
+      (the wall is really there, so the opening is not a missing wall);
+    * scanning the two axes measures the opening: the contiguous open run along
+      the wall is its width, the open run from the floor up is its height, and
+      both are compared with the spec.
 
-    def depth_at(lat_deg: float) -> float:
-        row = int(round(lat_row_to_pixel(math.radians(lat_deg), height)))
-        row = max(2, min(height - 3, row))
-        col = max(2, min(width - 3, column))
-        return float(np.median(rendered[row - 2 : row + 3, col - 2 : col + 3]))
+    This replaces the old spot check (``spec.openings[0]`` against every camera,
+    one column each, ``door_depth > 1.5 * wall_depth``): a door sealed in another
+    wall was never looked at, and the ratio itself was meaningless for a real
+    2-D plan (a camera looking along a corridor measures the far wall, not the
+    wall above the door).
+    """
+    half = float(spec.wall_thickness) / 2.0
+    t_enter, t_exit = probe_m - half, probe_m + half
+    segments = spec.wall_segments()
+    doors: list = []
 
-    door_z_min, door_z_max = 0.05, opening.height - 0.05
-    lat_door = math.degrees(math.atan2(((door_z_min + door_z_max) / 2.0) - cam[2], horizontal))
-    wall_z_min, wall_z_max = opening.height + 0.1, spec.wall_height - 0.05
-    lat_wall = math.degrees(math.atan2(((wall_z_min + wall_z_max) / 2.0) - cam[2], horizontal))
-    door_depth = depth_at(lat_door)
-    wall_depth = depth_at(lat_wall)
-    ok = door_depth > 1.5 * wall_depth and door_depth > 0.0 and wall_depth > 0.0
+    for index, opening in enumerate(spec.openings):
+        report: dict = {
+            "index": index,
+            "between": list(opening.between),
+            "center": [float(opening.center[0]), float(opening.center[1])],
+            "spec_width_m": float(opening.width),
+            "spec_height_m": float(opening.height),
+        }
+        segment = spec_mod.wall_segment_for_point(segments, opening.center, opening.between[0])
+        if segment is None:
+            report.update({"pass": False, "failures": ["opening centre is not on a wall shared by both rooms"]})
+            doors.append(report)
+            continue
+
+        direction = np.array(segment.direction, dtype=np.float64)
+        normal = np.array([-direction[1], direction[0]], dtype=np.float64)
+        centre = np.array([float(opening.center[0]), float(opening.center[1])], dtype=np.float64)
+        width, height = float(opening.width), float(opening.height)
+        failures: list = []
+
+        # which side of the wall each room is on (the ray probe has to stand
+        # inside that room, so the sign comes from the room polygon itself)
+        probe_sign = {}
+        for room_id in opening.between:
+            probe_sign[room_id] = 1.0 if spec_mod.point_in_polygon(
+                centre + normal * probe_m, spec.room(room_id).polygon) else -1.0
+        if probe_sign[opening.between[0]] == probe_sign[opening.between[1]]:
+            probe_sign = {opening.between[0]: 1.0, opening.between[1]: -1.0}
+
+        def offset_ray(along: float, z: float, side: float):
+            origin = np.array([centre[0] + direction[0] * along + normal[0] * side * probe_m,
+                               centre[1] + direction[1] * along + normal[1] * side * probe_m, z])
+            return origin, np.array([-normal[0] * side, -normal[1] * side, 0.0])
+
+        def cast(samples):
+            origins = np.array([item[0] for item in samples], dtype=np.float64)
+            directions = np.array([item[1] for item in samples], dtype=np.float64)
+            return caster.cast(origins, directions, chunk=8192)
+
+        def longest_open_run(mask) -> tuple:
+            best, start = None, None
+            for position, is_open in enumerate(mask):
+                if is_open and start is None:
+                    start = position
+                if start is not None and (not is_open or position == len(mask) - 1):
+                    end = position if is_open else position - 1
+                    if best is None or end - start > best[1] - best[0]:
+                        best = (start, end)
+                    start = None
+            return best
+
+        z_scan = min(max(height / 2.0, 0.45), height - 0.15, float(spec.wall_height) - 0.15)
+        along_scan = np.arange(-(width / 2.0 + 0.5), width / 2.0 + 0.5 + 1e-9, step_m)
+        z_values = np.arange(0.10, float(spec.wall_height) - 0.05 + 1e-9, step_m)
+
+        measured_widths, measured_heights = [], []
+        for room_id in opening.between:
+            side = probe_sign[room_id]
+            through = [offset_ray(along, z, side)
+                       for z in np.linspace(0.10, max(0.10, height - 0.10), 5)
+                       for along in np.linspace(-(width / 2.0 - 0.05), width / 2.0 - 0.05, 7)]
+            open_fraction = float(np.mean(cast(through) >= t_exit - 1e-4))
+
+            beside = [offset_ray(along, z, side)
+                      for along in (-(width / 2.0 + 0.15), width / 2.0 + 0.15)
+                      for z in (0.6, z_scan)]
+            beside_hits = cast(beside)
+            solid_fraction = float(np.mean((beside_hits >= t_enter - 1e-4) & (beside_hits <= t_exit + 1e-3)))
+
+            run = longest_open_run(cast([offset_ray(along, z_scan, side) for along in along_scan]) >= t_exit - 1e-4)
+            if run is None:
+                measured_width, centre_offset = 0.0, None
+            else:
+                measured_width = float((run[1] - run[0] + 1) * step_m)
+                low, high = along_scan[run[0]] - step_m / 2.0, along_scan[run[1]] + step_m / 2.0
+                centre_offset = float((low + high) / 2.0)
+                if not low <= 0.0 <= high:
+                    failures.append(f"{room_id}: the open run at z={z_scan:.2f} m does not contain the door centre")
+            measured_widths.append(measured_width)
+
+            open_z = cast([offset_ray(0.0, z, side) for z in z_values]) >= t_exit - 1e-4
+            if not open_z[0]:
+                failures.append(f"{room_id}: the opening does not reach the floor (first sample at "
+                                f"z={z_values[0]:.2f} m is wall)")
+            top = 0.0
+            for value, is_open in zip(z_values, open_z):
+                if not is_open:
+                    break
+                top = float(value)
+            measured_height = (top + step_m / 2.0) if top > 0.0 else 0.0
+            measured_heights.append(measured_height)
+
+            report.setdefault("sides", {})[room_id] = {
+                "probe_sign": side,
+                "open_fraction": round(open_fraction, 4),
+                "wall_solid_fraction": round(solid_fraction, 4),
+                "open_width_m": round(measured_width, 3),
+                "open_height_m": round(measured_height, 3),
+                "width_centre_offset_m": None if centre_offset is None else round(centre_offset, 3),
+            }
+            if open_fraction < 0.98:
+                failures.append(f"{room_id}: only {open_fraction * 100:.1f}% of the rays through the declared "
+                                f"opening leave the wall slab (the opening is not open)")
+            if solid_fraction < 0.95:
+                failures.append(f"{room_id}: {100 * (1 - solid_fraction):.1f}% of the rays beside the opening do "
+                                f"not stop inside the wall (the wall is missing next to the door)")
+            if abs(measured_width - width) > width_tol_m:
+                failures.append(f"{room_id}: measured opening width {measured_width:.2f} m vs spec {width:.2f} m")
+            if abs(measured_height - height) > height_tol_m:
+                failures.append(f"{room_id}: measured opening height {measured_height:.2f} m vs spec {height:.2f} m")
+
+        report["measured_width_m"] = round(sum(measured_widths) / len(measured_widths), 3)
+        report["measured_height_m"] = round(sum(measured_heights) / len(measured_heights), 3)
+        report["pass"] = not failures
+        report["failures"] = failures
+        doors.append(report)
+
     return {
-        "pass": bool(ok),
-        "column": int(column),
-        "wall_distance_m": horizontal,
-        "door_row": int(round(lat_row_to_pixel(math.radians(lat_door), height))),
-        "wall_row": int(round(lat_row_to_pixel(math.radians(lat_wall), height))),
-        "door_depth_m": door_depth,
-        "wall_depth_m": wall_depth,
-        "ratio": (door_depth / wall_depth) if wall_depth > 0 else None,
+        "pass": all(door["pass"] for door in doors),
+        "openings": len(doors),
+        "probe_m": probe_m,
+        "wall_half_thickness_m": half,
+        "doors": doors,
+    }
+
+
+def door_visibility_check(spec: spec_mod.SceneSpec, camera: spec_mod.CameraSpec,
+                          rendered: np.ndarray, c2w: np.ndarray) -> dict:
+    """Informational: which of the camera's own doors does it see through?
+
+    Every door of the camera's room is projected into the ERP frame by
+    :func:`world_to_erp` (matrix inverse -- no hand-written column arithmetic)
+    and the rendered depth at that pixel is compared with the distance to the
+    door plane: a sight line that really passes through the opening arrives
+    *behind* the door plane, an occluded one arrives in front of it.  The result
+    is a coverage number, so reasonable occlusion (furniture between the camera
+    and the doorway) is reported instead of failing the scene.
+    """
+    height, width = rendered.shape
+    doors = [opening for opening in spec.openings if camera.room in opening.between]
+    if not doors:
+        return {"role": "informational", "pass": True, "skipped": "camera room has no opening"}
+    entries = []
+    for index, opening in enumerate(doors):
+        z_sample = float(min(max(opening.height / 2.0, 0.30), opening.height - 0.10))
+        point = np.array([float(opening.center[0]), float(opening.center[1]), z_sample])
+        column, row, distance = erp_pixel_of_point(point, c2w, width, height)
+        column = max(2, min(width - 3, column))
+        row = max(2, min(height - 3, row))
+        measured = float(np.median(rendered[row - 2:row + 3, column - 2:column + 3]))
+        entries.append({
+            "between": list(opening.between),
+            "opening": index,
+            "column": int(column),
+            "row": int(row),
+            "door_distance_m": round(distance, 3),
+            "rendered_depth_m": round(measured, 3),
+            "ratio": round(measured / distance, 3) if distance > 0 else None,
+            "visible": bool(measured > 0.0 and measured >= distance - 0.10),
+        })
+    seen = sum(1 for entry in entries if entry["visible"])
+    best = max(entries, key=lambda entry: entry["ratio"] or 0.0)
+    return {
+        "role": "informational",
+        "pass": True,
+        "doors": entries,
+        "visible": seen,
+        "of": len(entries),
+        "visible_fraction": round(seen / len(entries), 3),
+        "ratio": best["ratio"],
+        "note": "occlusion is a coverage number here; the scene gate is door_openings_geometry",
     }
 
 
@@ -596,6 +788,7 @@ def main(argv=None) -> int:
     mesh = None
     caster = None
     ply_path = None
+    shell_ply_path = os.path.join(build_dir, "shell.ply")
     manifest_path = os.path.join(build_dir, "build_manifest.json")
     if os.path.isfile(manifest_path):
         with open(manifest_path, "r", encoding="utf-8") as handle:
@@ -603,17 +796,23 @@ def main(argv=None) -> int:
         candidate = (build_manifest.get("visible_geometry") or {}).get("ply")
         if candidate:
             ply_path = os.path.join(build_dir, candidate)
+        shell_candidate = (build_manifest.get("shell") or {}).get("ply")
+        if shell_candidate:
+            shell_ply_path = os.path.join(build_dir, shell_candidate)
     if ply_path is None or not os.path.isfile(ply_path):
         ply_path = os.path.join(build_dir, "shell.ply")
-    depth_reports = []
-    if os.path.isfile(ply_path):
+    def load_caster(path: str):
         import trimesh
 
-        mesh = trimesh.load(ply_path)
-        if hasattr(mesh, "geometry"):
-            mesh = trimesh.util.concatenate(list(mesh.geometry.values()))
-        hint = np.array([cam.pos for cam in cameras], dtype=np.float64)
-        caster = MeshRayCaster(mesh, hint)
+        loaded = trimesh.load(path)
+        if hasattr(loaded, "geometry"):
+            loaded = trimesh.util.concatenate(list(loaded.geometry.values()))
+        return loaded, MeshRayCaster(loaded, np.array([cam.pos for cam in cameras], dtype=np.float64))
+
+    depth_reports = []
+    door_visibility = {}
+    if os.path.isfile(ply_path):
+        mesh, caster = load_caster(ply_path)
 
     for camera in cameras:
         view_dir = os.path.join(scene_dir, "viewpoints", camera.name)
@@ -638,8 +837,11 @@ def main(argv=None) -> int:
         p95 = float(np.percentile(error, 95)) if error.size else float("nan")
         worst = float(error.max()) if error.size else float("nan")
 
-        spot = door_spot_check(spec, camera, rendered)
-        passed = valid_fraction >= 0.995 and median < 0.005 and p95 < 0.02 and spot["pass"]
+        # informational: does this camera see through the doorways of its room?
+        visibility = door_visibility_check(spec, camera, rendered, c2w)
+        door_visibility[camera.name] = visibility
+
+        passed = valid_fraction >= 0.995 and median < 0.005 and p95 < 0.02
         depth_reports.append(
             {
                 "camera": camera.name,
@@ -652,7 +854,7 @@ def main(argv=None) -> int:
                 "p95_error_m": p95,
                 "max_error_m": worst,
                 "cast_seconds": round(seconds, 2),
-                "door_spot_check": spot,
+                "door_spot_check": visibility,
                 "pass": bool(passed),
             }
         )
@@ -660,7 +862,7 @@ def main(argv=None) -> int:
             f"[validate] camera {camera.name}: valid={valid_fraction * 100:.3f}% "
             f"median|d|={median * 1000:.3f}mm p95|d|={p95 * 1000:.3f}mm max|d|={worst * 1000:.1f}mm "
             f"invalid_render={int(invalid_render.sum())} miss={int(invalid_truth.sum())} "
-            f"door/wall={spot.get('door_depth_m', float('nan')):.2f}/{spot.get('wall_depth_m', float('nan')):.2f}m "
+            f"doors_visible={visibility.get('visible', '?')}/{visibility.get('of', '?')} "
             f"({seconds:.1f}s)"
         )
 
@@ -672,6 +874,40 @@ def main(argv=None) -> int:
         cameras=depth_reports,
         ply=os.path.relpath(ply_path, REPO_ROOT) if os.path.isfile(ply_path) else None,
     )
+
+    # ---- 5: door geometry, every opening, both sides ---------------------- #
+    # The doors are measured on the *shell* (walls and their cuts), not on the
+    # furnished scene: the question here is the wall contract (open hole, wall
+    # thickness, opening size), and furniture is ``checks.py``'s and the
+    # visibility metric's business.
+    door_ply_path = shell_ply_path if os.path.isfile(shell_ply_path) else ply_path
+    if not spec.openings:
+        record("door_openings_geometry", True, skipped="spec has no openings")
+    elif door_ply_path is None or not os.path.isfile(door_ply_path):
+        record("door_openings_geometry", False, error="no PLY with the shell geometry to measure the doors")
+    else:
+        if door_ply_path == ply_path and caster is not None:
+            door_caster = caster
+        else:
+            _door_mesh, door_caster = load_caster(door_ply_path)
+        doors = check_door_openings(spec, door_caster)
+        for door in doors["doors"]:
+            print(f"[validate] door {door['index']} {door['between']}: "
+                  f"{'PASS' if door['pass'] else 'FAIL'} "
+                  f"width={door.get('measured_width_m', float('nan')):.2f}m "
+                  f"height={door.get('measured_height_m', float('nan')):.2f}m"
+                  + (f" -- {door['failures'][0]}" if door.get("failures") else ""))
+        record("door_openings_geometry", doors["pass"],
+               ply=os.path.relpath(door_ply_path, REPO_ROOT), **doors)
+        del door_caster
+
+    # ---- 6: door visibility coverage (informational, never gates) --------- #
+    seen = sum(entry.get("visible", 0) for entry in door_visibility.values())
+    pairs = sum(entry.get("of", 0) for entry in door_visibility.values())
+    record("door_visibility_coverage", True, role="informational",
+           cameras=door_visibility, doors_visible=seen, doors_checked=pairs,
+           visible_fraction=round(seen / pairs, 3) if pairs else None,
+           note="per-camera door visibility; reasonable occlusion is a number here, not a failure")
 
     # ---- caster cross-check ---------------------------------------------- #
     cross = {"available": bool(caster is not None)}
