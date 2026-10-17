@@ -1847,11 +1847,14 @@ def _print_success(payload: dict) -> None:
              views.get("rooms_without_camera"),
              views.get("scene_visible_area_fraction")))
     quality = payload["success"].get("quality") or {}
-    print("quality        : review %s/%s passed (score mean %s), validation %s at resolution, "
-          "degraded %s"
-          % (quality.get("review_passed"), quality.get("reviewed"),
+    rendered = payload["levels"].get("render_ok") is not None
+    print("quality        : review %s (score mean %s), validation %s, degraded %s"
+          % ("%s/%s passed" % (quality.get("review_passed"), quality.get("reviewed"))
+             if quality.get("reviewed") else "not run",
              (quality.get("review_score") or {}).get("mean"),
-             quality.get("validation_passed_at_resolution"), quality.get("degraded")))
+             "%s at resolution" % quality.get("validation_passed_at_resolution")
+             if rendered else "not run",
+             quality.get("degraded")))
     for name in ("generation", "product"):
         bias = payload["bias"][name]
         print("bias %-10s : tv(request, actual) %s" % (name, bias["tv_distance"]))

@@ -26,6 +26,21 @@ shared wall, and the two-storey cases use `tests/fixtures/two_floor_demo.json`,
 so the positive cases go through `blender_agent.spec` exactly like a generated
 spec does; the tolerant raw reader is exercised separately (malformed specs and
 a reader-agreement test).
+
+The third review's counter-example is the one the `success` mode answers:
+statistics were counted over the *generated specs*, so a sweep whose hard
+families fall back (or a pipeline that filters failed products) could look
+diverse while delivering row after row.  Those tests build a synthetic batch
+root -- `batch_summary.json` plus each scene's `spec.json` /
+`layout_report.json` / `run_summary.json` -- and pin that the requested, the
+built and the delivered mixes are counted apart, that retries / `auto_fallback`
+/ family switches are measured separately (and that a legacy artifact records
+*none* of them instead of reading as "no fallback"), that a failed product is
+filtered with its reason instead of counted, that asset reuse, view coverage,
+shape bins, the door graph and the review/validation quality of the same scenes
+are reported, that the CLI writes a *second* report without touching the old
+ones, and that the shipped benchmark100 artifacts recompute with their drawn
+families marked as replayed.
 """
 
 from __future__ import annotations
