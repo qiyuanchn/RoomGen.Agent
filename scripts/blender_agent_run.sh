@@ -89,7 +89,15 @@ if [[ ${STATUS} -ne 0 ]]; then
 fi
 
 echo
-echo "--- [4/6] OpenImageDenoise pass (separate Blender process) ---"
+echo "--- [4/6] final geometry check + OpenImageDenoise ---"
+# settle 已改变家具的世界位姿：在导出前用最终几何复核穿顶/支撑/碰撞，
+# 而不是只信 spec 初始摆放。PANOWORLD_FINAL_GEOMETRY=0 可显式跳过。
+if [[ "${PANOWORLD_FINAL_GEOMETRY:-1}" != "0" ]]; then
+  "${HOSTPY}" "${REPO}/blender_agent/checks.py" \
+    --final-manifest "${OUT}/build/build_manifest.json" \
+    --report "${OUT}/final_geometry_report.json"
+fi
+
 "${BLENDER}" --background --factory-startup \
   --python "${REPO}/blender_agent/run_build.py" \
   -- --spec "${SPEC}" --out "${OUT}/build" --denoise-only

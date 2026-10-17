@@ -22,6 +22,14 @@ PANOWORLD_RES=2048x1024 PANOWORLD_SAMPLES=128 \
 
 Rendered examples with validation reports live in [`demo/`](demo/README.md).
 
+The standard build also re-checks the **post-settle world geometry** before
+export (`final_geometry_report.json`): furniture cannot poke through a real
+slab or ceiling, stand over a slab opening, or float a ceiling mount away from
+its support.  Set `PANOWORLD_FINAL_GEOMETRY=0` only for a deliberate bypass.
+For delivered-mix analysis (requested vs generated vs successful layouts,
+fallback rates and request bias), use
+`python tools/diversity_report.py success --root <batch> [--scenes]`.
+
 ## Why build the scene in 3D first
 
 Classic pipelines generate panoramas with diffusion models and then

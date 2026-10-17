@@ -20,6 +20,12 @@ PANOWORLD_RES=2048x1024 PANOWORLD_SAMPLES=128 \
 
 渲染成品与校验报告见 [`demo/`](demo/README.md)。
 
+标准流水线在导出前还会对 **settle 后的最终世界几何**复核一次
+（`final_geometry_report.json`）：家具不得穿过真实楼板/顶板、站进楼板洞口，
+吊装物不得脱离支撑面。仅在明确需要时用 `PANOWORLD_FINAL_GEOMETRY=0` 跳过。
+成功产物的多样性（请求/生成/成功三套分布、户型回退率与偏差）用
+`python tools/diversity_report.py success --root <batch> [--scenes]` 分析。
+
 ## 为什么先在 3D 里把场景造对
 
 传统管线用扩散模型生成全景图再重建 3D，所有重建误差（深度漂移、位姿漂移、未观测区域）都需要额外机制补偿。本方案直接在 Blender 中构建场景，其余一切都从场景**精确渲染**：
