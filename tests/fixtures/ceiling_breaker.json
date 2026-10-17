@@ -1,0 +1,44 @@
+{
+  "_comment": [
+    "3D containment counterexample of review round 3, defect 4: 'a 4.2 m cabinet still",
+    "passes in a room with a 2.7 m clear height'.  One 10 x 10 m room with a 2.70 m",
+    "ceiling, a 0.9 x 0.4 x 4.2 m external cabinet against the south wall and a harmless",
+    "0.9 x 0.4 x 0.9 m one 2.7 m beside it.  Every planar rule passes -- the footprint is",
+    "inside the room, the wall gap is 0.10 m (wall hugging), the two pieces do not touch,",
+    "the camera is far away and the room stays walkable; only the 3D containment rule can",
+    "see that the tall cabinet's top at 4.20 m pokes 1.50 m through the ceiling of room",
+    "'living' at 2.70 m.",
+    "Check with:",
+    "  python blender_agent/checks.py tests/fixtures/ceiling_breaker.json \\",
+    "      --assets-index tests/fixtures/ceiling_breaker_assets.json",
+    "which must FAIL on furniture_containment for 'tall_cabinet' only.  Remove that item",
+    "and the same spec passes every check (tests/test_multifloor.py::ContainmentTest)."
+  ],
+  "unit": "meter",
+  "wall_height": 2.7,
+  "wall_thickness": 0.12,
+  "rooms": [
+    {"id": "living", "type": "living_room", "floor_color": [0.62, 0.55, 0.47],
+     "polygon": [[0, 0], [10.0, 0], [10.0, 10.0], [0, 10.0]]}
+  ],
+  "openings": [],
+  "windows": [],
+  "cameras": [
+    {"name": "0000", "room": "living", "pos": [8.0, 8.0, 1.5]}
+  ],
+  "style": {
+    "sun_elevation_deg": 35,
+    "sun_azimuth_deg": 210,
+    "sky_strength": 1.0,
+    "sun_energy": 3.0,
+    "view_transform": "AgX",
+    "exposure": 1.4
+  },
+  "lighting": {"lamp_w": 8.0, "lamp_radius": 0.08},
+  "furniture": [
+    {"asset": "ph:low_cabinet", "room": "living", "pos": [6.0, 0.3], "rot_z_deg": 0,
+     "name": "low_cabinet"},
+    {"asset": "ph:tall_cabinet", "room": "living", "pos": [3.0, 0.3], "rot_z_deg": 0,
+     "name": "tall_cabinet"}
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "_comment": [
+    "Measurement index for the 3D containment counterexamples (tests/fixtures/",
+    "ceiling_breaker.json plus the partial-covering cases of",
+    "tests/test_multifloor.py::ContainmentTest).  A real registry entry is a size the",
+    "checker believes; tall_cabinet is the 4.2 m piece of review round 3, defect 4 --",
+    "taller than the 2.7 m room it is placed in.  See also review round 3, defect 2:",
+    "the checked size is these numbers times the item's scale, and it is what the",
+    "builder is expected to build."
+  ],
+  "models": {
+    "tall_cabinet": {"api_dimensions_mm": [900, 400, 4200], "categories": ["storage"],
+                     "source": "counterexample (review round 3, defect 4)"},
+    "low_cabinet": {"api_dimensions_mm": [900, 400, 900], "categories": ["storage"],
+                    "source": "counterexample (normal furniture)"},
+    "mid_cabinet": {"api_dimensions_mm": [600, 500, 2600], "categories": ["storage"],
+                    "source": "counterexample (fits under a 2.70 m ceiling)"},
+    "ceiling_lamp": {"api_dimensions_mm": [500, 500, 500], "categories": ["lamp"],
+                     "source": "counterexample (ceiling mount)"}
+  }
+}

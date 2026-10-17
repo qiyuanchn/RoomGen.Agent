@@ -9,7 +9,13 @@ contract shared with the generator:
   millimetres), ``builtin:rug`` from its ``size``, ``builtin:table_lamp`` from
   the fixed prop size.  A yaw that is not a multiple of 90 still yields a
   conservative AABB (the AABB of the rotated box), so the generator keeps
-  rotations on the 90 degree grid.
+  rotations on the 90 degree grid.  ``scale`` is allowed for every scheme and
+  multiplies the whole resolved size: the builder scales the same geometry by
+  the same factor (``fixtures.world_boxes`` for the ``builtin:`` parts), so the
+  checked box *is* the built one.  ``z`` is a world height and
+  ``mount: "ceiling"`` hangs the item from its own room's ceiling -- both are
+  resolved by :func:`item_world_z`, the one rule the builder calls too, so a
+  non-zero storey elevation is added exactly once.
 * ``wall_gap`` is measured from the footprint to the room boundary *line*, which
   is the wall centre line: rooms abut on centre lines and a 0.12 m wall reaches
   0.06 m into each of them.  Every item needs ``wall_gap >= 0.05`` (nothing
@@ -57,12 +63,34 @@ contract shared with the generator:
   replaces it (same plane *and* covering the area); the rest keeps its own
   ceiling slab, and ``slab_openings`` stay open as declared voids.  Every
   obstruction test (headroom, walk track) uses the same per-area rule.
+* an item has to fit under the body that is really above it -- the 3D
+  containment rule (``furniture_containment``).  Its footprint is sampled and
+  measured against the *lowest* slab underside / owned ceiling over those
+  points, never against one height per storey: where an upper storey covers the
+  room the binding surface is that slab's underside, where the room keeps its
+  own ceiling it is the ceiling plane, and where a void or a double-height
+  space is declared the item may rise to the first real slab above it.  A base
+  may not sink into its own storey's slab, a floor-standing item may not stand
+  over a slab opening of its own storey (nothing under it), and a ``mount:
+  "ceiling"`` item has to reach the ceiling it claims to hang from -- a pendant
+  over a void sees a slab far above and fails, because there is nothing to
+  attach to.  Items on different storeys at the same XY are never measured
+  against each other.
+* the same rule runs again on the geometry as built: ``check_final_geometry``
+  and the CLI ``--final-bboxes`` / ``--final-manifest`` take the post-settle
+  world boxes and re-run every box-based rule on them, reporting what settle /
+  repair moved, so a built scene can be re-checked without Blender.
 
 CLI::
 
     python blender_agent/checks.py spec.json [--assets-index P] [--report R]
+    python blender_agent/checks.py spec.json --final-bboxes boxes.json [--report R]
+    python blender_agent/checks.py --final-manifest build/build_manifest.json [--report R]
 
-prints a PASS/FAIL line per check and exits non-zero when any check fails.
+prints a PASS/FAIL line per check and exits non-zero when any check fails.  The
+``--final-*`` forms do not check the authored spec: they check the boxes that
+were really built (``{"name", "room", "bbox": [x0, y0, z0, x1, y1, z1]}``, or a
+build manifest whose furniture entries carry ``bbox_z`` from settle).
 """
 
 from __future__ import annotations
@@ -72,7 +100,7 @@ import json
 import math
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -99,6 +127,15 @@ CAMERA_WALL_GAP_M = 0.10
 GRID_M = 0.05
 ROOM_REACH_MIN_CELLS = 8
 ROOM_REACH_MIN_FRACTION = 0.25
+
+# 3D containment (furniture against the real slabs / ceilings)
+CEILING_TOUCH_TOL_M = 0.005      # a top face may reach a ceiling plane this far
+CEILING_HUG_MAX_M = 0.10         # a ceiling mount has to reach the body it hangs from
+SLAB_SINK_TOL_M = 0.005          # a base may sink this far into its own storey's slab
+CONTAINMENT_GRID_M = 0.20        # footprint sampling step of the per-area rule
+CONTAINMENT_MAX_INTERVALS = 20   # ... at most this many intervals per axis
+CONTAINMENT_VOID_SHARE = 0.5     # share of the footprint that may hang over an opening
+FLAT_FINISH_MAX_M = 0.05         # a piece this thin is a floor finish, not a body
 
 # generated props (blender_agent/details.py) that have no Poly Haven entry
 BUILTIN_DIMS_M: Dict[str, Tuple[float, float, float]] = {
@@ -149,7 +186,14 @@ def load_assets_index(path: str = DEFAULT_ASSETS_INDEX) -> Dict[str, dict]:
 
 def item_dims(asset: str, index: Dict[str, dict], size: Optional[Sequence[float]] = None,
               scale: float = 1.0) -> Optional[Tuple[float, float, float]]:
-    """Un-rotated ``(width_x, depth_y, height_z)`` of a furniture item in metres."""
+    """Un-rotated ``(width_x, depth_y, height_z)`` of a furniture item in metres.
+
+    ``scale`` (``FurnitureSpec.scale``) multiplies the resolved size for every
+    scheme -- a ``builtin:`` part is scaled from the measured table
+    (``fixtures.BUILTIN_DIMS_M``), whose boxes the builder scales with the same
+    factor, and a rug from its ``size``; its thickness stays the fixed prop
+    thickness.
+    """
     scheme, _, asset_id = asset.partition(":")
     if scheme == "builtin":
         if asset_id == "rug":
@@ -190,6 +234,12 @@ class ItemBox:
     floor_z: float = 0.0
     floor_id: str = ""
     attached_to: Optional[str] = None
+    mount: str = ""  # "floor" / "ceiling" / "wall" as authored ("" when inferred)
+
+    @property
+    def ceiling_mounted(self) -> bool:
+        """Does this item claim to hang from the ceiling (``mount: "ceiling"``)?"""
+        return self.placement == CEILING or self.mount == "ceiling"
 
     @property
     def walk_band(self) -> Tuple[float, float]:
@@ -209,6 +259,34 @@ class ItemBox:
 
 
 
+def item_world_z(spec: "spec_mod.SceneSpec", item: "spec_mod.FurnitureSpec",
+                 dims: Sequence[float]) -> Tuple[float, float, float]:
+    """``(floor_z, bottom_z, top_z)`` of one item in world coordinates.
+
+    The single local-to-world height rule of the pipeline -- ``checks.py`` and
+    ``run_build.py`` both call it, so the checked box and the built geometry
+    cannot drift apart:
+
+    * ``item.z`` is a *world* height (the ``run_build`` contract); without one
+      the item stands on the floor of its room, at its storey's elevation.
+    * ``mount == "ceiling"`` hangs the item from the ceiling of its own room:
+      its top is the room top and its bottom one object height below, which is a
+      *local* height and must never be offset by the storey's elevation again.
+
+    A non-zero storey elevation is therefore added exactly once, whichever
+    branch runs.
+    """
+    floor_z = float(spec.room_elevation(item.room))
+    height = float(dims[2])
+    if getattr(item, "mount", "") == "ceiling":
+        bottom = spec.room_top(item.room) - height
+    elif item.z is not None:
+        bottom = float(item.z)
+    else:
+        bottom = floor_z
+    return floor_z, bottom, bottom + height
+
+
 def item_boxes(spec: "spec_mod.SceneSpec", index: Dict[str, dict]) -> Tuple[List[ItemBox], List[str]]:
     """Build boxes for every furniture item; the second value lists unknown assets."""
     boxes: List[ItemBox] = []
@@ -223,15 +301,13 @@ def item_boxes(spec: "spec_mod.SceneSpec", index: Dict[str, dict]) -> Tuple[List
         if placement not in PLACEMENT_CLASSES:
             placement = ""
         floor = spec.room_floor(item.room)
-        floor_z = float(floor.elevation)
-        top = floor_z + spec.room_height(item.room)
+        floor_z, bottom_z, top_z = item_world_z(spec, item, dims)
         # a world z on the room's own floor is "standing on the floor"; anything
         # lifted off it (relative to *that* floor) is mounted or stacked
-        z0 = (float(item.z) - floor_z) if item.z is not None else 0.0
+        local_z = bottom_z - floor_z
         if item.mount == "ceiling":
             placement = CEILING
-            z0 = top - dims[2]
-        elif placement == "" and item.z is not None and float(item.z) - floor_z >= 0.5:
+        elif placement == "" and item.z is not None and local_z >= 0.5:
             placement = MOUNTED
         elif placement == "" and item.asset == "builtin:rug":
             placement = FLOOR_FLAT
@@ -242,7 +318,7 @@ def item_boxes(spec: "spec_mod.SceneSpec", index: Dict[str, dict]) -> Tuple[List
                 asset=item.asset,
                 room=item.room,
                 aabb=rotated_aabb(item.pos, dims, rot),
-                z=(floor_z + z0, floor_z + z0 + dims[2]),
+                z=(bottom_z, top_z),
                 dims=dims,
                 placement=placement,  # filled below when empty
                 rot_z_deg=rot,
@@ -250,6 +326,7 @@ def item_boxes(spec: "spec_mod.SceneSpec", index: Dict[str, dict]) -> Tuple[List
                 floor_z=floor_z,
                 floor_id=floor.id,
                 attached_to=(str(getattr(item, "attached_to", "")) or None),
+                mount=str(getattr(item, "mount", "") or ""),
             )
         )
     return boxes, unknown
@@ -446,11 +523,403 @@ def corridor_rect(zone: DoorZone, wall_thickness: float) -> Tuple[float, float, 
 
 
 # --------------------------------------------------------------------------- #
+# 3D containment: what the real slabs and ceilings leave for an item
+# --------------------------------------------------------------------------- #
+@dataclass
+class OverheadFace:
+    """One real horizontal body above a point: a slab underside or a ceiling."""
+
+    bottom: float
+    kind: str        # "slab" | "ceiling"
+    floor: str
+    room: str
+    label: str
+
+
+def ceiling_parts_index(spec: "spec_mod.SceneSpec") -> Dict[str, List[List[List[float]]]]:
+    """``{room id: ceiling outlines the room still owns}``, clipped once per room.
+
+    :func:`overhead_faces` tests points against this instead of calling
+    ``spec.ceiling_above`` per sample; the polygon difference behind it is the
+    same one (:func:`room_ceiling_parts`), just not recomputed per sample.
+    """
+    return {room.id: spec.ceiling_regions(room.id) for room in spec.rooms}
+
+
+def overhead_faces(spec: "spec_mod.SceneSpec", point: Sequence[float],
+                   ceilings: Optional[Dict[str, List[List[List[float]]]]] = None
+                   ) -> List[OverheadFace]:
+    """Every slab underside and owned ceiling above ``point``, across all storeys.
+
+    The per-area rule the stair headroom and the walk track already use: a
+    storey's slab counts where a room of that storey covers the point and the
+    point is not inside one of that storey's slab openings; a room's ceiling
+    counts only where the room still owns it, i.e. where no upper slab replaces
+    it.  A declared void therefore contributes neither, so the first body above
+    a void is the slab (or the ceiling) of a storey further up.
+    """
+    parts = ceilings if ceilings is not None else ceiling_parts_index(spec)
+    storeys = spec.floors or [_synthetic_check_floor(spec)]
+    out: List[OverheadFace] = []
+    for floor in storeys:
+        rooms = spec.floor_rooms(floor.id) if spec.floors else list(spec.rooms)
+        name = floor.id if spec.floors else "f0"
+        openings = spec.slab_openings_for(floor.id) if spec.floors else []
+        opened = any(point_in_polygon(point, opening.outline) for opening in openings)
+        for room in rooms:
+            if not point_in_polygon(point, room.polygon):
+                continue
+            if not opened:
+                out.append(OverheadFace(bottom=floor.elevation - floor.slab_thickness, kind="slab",
+                                        floor=name, room=room.id,
+                                        label=f"slab of floor '{name}'"))
+            ceiling = floor.elevation + spec.room_height(room.id)
+            if any(point_in_polygon(point, part) for part in parts.get(room.id, ())):
+                out.append(OverheadFace(bottom=ceiling, kind="ceiling", floor=name, room=room.id,
+                                        label=f"ceiling of room '{room.id}'"))
+    return out
+
+
+def _axis_samples(lo: float, hi: float, grid_m: float) -> List[float]:
+    intervals = max(1, min(CONTAINMENT_MAX_INTERVALS, int(math.ceil((hi - lo) / grid_m))))
+    span = hi - lo
+    values = [lo + span * i / intervals for i in range(intervals + 1)]
+    middle = 0.5 * (lo + hi)
+    if all(abs(value - middle) > 1e-9 for value in values):
+        values.append(middle)
+    return sorted(values)
+
+
+def footprint_samples(aabb: Sequence[float], grid_m: float = CONTAINMENT_GRID_M
+                      ) -> List[Tuple[float, float]]:
+    """XY points an item is measured at: its corners, its centre and a lattice.
+
+    The body above an item is not one number per room, so the item is probed
+    where its footprint really is -- a cabinet that straddles the edge of a
+    partial upper floor is bounded by the lower of the two surfaces it meets.
+    """
+    xs = _axis_samples(float(aabb[0]), float(aabb[2]), grid_m)
+    ys = _axis_samples(float(aabb[1]), float(aabb[3]), grid_m)
+    return [(x, y) for x in xs for y in ys]
+
+
+def containment_report(spec: "spec_mod.SceneSpec", boxes: Sequence[ItemBox],
+                       ceilings: Optional[Dict[str, List[List[List[float]]]]] = None) -> dict:
+    """Measure every item against the real body above and below it.
+
+    Per item: the lowest slab underside / owned ceiling over its footprint is
+    what it has to fit under (a top face may touch that plane, not pass it), a
+    base may not sink into its own storey's slab, a floor-standing item may not
+    stand over a slab opening of its own storey, and a ``mount: "ceiling"``
+    item must reach the body it hangs from -- a pendant over a declared void
+    sees the slab of an upper storey metres above and fails, because nothing is
+    there to attach it to.
+
+    Returns ``{"items": [...], "violations": [...]}``; the per-item entries
+    carry the measured surface, the clearance to it and the share of the
+    footprint that hangs over an opening, which is what the final-geometry
+    re-check reports as well.
+    """
+    parts = ceilings if ceilings is not None else ceiling_parts_index(spec)
+    items: List[dict] = []
+    violations: List[str] = []
+    for box in boxes:
+        base, top = float(box.z[0]), float(box.z[1])
+        floor = spec.room_floor(box.room)
+        floor_name = floor.id if spec.floors else "f0"
+        samples = footprint_samples(box.aabb)
+        lowest: Optional[OverheadFace] = None
+        opened = 0
+        own_ceiling = 0
+        parts_of_room = parts.get(box.room, ())
+        for point in samples:
+            if spec.floors and spec.in_slab_opening(floor.id, point):
+                opened += 1
+            if any(point_in_polygon(point, part) for part in parts_of_room):
+                own_ceiling += 1
+            for face in overhead_faces(spec, point, parts):
+                # a face at or below the item's own floor plane belongs to the sink
+                # rule below, not to "pokes through the ceiling above"
+                if face.bottom < max(base, floor.elevation) - CEILING_TOUCH_TOL_M:
+                    continue
+                if lowest is None or face.bottom < lowest.bottom - 1e-9:
+                    lowest = face
+        entry = {
+            "name": box.name,
+            "room": box.room, "floor": floor_name, "mount": box.mount or "floor",
+            "placement": box.placement, "z": [round(base, 3), round(top, 3)],
+            "samples": len(samples),
+            "over_opening_share": round(opened / len(samples), 3) if samples else 0.0,
+            "own_ceiling_share": round(own_ceiling / len(samples), 3) if samples else 0.0,
+            "lowest_face": None if lowest is None else {
+                "bottom": round(lowest.bottom, 3), "kind": lowest.kind, "floor": lowest.floor,
+                "room": lowest.room, "label": lowest.label},
+            "clearance_m": None if lowest is None else round(lowest.bottom - top, 3),
+        }
+        items.append(entry)
+
+        if base < floor.elevation - SLAB_SINK_TOL_M and \
+                box.placement != FLOOR_FLAT and top - base > FLAT_FINISH_MAX_M:
+            # a floor finish (a rug, a sheet) lies *on* the slab and settle pushes
+            # it into the floor plane by design; a body may not sink into it
+            violations.append(
+                f"{box.name} ({box.room}): base at {base:.3f} m sinks "
+                f"{floor.elevation - base:.3f} m into the slab of floor '{floor_name}'"
+            )
+        if lowest is None:
+            if box.ceiling_mounted:
+                violations.append(
+                    f"{box.name} ({box.room}): mounted on the ceiling at {top:.3f} m but nothing is "
+                    f"above its footprint (no slab and no ceiling) -- there is nothing to hang from"
+                )
+        elif top > lowest.bottom + CEILING_TOUCH_TOL_M:
+            violations.append(
+                f"{box.name} ({box.room}): top at {top:.3f} m pokes "
+                f"{top - lowest.bottom:.3f} m through the {lowest.label} at "
+                f"{lowest.bottom:.3f} m"
+            )
+        if box.ceiling_mounted:
+            if lowest is not None and lowest.bottom - top > CEILING_HUG_MAX_M + 1e-9:
+                where = ("its own room's ceiling is not there over the footprint: a declared void "
+                         "or a double-height space"
+                         if entry["own_ceiling_share"] < 0.5 else
+                         "no slab and no ceiling sits over its footprint")
+                violations.append(
+                    f"{box.name} ({box.room}): mounted on the ceiling but its top at {top:.3f} m is "
+                    f"{lowest.bottom - top:.3f} m below the {lowest.label} at {lowest.bottom:.3f} m "
+                    f"({where}) -- a ceiling-mounted item has to reach the ceiling of its own room "
+                    f"(max {CEILING_HUG_MAX_M} m below it)"
+                )
+        elif entry["over_opening_share"] >= CONTAINMENT_VOID_SHARE \
+                and abs(base - floor.elevation) <= SLAB_SINK_TOL_M + 1e-9:
+            violations.append(
+                f"{box.name} ({box.room}): stands on the floor but "
+                f"{entry['over_opening_share'] * 100:.0f}% of its footprint is over a slab opening "
+                f"of floor '{floor_name}' -- nothing supports it there"
+            )
+    return {"items": items, "violations": violations}
+
+
+def _item_box(entry: dict, spec: Optional["spec_mod.SceneSpec"] = None,
+              rooms_by_name: Optional[Dict[str, str]] = None) -> Tuple[Optional[ItemBox], str]:
+    """One world box from a dict: ``bbox`` (x0,y0,z0,x1,y1,z1) or ``aabb`` + ``z``."""
+    room = str(entry.get("room") or "")
+    name = str(entry.get("name") or "")
+    if not room and rooms_by_name:
+        room = rooms_by_name.get(name, "")
+    if not room:
+        return None, f"{name or '?'}: no room (needed to find its slabs and ceilings)"
+    bbox = entry.get("bbox")
+    if bbox is not None:
+        if len(bbox) != 6:
+            return None, f"{name}: 'bbox' must be [x0, y0, z0, x1, y1, z1]"
+        x0, y0, z0, x1, y1, z1 = (float(v) for v in bbox)
+        aabb, z = (x0, y0, x1, y1), (z0, z1)
+    elif entry.get("aabb") is not None and entry.get("z") is not None:
+        x0, y0, x1, y1 = (float(v) for v in entry["aabb"])
+        z0, z1 = (float(v) for v in entry["z"])
+        aabb, z = (x0, y0, x1, y1), (z0, z1)
+    else:
+        return None, f"{name}: needs a 'bbox' or 'aabb' + 'z'"
+    mount = str(entry.get("mount") or "")
+    placement = str(entry.get("placement") or "")
+    if placement not in PLACEMENT_CLASSES:
+        placement = CEILING if mount == "ceiling" else ""
+    floor_z = 0.0
+    floor_id = ""
+    if spec is not None and room in {item.id for item in spec.rooms}:
+        floor = spec.room_floor(room)
+        floor_z, floor_id = float(floor.elevation), floor.id
+    return ItemBox(name=name or f"item_{id(entry)}", asset=str(entry.get("asset") or ""),
+                   room=room, aabb=aabb, z=z, dims=None, placement=placement,
+                   rot_z_deg=float(entry.get("rot_z_deg") or 0.0), rotation_on_grid=True,
+                   floor_z=floor_z, floor_id=floor_id, mount=mount), ""
+
+
+def boxes_from_entries(entries: Sequence[dict], spec: Optional["spec_mod.SceneSpec"] = None
+                       ) -> Tuple[List[ItemBox], List[str]]:
+    """Item boxes from explicit world boxes; the second value lists unusable entries.
+
+    The contract of the final-geometry re-check: whatever produced the boxes
+    (settle, a repair pass, another tool) only has to provide the world AABB and
+    the room, and every box-based rule can be measured on it.
+    """
+    rooms_by_name = {item.name: item.room for item in spec.furniture} if spec is not None else None
+    boxes: List[ItemBox] = []
+    notes: List[str] = []
+    for entry in entries:
+        box, note = _item_box(entry, spec, rooms_by_name)
+        if box is None:
+            notes.append(note)
+        else:
+            boxes.append(box)
+    return boxes, notes
+
+
+def _built_size_note(name: str, built: Sequence[float], dims: Sequence[float]) -> Optional[str]:
+    """Note when the asset as built is not the size the registry measured.
+
+    The builder records ``asset_object.dimensions * scale``; the checker sizes
+    the same asset from its index entry.  A piece whose built body differs from
+    the registry size (import rotation, local scaling inside the asset) is a
+    drift between "checked" and "built" worth naming, so the final re-check
+    reports it.  Sorted sizes, because the two may be expressed in different
+    frames.
+    """
+    if dims is None:
+        return None
+    pairs = sorted(zip((float(v) for v in built), (float(v) for v in dims)),
+                   key=lambda pair: pair[1])
+    worst = max((abs(a - b), a, b) for a, b in pairs)
+    if worst[0] <= 0.05:
+        return None
+    return (f"{name}: built size differs from the registry by up to {worst[0]:.3f} m "
+            f"(built {worst[1]:.3f} m vs registry {worst[2]:.3f} m)")
+
+
+def _manifest_boxes(manifest: dict, spec: "spec_mod.SceneSpec",
+                    index: Optional[Dict[str, dict]] = None
+                    ) -> Tuple[List[ItemBox], List[str]]:
+    """Final boxes from a ``build_manifest.json``: settle's world Z on the placed footprint.
+
+    The builder walks ``spec.furniture`` in order and records what it placed;
+    settle rewrites ``bbox_z`` to the world Z range of the geometry it relaxed,
+    which is the only part of the final pose the manifest carries.  So the box
+    is the spec's own footprint (same ``rotated_aabb`` as the spec-time check)
+    with the settled Z range -- the height really built, which is what the
+    containment rule needs.  Lateral drift (millimetres, not recorded) is not
+    re-checked here; a caller with true post-settle boxes uses the ``bbox``
+    contract instead.
+    """
+    nominal, unknown = item_boxes(spec, index or {})
+    notes: List[str] = list(unknown)
+    boxes: List[ItemBox] = []
+    cursor = 0
+    for placement in manifest.get("furniture") or []:
+        name = str(placement.get("name") or "")
+        # entries follow the spec order, so the first not-yet-consumed item of the
+        # same name is this one -- duplicate names ("bed" twice) stay distinct
+        while cursor < len(nominal) and nominal[cursor].name != name:
+            cursor += 1
+        if cursor >= len(nominal):
+            notes.append(f"{name or '?'}: no measured spec item of this name -- not re-checked")
+            continue
+        source = nominal[cursor]
+        cursor += 1
+        built = placement.get("size_m")
+        if built and len(built) == 3:
+            note = _built_size_note(name, built, source.dims)
+            if note:
+                notes.append(note)
+        z_range = placement.get("bbox_z")
+        if not (z_range and len(z_range) == 2 and float(z_range[1]) > float(z_range[0])):
+            notes.append(f"{name}: no settled 'bbox_z' -- re-checked at its authored height")
+            boxes.append(source)
+            continue
+        boxes.append(replace(source, z=(float(z_range[0]), float(z_range[1]))))
+    return boxes, notes
+
+
+def check_final_geometry(spec: "spec_mod.SceneSpec", boxes: Sequence[ItemBox],
+                         assets_index: Optional[Dict[str, dict]] = None, grid_m: float = GRID_M,
+                         authored: Optional[Sequence[ItemBox]] = None, source: str = "",
+                         notes: Optional[Sequence[str]] = None) -> dict:
+    """Re-run every box-based rule on the geometry as built (post-settle boxes).
+
+    ``check_spec`` measures the spec; this measures what settle / repair left
+    behind: through-wall, through-ceiling, collisions, door zones, stair
+    clearance, circulation and containment all read the given boxes, and
+    ``adjustments`` records what moved relative to the authored boxes, so a
+    "repaired" scene cannot pass by being measured before the repair.  A run
+    that measured no box at all fails ``final_geometry_measured`` when the spec
+    has furniture: an empty re-check must never read as a pass.
+    """
+    report = check_spec(spec, assets_index, grid_m=grid_m, boxes=boxes)
+    report["kind"] = "blender_agent_final_geometry"
+    report["mode"] = "final_geometry"
+    report["source"] = source
+    measured = bool(boxes) or not spec.furniture
+    report["checks"].append({"name": "final_geometry_measured", "pass": measured,
+                             "boxes": len(boxes), "spec_items": len(spec.furniture),
+                             "notes": list(notes or [])})
+    if not measured:
+        report["violations"].append(
+            f"final geometry: the spec has {len(spec.furniture)} furniture items but the input "
+            f"measured none -- the re-check proves nothing"
+        )
+        report["pass"] = False
+    adjustments = []
+    if authored is not None:
+        by_name = {box.name: box for box in authored}
+        for box in boxes:
+            before = by_name.get(box.name)
+            if before is None:
+                adjustments.append({"name": box.name, "status": "not_in_spec"})
+                continue
+            entry = {
+                "name": box.name, "room": box.room,
+                "xy_shift_m": round(math.dist(
+                    ((box.aabb[0] + box.aabb[2]) / 2.0, (box.aabb[1] + box.aabb[3]) / 2.0),
+                    ((before.aabb[0] + before.aabb[2]) / 2.0,
+                     (before.aabb[1] + before.aabb[3]) / 2.0)), 4),
+                "z_before": [round(float(before.z[0]), 4), round(float(before.z[1]), 4)],
+                "z_after": [round(float(box.z[0]), 4), round(float(box.z[1]), 4)],
+                "z_shift_m": round(float(box.z[0]) - float(before.z[0]), 4),
+                "height_shift_m": round((float(box.z[1]) - float(box.z[0]))
+                                        - (float(before.z[1]) - float(before.z[0])), 4),
+            }
+            entry["changed"] = bool(entry["xy_shift_m"] > 1e-4 or abs(entry["z_shift_m"]) > 1e-4
+                                    or abs(entry["height_shift_m"]) > 1e-4)
+            adjustments.append(entry)
+    report["final_geometry"] = {
+        "boxes": {box.name: {"room": box.room, "placement": box.placement,
+                             "aabb": [round(v, 3) for v in box.aabb],
+                             "z": [round(v, 3) for v in box.z]} for box in boxes},
+        "adjustments": adjustments,
+        "moved": sum(1 for entry in adjustments if entry.get("changed")),
+    }
+    return report
+
+
+def load_final_boxes(path: str, spec: Optional["spec_mod.SceneSpec"] = None,
+                     index: Optional[Dict[str, dict]] = None
+                     ) -> Tuple[Optional["spec_mod.SceneSpec"], List[ItemBox], List[str], str]:
+    """Read the final-geometry input: a box list or a build manifest.
+
+    Returns ``(spec, boxes, notes, source)``.  The first form is the explicit
+    contract -- ``{"items": [{"name", "room", "bbox": [x0, y0, z0, x1, y1, z1]}]}``
+    (a bare list works too); the second form is a ``build_manifest.json``, whose
+    embedded spec is parsed and whose furniture entries carry settle's ``bbox_z``.
+    """
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if isinstance(data, list):
+        data = {"items": data}
+    if str(data.get("kind") or "") == "blender_agent_build":
+        if spec is None:
+            raw = data.get("spec")
+            if not isinstance(raw, dict):
+                raise spec_mod.SpecError(f"{path}: build manifest carries no 'spec' block")
+            spec = spec_mod.parse_spec(raw, source_path=path)
+        boxes, notes = _manifest_boxes(data, spec, index)
+        return spec, boxes, notes, os.path.abspath(path)
+    if spec is None:
+        raise spec_mod.SpecError(f"{path}: a box list needs the spec that goes with it")
+    boxes, notes = boxes_from_entries(data.get("items") or [], spec)
+    return spec, boxes, notes, os.path.abspath(path)
+
+
+# --------------------------------------------------------------------------- #
 # the check itself
 # --------------------------------------------------------------------------- #
 def check_spec(spec: "spec_mod.SceneSpec", assets_index: Optional[Dict[str, dict]] = None,
-               grid_m: float = GRID_M) -> dict:
-    """Run every placement rule. Returns a report dict with ``pass`` and ``checks``."""
+               grid_m: float = GRID_M, boxes: Optional[Sequence[ItemBox]] = None) -> dict:
+    """Run every placement rule. Returns a report dict with ``pass`` and ``checks``.
+
+    ``boxes`` overrides the boxes resolved from the spec: the final-geometry
+    re-check (:func:`check_final_geometry`) passes the post-settle world boxes
+    so every box-based rule is measured on the geometry that was really built.
+    """
     index = assets_index if assets_index is not None else load_assets_index()
     violations: List[str] = []
     checks: List[dict] = []
@@ -461,7 +930,8 @@ def check_spec(spec: "spec_mod.SceneSpec", assets_index: Optional[Dict[str, dict
         checks.append(entry)
 
     # -- sizes ------------------------------------------------------------- #
-    boxes, unknown = item_boxes(spec, index)
+    resolved, unknown = item_boxes(spec, index)
+    boxes = list(resolved) if boxes is None else list(boxes)
     record("assets_resolved", not unknown, unknown=unknown)
     violations.extend(unknown)
 
@@ -512,6 +982,14 @@ def check_spec(spec: "spec_mod.SceneSpec", assets_index: Optional[Dict[str, dict
                 clashes.append(f"{a.name} ({a.room}) overlaps {b.name} ({b.room})")
     record("furniture_no_collision", not clashes, violations=clashes, exempt=exempt_pairs)
     violations.extend(clashes)
+
+    # -- 3D containment: nothing pokes through a slab or a ceiling ---------- #
+    containment = containment_report(spec, boxes)
+    record("furniture_containment", not containment["violations"],
+           violations=containment["violations"], items=containment["items"],
+           ceiling_touch_tol_m=CEILING_TOUCH_TOL_M, ceiling_hug_max_m=CEILING_HUG_MAX_M,
+           slab_sink_tol_m=SLAB_SINK_TOL_M)
+    violations.extend(containment["violations"])
 
     # -- doors ------------------------------------------------------------- #
     zones = door_zones(spec, spec.wall_thickness)
@@ -1300,15 +1778,89 @@ def check_file(spec_path: str, assets_index: Optional[Dict[str, dict]] = None,
     return report
 
 
+def _print_report(report: dict, label: str) -> None:
+    print(f"checks: {label}")
+    for entry in report["checks"]:
+        print(f"  [{'PASS' if entry['pass'] else 'FAIL'}] {entry['name']}")
+        if not entry["pass"]:
+            for violation in entry.get("violations", []):
+                print(f"         - {violation}")
+    rooms = next((entry for entry in report["checks"] if entry["name"] == "circulation_reachable"), None)
+    if rooms:
+        for room_id, stats in rooms["rooms"].items():
+            print(f"  room {room_id:>10s}: {stats['reachable_cells']:5d}/{stats['free_cells']:5d} free cells "
+                  f"reachable ({stats['reachable_fraction'] * 100:.1f}%)")
+    print(f"checks: {'PASS' if report['pass'] else 'FAIL'} ({len(report['violations'])} violations)")
+
+
+def _final_geometry(spec, boxes, notes, source, args, authored=None) -> dict:
+    """The ``--final-*`` mode: box-based rules on the geometry as built."""
+    index = load_assets_index(args.assets_index) \
+        if args.assets_index and os.path.isfile(args.assets_index) else None
+    report = check_final_geometry(spec, boxes, index, grid_m=args.grid, authored=authored,
+                                  source=source, notes=notes)
+    report["notes"] = notes
+    if not args.quiet:
+        _print_report(report, f"{source} (final geometry, {len(boxes)} boxes)")
+        containment = next((entry for entry in report["checks"]
+                            if entry["name"] == "furniture_containment"), None)
+        for item in (containment or {}).get("items", []):
+            face = item["lowest_face"]
+            above = "nothing" if face is None else f"{face['bottom']:.3f} m ({face['label']})"
+            print(f"  {item['name']:>22s} {item['room']:>10s} "
+                  f"z {item['z'][0]:6.2f}-{item['z'][1]:6.2f}  lowest body above: "
+                  f"{above}  clearance {item['clearance_m']}")
+        moved = report["final_geometry"]["moved"]
+        print(f"checks: {moved} of {len(boxes)} boxes differ from the spec geometry")
+        for note in notes:
+            print(f"checks: note: {note}")
+    if args.report:
+        os.makedirs(os.path.dirname(os.path.abspath(args.report)), exist_ok=True)
+        with open(args.report, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2)
+        if not args.quiet:
+            print(f"checks: report written to {args.report}")
+    return report
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Check furniture placement and circulation of a scene spec")
-    parser.add_argument("spec", help="scene spec JSON")
+    parser.add_argument("spec", nargs="?", default=None, help="scene spec JSON")
     parser.add_argument("--assets-index", default=DEFAULT_ASSETS_INDEX)
     parser.add_argument("--report", default=None, help="write the JSON report here")
     parser.add_argument("--grid", type=float, default=GRID_M, help="circulation grid step in metres")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--final-bboxes", default=None,
+                        help="JSON box list of the geometry as built ({'items': [{'name', 'room', "
+                             "'bbox': [x0, y0, z0, x1, y1, z1]}]}); checks those boxes instead of "
+                             "the spec")
+    parser.add_argument("--final-manifest", default=None,
+                        help="build_manifest.json of a built scene; its spec and settle's bbox_z "
+                             "give the boxes to re-check (spec may be omitted)")
     args = parser.parse_args(argv)
 
+    final_path = args.final_manifest or args.final_bboxes
+    if final_path:
+        try:
+            spec = spec_mod.load_spec(args.spec) if args.spec else None
+        except spec_mod.SpecError as error:
+            print(f"checks: spec is invalid: {error}")
+            return 2
+        index = load_assets_index(args.assets_index) \
+            if args.assets_index and os.path.isfile(args.assets_index) else None
+        try:
+            spec, boxes, notes, source = load_final_boxes(final_path, spec, index)
+        except (spec_mod.SpecError, OSError, ValueError) as error:
+            print(f"checks: final geometry input is invalid: {error}")
+            return 2
+        authored = item_boxes(spec, index)[0]
+        report = _final_geometry(spec, boxes, notes, source, args, authored=authored)
+        if args.spec:
+            report["spec"] = os.path.abspath(args.spec)
+        return 0 if report["pass"] else 1
+
+    if not args.spec:
+        parser.error("a scene spec is required (or --final-manifest with a spec inside it)")
     try:
         spec = spec_mod.load_spec(args.spec)
     except spec_mod.SpecError as error:
@@ -1325,18 +1877,7 @@ def main(argv=None) -> int:
     report["spec"] = os.path.abspath(args.spec)
 
     if not args.quiet:
-        print(f"checks: {args.spec}")
-        for entry in report["checks"]:
-            print(f"  [{'PASS' if entry['pass'] else 'FAIL'}] {entry['name']}")
-            if not entry["pass"]:
-                for violation in entry.get("violations", []):
-                    print(f"         - {violation}")
-        rooms = next((entry for entry in report["checks"] if entry["name"] == "circulation_reachable"), None)
-        if rooms:
-            for room_id, stats in rooms["rooms"].items():
-                print(f"  room {room_id:>10s}: {stats['reachable_cells']:5d}/{stats['free_cells']:5d} free cells "
-                      f"reachable ({stats['reachable_fraction'] * 100:.1f}%)")
-        print(f"checks: {'PASS' if report['pass'] else 'FAIL'} ({len(report['violations'])} violations)")
+        _print_report(report, args.spec)
 
     if args.report:
         os.makedirs(os.path.dirname(os.path.abspath(args.report)), exist_ok=True)

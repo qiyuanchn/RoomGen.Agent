@@ -34,6 +34,16 @@ Covers the frozen schema_version 2 contract and everything that reads it:
 * **validator**: a synthetic two-storey shell proves the door probes measure
   each opening inside its own storey, the step tops are really built and the
   upper slab / lower ceiling are one sandwich of the declared thickness.
+* **3D containment** (``ceiling_breaker.json`` and the partial-covering fixture):
+  an item is bound to the lowest slab underside / owned ceiling over its own
+  footprint -- a 4.2 m cabinet in a 2.7 m room fails while the same cabinet
+  under a declared void or a double-height space passes, a piece that straddles
+  the edge of a partial upper floor is bound by the lower surface, a ceiling
+  mount has to reach the body it hangs from (a pendant over a void has nothing
+  to attach to) and two storeys at the same XY are never measured against each
+  other.  The final-geometry re-check (``check_final_geometry`` / the
+  ``--final-bboxes`` and ``--final-manifest`` CLI) re-measures the geometry as
+  built and catches a piece settle or a repair lifted into the ceiling.
 """
 
 from __future__ import annotations
@@ -45,6 +55,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 
 import numpy as np
 
@@ -66,6 +77,8 @@ import validate_blender_agent_p0 as validator  # noqa: E402
 DEMO_SPEC = os.path.join(TESTS_DIR, "fixtures", "two_floor_demo.json")
 STAIR_CAMERA_SPEC = os.path.join(TESTS_DIR, "fixtures", "stair_well_camera.json")
 PARTIAL_CEILING_SPEC = os.path.join(TESTS_DIR, "fixtures", "partial_upper_floor.json")
+CEILING_BREAKER_SPEC = os.path.join(TESTS_DIR, "fixtures", "ceiling_breaker.json")
+CEILING_BREAKER_ASSETS = os.path.join(TESTS_DIR, "fixtures", "ceiling_breaker_assets.json")
 
 
 def _demo_dict() -> dict:
@@ -1009,6 +1022,321 @@ class ValidatorStairsTest(unittest.TestCase):
         self.assertFalse(report["pass"])
         self.assertTrue(any("sandwich" in failure or "ceiling" in failure
                             for failure in report["violations"]))
+
+
+class ContainmentTest(unittest.TestCase):
+    """Furniture fits under the body that is really above it (review round 3, defect 4).
+
+    ``ceiling_breaker.json`` is the review's repro: a 0.9 x 0.4 x 4.2 m cabinet
+    against the wall of a 10 x 10 m room with a 2.70 m ceiling.  Every planar
+    rule passes -- footprint, wall gap, collisions, cameras, circulation -- so
+    the piece used to be accepted; the containment rule binds it to the lowest
+    slab underside / owned ceiling over its own footprint and rejects it.
+
+    ``partial_upper_floor.json`` (8 x 6 m hall on f0, the f1 landing over its
+    southern half only, a 1 x 1 m declared void at 7.0/1.0) proves the rule is
+    per area instead of one number per storey: the same cabinet is stopped by
+    the hall's own ceiling in the uncovered half, is stopped by the f1 slab
+    where the landing covers the hall, passes inside the declared void, and is
+    stopped again as soon as one sample of its footprint reaches out of that
+    void.  A ``mount: "ceiling"`` item has to reach the body it hangs from, so a
+    pendant under the void fails instead of riding down from the landing roof.
+    The final-geometry re-check (``check_final_geometry``, the CLI's
+    ``--final-bboxes`` / ``--final-manifest``) re-measures the boxes as built,
+    which is how a piece settle or a repair lifted into the ceiling is caught.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.assets = checks_mod.load_assets_index(CEILING_BREAKER_ASSETS)
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="containment_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    # -- helpers ----------------------------------------------------------- #
+    def _entry(self, report, name="furniture_containment"):
+        return next(item for item in report["checks"] if item["name"] == name)
+
+    def _failing(self, report):
+        return [item["name"] for item in report["checks"] if not item["pass"]]
+
+    def _item(self, report, name):
+        return next(item for item in self._entry(report)["items"] if item["name"] == name)
+
+    def _breaker(self, drop_tall: bool = False):
+        data = _load_dict(CEILING_BREAKER_SPEC)
+        if drop_tall:
+            data["furniture"] = [item for item in data["furniture"]
+                                 if item["name"] != "tall_cabinet"]
+        return spec_mod.parse_spec(data)
+
+    def _partial(self, asset, pos, name, mount=None, room="hall"):
+        data = _load_dict(PARTIAL_CEILING_SPEC)
+        item = {"asset": asset, "room": room, "pos": list(pos), "rot_z_deg": 0, "name": name}
+        if mount:
+            item["mount"] = mount
+        data["furniture"].append(item)
+        return spec_mod.parse_spec(data)
+
+    def _two_storeys(self, lower_asset: str):
+        """Two identical 6 x 6 m rooms stacked, one item at the same XY on each."""
+        data = {
+            "schema_version": 2, "unit": "meter",
+            "wall_height": 2.7, "wall_thickness": 0.12,
+            "floors": [{"id": "f0", "elevation": 0.0, "height": 2.7, "slab_thickness": 0.15},
+                       {"id": "f1", "elevation": 2.85, "height": 2.7, "slab_thickness": 0.15}],
+            "rooms": [
+                {"id": "low", "type": "living_room", "floor_id": "f0",
+                 "polygon": [[0, 0], [6.0, 0], [6.0, 6.0], [0, 6.0]]},
+                {"id": "up", "type": "bedroom", "floor_id": "f1",
+                 "polygon": [[0, 0], [6.0, 0], [6.0, 6.0], [0, 6.0]]},
+            ],
+            "cameras": [{"name": "0000", "room": "low", "pos": [3.0, 3.0, 1.5]}],
+            "furniture": [
+                {"asset": lower_asset, "room": "low", "pos": [4.0, 4.0], "rot_z_deg": 0,
+                 "name": "low_cabinet"},
+                {"asset": "ph:mid_cabinet", "room": "up", "pos": [4.0, 4.0], "rot_z_deg": 0,
+                 "name": "up_cabinet"},
+            ],
+        }
+        return spec_mod.parse_spec(data)
+
+    # -- the review's counterexample ---------------------------------------- #
+    def test_a_cabinet_taller_than_the_room_is_rejected(self):
+        report = checks_mod.check_spec(self._breaker(), self.assets)
+        self.assertIn("furniture_containment", self._failing(report))
+        item = self._item(report, "tall_cabinet")
+        self.assertAlmostEqual(item["z"][1], 4.2, places=6)
+        self.assertEqual(item["lowest_face"]["kind"], "ceiling")
+        self.assertAlmostEqual(item["lowest_face"]["bottom"], 2.7, places=6)
+        self.assertAlmostEqual(item["clearance_m"], -1.5, places=6)
+        violation = next(text for text in self._entry(report)["violations"] if "tall_cabinet" in text)
+        self.assertIn("pokes 1.500 m through the ceiling of room 'living' at 2.700 m", violation)
+
+    def test_every_other_rule_still_passes_the_same_spec(self):
+        """What the review measured: only the 3D rule can see this piece."""
+        report = checks_mod.check_spec(self._breaker(), self.assets)
+        self.assertEqual(self._failing(report), ["furniture_containment"])
+
+    def test_normal_furniture_in_the_same_room_passes(self):
+        report = checks_mod.check_spec(self._breaker(drop_tall=True), self.assets)
+        self.assertTrue(report["pass"], report["violations"])
+        item = self._item(report, "low_cabinet")
+        self.assertAlmostEqual(item["clearance_m"], 1.8, places=6)
+
+    def test_the_cli_reports_the_counterexample(self):
+        report_path = os.path.join(self.tmp, "checks_report.json")
+        code = checks_mod.main([CEILING_BREAKER_SPEC, "--assets-index", CEILING_BREAKER_ASSETS,
+                                "--report", report_path, "--quiet"])
+        self.assertEqual(code, 1)
+        with open(report_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        self.assertFalse(data["pass"])
+        self.assertEqual([entry["name"] for entry in data["checks"] if not entry["pass"]],
+                         ["furniture_containment"])
+
+    # -- per area: the ceiling this room owns, the slab that replaces it ---- #
+    def test_the_hall_ceiling_stops_a_tall_piece(self):
+        spec = self._partial("ph:tall_cabinet", (7.0, 5.7), "hall_cabinet")
+        report = checks_mod.check_spec(spec, self.assets)
+        self.assertEqual(self._failing(report), ["furniture_containment"])
+        item = self._item(report, "hall_cabinet")
+        self.assertEqual(item["lowest_face"]["label"], "ceiling of room 'hall'")
+
+    def test_where_the_landing_covers_the_hall_the_slab_binds(self):
+        spec = self._partial("ph:mid_cabinet", (7.0, 2.6), "hall_cabinet")
+        report = checks_mod.check_spec(spec, self.assets)
+        self.assertTrue(report["pass"], report["violations"])
+        item = self._item(report, "hall_cabinet")
+        self.assertEqual(item["lowest_face"]["kind"], "slab")
+        self.assertEqual(item["lowest_face"]["floor"], "f1")
+        self.assertAlmostEqual(item["clearance_m"], 0.1, places=6)
+
+    def test_a_declared_void_lets_the_same_piece_through(self):
+        """Not one height per storey: the 4.2 m piece fits where the void is open."""
+        spec = self._partial("ph:tall_cabinet", (7.0, 1.0), "hall_cabinet")
+        item = self._item(checks_mod.check_spec(spec, self.assets), "hall_cabinet")
+        self.assertEqual(item["lowest_face"]["label"], "ceiling of room 'landing'")
+        self.assertAlmostEqual(item["lowest_face"]["bottom"], 5.55, places=6)
+        self.assertAlmostEqual(item["clearance_m"], 1.35, places=6)
+
+    def test_a_footprint_that_reaches_out_of_the_void_is_bound_again(self):
+        inside = self._partial("ph:tall_cabinet", (7.0, 1.0), "hall_cabinet")
+        straddling = self._partial("ph:tall_cabinet", (7.0, 1.4), "hall_cabinet")
+        self.assertGreater(self._item(checks_mod.check_spec(inside, self.assets),
+                                      "hall_cabinet")["clearance_m"], 1.0)
+        report = checks_mod.check_spec(straddling, self.assets)
+        self.assertIn("furniture_containment", self._failing(report))
+        item = self._item(report, "hall_cabinet")
+        self.assertEqual(item["lowest_face"]["kind"], "slab")
+        self.assertAlmostEqual(item["lowest_face"]["bottom"], 2.7, places=6)
+
+    def test_a_piece_standing_over_a_hole_in_its_own_floor_is_rejected(self):
+        """Support below: the landing's own slab is opened by the declared void."""
+        data = _load_dict(PARTIAL_CEILING_SPEC)
+        data["furniture"].append({"asset": "ph:mid_cabinet", "room": "landing",
+                                  "pos": [7.0, 1.0], "rot_z_deg": 0, "name": "void_cabinet"})
+        spec = spec_mod.parse_spec(data)
+        report = checks_mod.check_spec(spec, self.assets)
+        self.assertIn("furniture_containment", self._failing(report))
+        item = self._item(report, "void_cabinet")
+        self.assertAlmostEqual(item["over_opening_share"], 1.0, places=6)
+        self.assertTrue(any("over a slab opening of floor 'f1'" in text
+                            for text in self._entry(report)["violations"]))
+
+    # -- ceiling mounts hang from something real ---------------------------- #
+    def test_a_pendant_lamp_reaches_the_ceiling_of_its_room(self):
+        spec = self._partial("ph:ceiling_lamp", (7.0, 5.7), "hall_lamp", mount="ceiling")
+        report = checks_mod.check_spec(spec, self.assets)
+        self.assertTrue(report["pass"], report["violations"])
+        item = self._item(report, "hall_lamp")
+        self.assertAlmostEqual(item["z"][1], 2.7, places=6)
+        self.assertAlmostEqual(item["clearance_m"], 0.0, places=6)
+        self.assertAlmostEqual(item["own_ceiling_share"], 1.0, places=6)
+
+    def test_a_pendant_over_the_void_has_nothing_to_hang_from(self):
+        """The landing roof is metres up: the lamp cannot ride down from it."""
+        spec = self._partial("ph:ceiling_lamp", (7.0, 1.0), "hall_lamp", mount="ceiling")
+        report = checks_mod.check_spec(spec, self.assets)
+        self.assertEqual(self._failing(report), ["furniture_containment"])
+        item = self._item(report, "hall_lamp")
+        self.assertAlmostEqual(item["clearance_m"], 2.85, places=6)
+        violation = next(text for text in self._entry(report)["violations"] if "hall_lamp" in text)
+        self.assertIn("has to reach the ceiling of its own room", violation)
+        self.assertIn("declared void", violation)
+
+    def test_a_ceiling_hung_tall_cabinet_cannot_borrow_the_void(self):
+        spec = self._partial("ph:tall_cabinet", (7.0, 1.0), "hung_cabinet", mount="ceiling")
+        violations = self._entry(checks_mod.check_spec(spec, self.assets))["violations"]
+        self.assertTrue(any("sinks" in text for text in violations), violations)
+        self.assertTrue(any("has to reach the ceiling of its own room" in text
+                            for text in violations), violations)
+
+    # -- two storeys at the same XY are measured on their own --------------- #
+    def test_items_stacked_over_two_storeys_are_not_measured_against_each_other(self):
+        report = checks_mod.check_spec(self._two_storeys("ph:mid_cabinet"), self.assets)
+        self.assertTrue(self._entry(report)["pass"], self._entry(report)["violations"])
+        self.assertTrue(self._entry(report, "furniture_no_collision")["pass"])
+        low = self._item(report, "low_cabinet")
+        up = self._item(report, "up_cabinet")
+        self.assertEqual(low["lowest_face"]["floor"], "f1")          # bound by the f1 slab
+        self.assertAlmostEqual(low["z"][1], 2.6, places=6)
+        self.assertAlmostEqual(low["clearance_m"], 0.1, places=6)
+        self.assertEqual(up["lowest_face"]["floor"], "f1")           # its own room's ceiling
+        self.assertAlmostEqual(up["clearance_m"], 0.1, places=6)
+        cross = self._entry(report, "cross_floor_xy_ok_info")
+        self.assertIn(("low_cabinet", "up_cabinet"), {(pair["a"], pair["b"])
+                                                     for pair in cross["pairs"]})
+
+    def test_a_piece_that_reaches_into_the_storey_above_is_rejected(self):
+        report = checks_mod.check_spec(self._two_storeys("ph:tall_cabinet"), self.assets)
+        violations = self._entry(report)["violations"]
+        self.assertTrue(any("low_cabinet" in text and "slab of floor 'f1'" in text
+                            for text in violations), violations)
+        self.assertFalse(any("up_cabinet" in text for text in violations), violations)
+
+    # -- the final-geometry re-check ---------------------------------------- #
+    def _settled_recheck(self, z_shift: float):
+        """The partial scene with ``hall_cabinet`` lifted by settle / a repair."""
+        spec = self._partial("ph:mid_cabinet", (7.0, 2.6), "hall_cabinet")
+        authored = checks_mod.item_boxes(spec, self.assets)[0]
+        self.assertTrue(checks_mod.check_spec(spec, self.assets)["pass"])
+        settled = [replace(box, z=(box.z[0] + z_shift, box.z[1] + z_shift))
+                   if box.name == "hall_cabinet" else box for box in authored]
+        report = checks_mod.check_final_geometry(spec, settled, self.assets, authored=authored,
+                                                 source="test")
+        return report
+
+    def test_the_recheck_catches_a_piece_lifted_into_the_ceiling(self):
+        report = self._settled_recheck(0.4)
+        self.assertEqual(report["kind"], "blender_agent_final_geometry")
+        self.assertFalse(report["pass"])
+        self.assertIn("furniture_containment", self._failing(report))
+        adjustment = next(item for item in report["final_geometry"]["adjustments"]
+                          if item["name"] == "hall_cabinet")
+        self.assertTrue(adjustment["changed"])
+        self.assertAlmostEqual(adjustment["z_shift_m"], 0.4, places=6)
+        self.assertEqual(report["final_geometry"]["moved"], 1)
+
+    def test_the_recheck_passes_the_settled_boxes_that_fit(self):
+        report = self._settled_recheck(0.0)
+        self.assertTrue(report["pass"], report["violations"])
+        self.assertEqual(report["final_geometry"]["moved"], 0)
+
+    def test_the_recheck_cli_takes_settle_boxes(self):
+        spec_path = PARTIAL_CEILING_SPEC
+        boxes = {"items": [
+            {"name": "entry_shelf", "room": "entry", "bbox": [9.05, 0.1, 0.0, 9.95, 0.5, 1.8]},
+            {"name": "hall_cabinet", "room": "hall", "bbox": [6.7, 2.35, 0.4, 7.3, 2.85, 3.0]},
+        ]}
+        box_path = os.path.join(self.tmp, "final_boxes.json")
+        with open(box_path, "w", encoding="utf-8") as handle:
+            json.dump(boxes, handle)
+        report_path = os.path.join(self.tmp, "final_report.json")
+        code = checks_mod.main([spec_path, "--final-bboxes", box_path,
+                                "--assets-index", CEILING_BREAKER_ASSETS,
+                                "--report", report_path, "--quiet"])
+        self.assertEqual(code, 1)
+        with open(report_path, "r", encoding="utf-8") as handle:
+            report = json.load(handle)
+        self.assertEqual(report["kind"], "blender_agent_final_geometry")
+        self.assertIn("furniture_containment", [entry["name"] for entry in report["checks"]
+                                                if not entry["pass"]])
+        boxes["items"][1]["bbox"] = [6.7, 2.35, 0.0, 7.3, 2.6]
+        with open(box_path, "w", encoding="utf-8") as handle:
+            json.dump(boxes, handle)
+        self.assertEqual(checks_mod.main([spec_path, "--final-bboxes", box_path,
+                                          "--assets-index", CEILING_BREAKER_ASSETS,
+                                          "--quiet"]), 0)
+
+    def test_the_recheck_reads_a_build_manifest(self):
+        """The manifest path: settle's ``bbox_z``, matched to the spec by position."""
+        data = _load_dict(PARTIAL_CEILING_SPEC)
+        data["furniture"] += [
+            {"asset": "ph:mid_cabinet", "room": "hall", "pos": [7.0, 2.6], "rot_z_deg": 0,
+             "name": "cabinet"},
+            {"asset": "ph:mid_cabinet", "room": "entry", "pos": [9.5, 2.4], "rot_z_deg": 180,
+             "name": "cabinet"},
+        ]
+        manifest = {
+            "kind": "blender_agent_build", "spec": data,
+            "furniture": [
+                {"name": "entry_shelf", "asset": "builtin:storage_shelf", "pos": [9.5, 0.3],
+                 "rot_z_deg": 0, "size_m": [0.9, 0.4, 1.8], "bbox_z": [0.0, 1.8]},
+                {"name": "cabinet", "asset": "ph:mid_cabinet", "pos": [7.0, 2.6], "rot_z_deg": 0,
+                 "size_m": [0.6, 0.5, 2.6], "bbox_z": [0.0, 2.6]},
+                {"name": "cabinet", "asset": "ph:mid_cabinet", "pos": [9.5, 2.4], "rot_z_deg": 180,
+                 "size_m": [0.6, 0.5, 2.6], "bbox_z": [0.4, 3.0]},
+            ],
+        }
+        path = os.path.join(self.tmp, "build_manifest.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle)
+
+        spec, boxes, notes, source = checks_mod.load_final_boxes(path, None, self.assets)
+        self.assertEqual([(box.name, box.room) for box in boxes],
+                         [("entry_shelf", "entry"), ("cabinet", "hall"), ("cabinet", "entry")])
+        self.assertEqual([round(box.z[0], 3) for box in boxes], [0.0, 0.0, 0.4])
+        report = checks_mod.check_final_geometry(spec, boxes, self.assets, source=source)
+        self.assertIn("furniture_containment", self._failing(report))
+        violation = next(text for text in self._entry(report)["violations"] if "cabinet" in text)
+        self.assertIn("pokes 0.300 m through the ceiling of room 'entry'", violation)
+
+    def test_a_build_manifest_with_an_unknown_asset_is_noted_not_guessed(self):
+        data = _load_dict(PARTIAL_CEILING_SPEC)
+        manifest = {"kind": "blender_agent_build", "spec": data, "furniture": [
+            {"name": "ghost", "asset": "ph:ghost", "pos": [9.5, 0.3], "rot_z_deg": 0,
+             "size_m": [0.5, 0.5, 0.5], "bbox_z": [0.0, 0.5]}]}
+        path = os.path.join(self.tmp, "build_manifest.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle)
+        _spec, boxes, notes, _source = checks_mod.load_final_boxes(path, None, self.assets)
+        self.assertEqual(boxes, [])
+        self.assertTrue(any("ghost" in note for note in notes), notes)
+        report = checks_mod.check_final_geometry(_spec, boxes, self.assets, notes=notes)
+        self.assertIn("final_geometry_measured", self._failing(report))
+        self.assertFalse(report["pass"])
 
 
 if __name__ == "__main__":
