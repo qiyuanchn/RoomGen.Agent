@@ -365,6 +365,33 @@ in `review_repair.json`, and `scripts/layout_gen_run.sh` drives the loop
 (`PANOWORLD_REVIEW=1`, plus `PANOWORLD_REVIEW_REPAIR=1` for one repair retry,
 graded as `review_ok` in the summary and exit code 6 when it fails).
 
+A spec tweak only helps the *next* render.  `review.py <outdir> --fix-exposure`
+re-does the colour management of the render that is already on disk instead:
+OpenImageDenoise plus the display transform of the saved linear EXRs, no
+modelling and no ray tracing.  It estimates the exposure from the linear data
+(interior clipping only, ERP-weighted, one value for the whole viewpoint set),
+writes the panoramas, keeps the previous images in `build/pano_pre_exposure/`
+and records what changed in `review_exposure.json`; `--exposure N` pins the
+stop value instead of estimating one.
+
+Every camera is rewritten with the display settings its panorama was
+*delivered* with, so that the re-do changes the exposure and nothing else:
+
+* the per-camera record of the denoise pass
+  (`build/build_manifest.json` -> `render.post_denoise.cameras[]`, written by
+  `run_build.py --denoise-only`) when it carries `view_transform`/`exposure`;
+* the render's own settings (`render.view_transform`/`render.exposure`) for a
+  camera the denoise pass left alone -- that panorama is the render's output;
+* `Standard`/0 only for a legacy product whose denoise pass recorded no
+  settings at all (its output node hard-coded `Standard`/0, so the render block
+  describes the render, not those images).  That fallback is reported with
+  `source: "post_denoise_legacy"` and a warning.
+
+An `AgX` panorama is therefore never silently rewritten as `Standard`: a
+transform this module cannot reproduce is measured from the delivered panorama
+and handed to Blender for the re-do, and without Blender the re-do refuses
+(`unsupported_transform`) rather than write the wrong response.
+
 ## Furniture settling (drop to rest)
 
 Placement in a spec is *analytic*: a piece's bottom goes to the authored `z`

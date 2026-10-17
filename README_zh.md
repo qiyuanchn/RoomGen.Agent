@@ -152,8 +152,21 @@ PANOWORLD_BATCH_RENDER=1 PANOWORLD_REVIEW=1 \
 python blender_agent/review.py outputs/stream/scene_0007            # 退出 0 通过 / 1 失败
 python blender_agent/review.py outputs/stream/scene_0007 --strict   # warn 也算失败
 python blender_agent/review.py outputs/stream/scene_0007 --apply-repair   # 微调 spec.json
+python blender_agent/review.py outputs/stream/scene_0007 --fix-exposure   # 重做色彩管理
 REVIEW_CMD="mymodel --json" python blender_agent/review.py <outdir>  # 可插拔外部评审
 ```
+
+`--apply-repair` 的 spec 微调只对*下一次*渲染有效，因此 `--fix-exposure` 直接重做
+磁盘上已有渲染的色彩管理：对保存的线性 EXR 走 OpenImageDenoise + 显示变换，按线性
+数据算出的曝光档位（只统计室内过曝、按 ERP 权重、整组视点共用一个值）重写全景图，
+不建模、不重打光线，分钟级而非重渲。旧图留在 `build/pano_pre_exposure/`，
+`review_exposure.json` 记录改动。每个相机都按它那张全景图**实际交付时**的显示设置
+重写：优先 `build/build_manifest.json` 中降噪流程记录的
+`render.post_denoise.cameras[]`，其次是没有被降噪流程接管的相机的
+`render.view_transform`/`render.exposure`，只有完全没有元数据的旧产物才按其真实输出
+回退到 `Standard`/0——不会把 AgX 全景悄悄改写成 Standard；没有 Blender 时宁可拒绝
+（`unsupported_transform`）。`--exposure N` 可直接指定档位（`--exposure 0` 即按原曝光
+重做一遍，像素应保持不变）。
 
 闭环已接进脚本入口：`PANOWORLD_REVIEW=1` 时，渲染前先做一次仅 spec 的评审（很便宜，
 能在花渲染时间之前拦住空房），渲染后做完整评审。评审失败且

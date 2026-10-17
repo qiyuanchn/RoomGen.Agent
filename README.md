@@ -245,8 +245,26 @@ required scopes to the spec).
 python blender_agent/review.py outputs/stream/scene_0007            # exit 0 pass, 1 fail
 python blender_agent/review.py outputs/stream/scene_0007 --strict   # warnings fail too
 python blender_agent/review.py outputs/stream/scene_0007 --apply-repair   # patch spec.json
+python blender_agent/review.py outputs/stream/scene_0007 --fix-exposure   # redo the colours
 REVIEW_CMD="mymodel --json" python blender_agent/review.py <outdir>  # pluggable reviewer
 ```
+
+A spec tweak (`--apply-repair` above) only helps the *next* render, so
+`--fix-exposure` re-does the colour management of the render already on disk
+instead: OpenImageDenoise plus the display transform of the saved linear EXRs,
+at the exposure those EXRs call for -- no modelling, no ray tracing, minutes
+instead of a rebuild.  The previous images stay in `build/pano_pre_exposure/`
+and `review_exposure.json` records what changed.  Each camera is rewritten with
+the display settings its panorama was *delivered* with, read per camera from
+the denoise pass' record in `build/build_manifest.json`
+(`render.post_denoise.cameras[]`), then from the render block
+(`render.view_transform`/`render.exposure`) for a camera the denoise pass left
+to the render, and only for a legacy product that recorded neither from its
+actual output (`Standard`/0): an `AgX` panorama is never silently rewritten as
+`Standard` -- without Blender the re-do refuses instead
+(`unsupported_transform`).  `--exposure N` pins the stop value instead of
+estimating one (`--exposure 0` redoes the colours at the exposure the images
+already have, and the pixels come back unchanged).
 
 The closed loop is wired into the shell entry points: with
 `PANOWORLD_REVIEW=1` a spec-only review runs *before* the render (cheap, it

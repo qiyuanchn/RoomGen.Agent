@@ -94,7 +94,12 @@ panoramas, simulates the scene's display transform at candidate exposures
 interior surfaces and the sky/window behind them), picks **one** exposure for
 the whole viewpoint set and redoes the colour management of the existing render
 -- denoise and display transform, no modelling, no ray tracing -- then
-re-reviews the images it wrote.  See :func:`fix_exposure`.
+re-reviews the images it wrote.  Each camera is rewritten with the display
+settings its panorama was delivered with, read from the denoise pass' own
+record in the manifest (``render.post_denoise.cameras[]``, falling back to
+``render.view_transform``/``exposure`` and, for a legacy product that recorded
+neither, to ``Standard``/0); AgX is never silently swapped for ``Standard``.
+See :func:`fix_exposure`.
 """
 
 from __future__ import annotations
@@ -1524,35 +1529,160 @@ class _ExposureFrame:
         }
 
 
-def _exposure_settings(artifacts: Artifacts) -> dict:
-    """The display transform and exposure the delivered panoramas were made with.
+#: Display settings of a post-denoise build that recorded no settings of its
+#: own: that pass hard-coded its output node to ``Standard`` at exposure 0, so
+#: the manifest's render block describes the *render*, not the images it wrote.
+_LEGACY_POST_DENOISE = {"transform": "Standard", "exposure": 0.0}
 
-    ``run_build.py --no-denoise`` writes a linear EXR and a separate Blender
-    pass denoises it with the output node's own colour management
-    (``Standard``, exposure 0) -- the ``style.exposure`` of the spec never
-    reaches those files.  A build without that post-pass wrote its panoramas
-    straight from the render, so the render's own view settings apply.
 
-    ``review_exposure.json`` of an earlier re-do overrides both, but only while
-    the panoramas it wrote are still the panoramas on disk; a fresh render
-    invalidates it by hash.
+def _recorded_display(entry) -> Optional[dict]:
+    """The ``view_transform``/``exposure`` one denoise record carries, if any.
+
+    A record of the older ``--denoise-only`` carries neither, which is exactly
+    how a legacy product is told apart from one whose output settings are known.
     """
-    render = ((artifacts.manifest or {}).get("render") or {})
-    if render.get("post_denoise"):
-        settings = {"transform": "Standard", "exposure": 0.0, "denoised": True,
-                    "source": "post_denoise"}
+    if not isinstance(entry, dict):
+        return None
+    transform, exposure = entry.get("view_transform"), entry.get("exposure")
+    if transform is None and exposure is None:
+        return None
+    try:
+        return {"transform": str(transform or "Standard"),
+                "exposure": float(exposure) if exposure is not None else 0.0}
+    except (TypeError, ValueError):
+        return None
+
+
+def _common_display(recorded: Dict[str, dict]) -> Tuple[dict, bool]:
+    """The settings most of ``recorded`` agrees on, and whether they disagreed."""
+    counts: Dict[Tuple[str, float], int] = {}
+    for entry in recorded.values():
+        key = (str(entry["transform"]), float(entry["exposure"]))
+        counts[key] = counts.get(key, 0) + 1
+    (transform, exposure), _seen = max(counts.items(), key=lambda item: item[1])
+    return {"transform": transform, "exposure": exposure}, len(counts) > 1
+
+
+def _display_of(settings: dict, camera: str) -> dict:
+    """The display settings one camera's panorama was delivered with."""
+    return (settings.get("cameras") or {}).get(camera) or {
+        "transform": str(settings["transform"]), "exposure": float(settings["exposure"])}
+
+
+def _camera_exposure(settings: dict, camera: str, exposure: float) -> float:
+    """Put a set-wide *exposure* on the baseline of one camera."""
+    return round(float(exposure) + (float(_display_of(settings, camera)["exposure"])
+                                    - float(settings["exposure"])), 4)
+
+
+def _exposure_settings(artifacts: Artifacts) -> dict:
+    """The display settings each delivered panorama was written with.
+
+    ``run_build.py --no-denoise`` writes a linear EXR per camera and a separate
+    Blender pass denoises it with the output node's colour management; that pass
+    records ``view_transform``/``exposure`` per camera under
+    ``render.post_denoise``.  Per camera the delivered image is therefore read
+    from
+
+    1. its own record in ``post_denoise.cameras[]`` (or the pass' own record,
+       when a writer states the settings once for the whole pass) -- what the
+       current pipeline writes;
+    2. the render's settings (``render.view_transform``/``render.exposure``)
+       when no denoise record covers that camera: the panorama is the render's
+       own output, colour management included;
+    3. ``Standard``/0 for a camera a denoise pass *did* write without recording
+       what it wrote: that pass hard-coded its output node, so the render block
+       describes the render and not that image (``source:
+       "post_denoise_legacy"``, with a warning).
+
+    Assuming ``Standard``/0 for a *recorded* product is what made the exposure
+    estimate pick the wrong response model and the rewrite change the tone;
+    assuming the render's settings for a *legacy* one does the same from the
+    other side, because those images were never made with them.
+
+    ``review_exposure.json`` of an earlier re-do overrides the records camera by
+    camera, but only while the panorama it wrote is still the panorama on disk;
+    a fresh render invalidates it by hash.
+    """
+    manifest = artifacts.manifest or {}
+    render = manifest.get("render") or {}
+    exrs = artifacts.raw_exrs()
+    render_display = {"transform": str(render.get("view_transform") or "Standard"),
+                      "exposure": float(render.get("exposure") or 0.0)}
+    settings = {"transform": render_display["transform"], "exposure": render_display["exposure"],
+                "denoised": bool(render.get("denoising_requested")), "source": "render",
+                "cameras": {}, "warnings": []}
+    post = render.get("post_denoise")
+    recorded: Dict[str, dict] = {}
+    listed = set()
+    base = dict(render_display)
+    if isinstance(post, dict) and post:
+        for entry in post.get("cameras") or []:
+            camera = entry.get("camera") if isinstance(entry, dict) else None
+            if not camera:
+                continue
+            listed.add(camera)
+            per_camera = _recorded_display(entry)
+            if per_camera:
+                recorded[camera] = per_camera
+        block = _recorded_display(post)
+        if recorded or block:
+            if block:
+                base, source = block, "post_denoise"
+            else:
+                base, mixed = _common_display(recorded)
+                source = "post_denoise.cameras"
+                if mixed:
+                    settings["warnings"].append(
+                        "the denoise records disagree on the display settings; using "
+                        f"{base['transform']} / {base['exposure']:g} for the whole set")
+            settings.update({"denoised": True, "source": source,
+                             "transform": base["transform"], "exposure": float(base["exposure"])})
+        else:
+            base = dict(_LEGACY_POST_DENOISE)
+            settings.update({"denoised": True, "source": "post_denoise_legacy",
+                             "transform": base["transform"], "exposure": base["exposure"]})
+            settings["warnings"].append(
+                "the denoise pass recorded no display settings (an older build): that pass "
+                "hard-coded its output node to Standard/0, so its panoramas are read as "
+                "Standard/0 -- the render block "
+                f"({render_display['transform']} / {render_display['exposure']:g}) describes "
+                "the render, not those images")
+        for camera in sorted(listed):
+            settings["cameras"][camera] = dict(recorded.get(camera) or base)
     else:
-        settings = {"transform": str(render.get("view_transform") or "Standard"),
-                    "exposure": float(render.get("exposure") or 0.0), "denoised": False,
-                    "source": "render"}
+        base = dict(render_display)
+    known: List[str] = []
+    for entry in manifest.get("cameras") or []:
+        camera = entry.get("camera") if isinstance(entry, dict) else None
+        if camera and camera not in known:
+            known.append(camera)
+    for camera in sorted(set(settings["cameras"]) | set(exrs)):
+        if camera not in known:
+            known.append(camera)
+    # the denoise pass rewrites every camera it has a linear EXR for; a block
+    # that lists no camera at all covered exactly those.  A camera it skipped
+    # (no EXR) kept the render's own output, colour management included.
+    covered = listed if listed else set(exrs)
+    for camera in known:
+        settings["cameras"].setdefault(camera, dict(base if camera in covered else render_display))
     applied = _load_json(os.path.join(artifacts.outdir, "review_exposure.json")) or {}
     if applied.get("changed"):
         for camera, record in sorted((applied.get("cameras") or {}).items()):
+            if not isinstance(record, dict) or not record.get("sha256_after"):
+                continue
             panorama = os.path.join(artifacts.outdir, "build", f"pano_{camera}.png")
-            if record.get("sha256_after") and _digest(panorama) == record["sha256_after"]:
-                settings.update({"exposure": float(applied.get("exposure_after", settings["exposure"])),
+            if _digest(panorama) != record["sha256_after"]:
+                continue
+            before = _display_of(settings, camera)
+            after = {"transform": str(record.get("view_transform") or before["transform"]),
+                     "exposure": float(record.get("exposure", applied.get("exposure_after",
+                                                                         before["exposure"])))}
+            settings["cameras"][camera] = after
+            if settings["source"] != "review_exposure.json":
+                settings.update({"transform": after["transform"], "exposure": after["exposure"],
+                                 "denoised": bool(record.get("denoised", settings["denoised"])),
                                  "source": "review_exposure.json"})
-                break
     return settings
 
 
@@ -1579,31 +1709,41 @@ def estimate_exposure(artifacts: Artifacts, index: Optional[Dict[str, dict]] = N
     clip share is measured with the ERP weights; the smallest drop that clears
     the gate wins.  Bright windows are not counted against the estimate -- a
     view whose clipping sits in the sky is reported, not darkened.
+
+    Every camera is modelled with the display transform its own panorama was
+    delivered with (:func:`_exposure_settings`); one this module cannot
+    reproduce (AgX and friends) is measured from the delivered images instead
+    of being swapped for ``Standard``.
     """
     import numpy as np
 
     settings = _exposure_settings(artifacts)
+    baseline_exposure = float(settings["exposure"])
     result: dict = {
         "kind": "blender_agent_review_exposure_estimate",
         "created_utc": _utc_now(),
         "scene": artifacts.outdir,
         "target": target,
         "transform": settings["transform"],
-        "exposure_before": round(float(settings["exposure"]), 3),
+        "display_source": settings["source"],
+        "display": {camera: _display_of(settings, camera)
+                    for camera in sorted(settings.get("cameras") or {})},
+        "exposure_before": round(baseline_exposure, 3),
         "exposure_after": None,
         "delta_stops": None,
         "cameras": {},
-        "warnings": [],
+        "warnings": list(settings.get("warnings") or []),
     }
     raw_paths = artifacts.raw_exrs()
     if not raw_paths:
         result.update({"status": "no_linear_source",
                        "detail": "the build kept no linear EXR (render with --no-denoise)"})
         return result
-    curve = None
-    if settings["transform"] not in _PURE_PYTHON_TRANSFORMS:
+    foreign = sorted({str(_display_of(settings, camera)["transform"]) for camera in raw_paths}
+                     - set(_PURE_PYTHON_TRANSFORMS))
+    if foreign:
         result["warnings"].append(
-            f"view transform '{settings['transform']}' is not reproduced by this module; "
+            f"view transform(s) {', '.join(foreign)} are not reproduced by this module; "
             f"the display response is measured from the delivered panoramas instead")
     frames: Dict[str, _ExposureFrame] = {}
     for camera, raw_path in sorted(raw_paths.items()):
@@ -1613,36 +1753,50 @@ def estimate_exposure(artifacts: Artifacts, index: Optional[Dict[str, dict]] = N
                                             artifacts.exterior_depth_m)
         except Exception as error:
             result["cameras"][camera] = {"error": f"{type(error).__name__}: {error}"}
-    usable = {camera: frame for camera, frame in frames.items() if frame.delivered is not None
-              or settings["transform"] in _PURE_PYTHON_TRANSFORMS}
+    usable = {camera: frame for camera, frame in frames.items()
+              if frame.delivered is not None
+              or _display_of(settings, camera)["transform"] in _PURE_PYTHON_TRANSFORMS}
     if not usable:
         result.update({"status": "no_linear_source",
                        "detail": "no camera has both a linear EXR and a delivered panorama"})
         return result
-    if settings["transform"] not in _PURE_PYTHON_TRANSFORMS:
-        scale = 2.0 ** float(settings["exposure"])
-        xs = [_luminance(frame.linear).ravel() * scale for frame in usable.values()
-              if frame.delivered is not None]
-        ys = [frame.delivered.ravel() for frame in usable.values()
-              if frame.delivered is not None]
+    curves: Dict[str, object] = {}
+    for transform in foreign:
+        xs, ys = [], []
+        for camera, frame in usable.items():
+            if frame.delivered is None or _display_of(settings, camera)["transform"] != transform:
+                continue
+            xs.append(_luminance(frame.linear).ravel()
+                      * (2.0 ** float(_display_of(settings, camera)["exposure"])))
+            ys.append(frame.delivered.ravel())
         curve = _measured_curve(np.concatenate(xs), np.concatenate(ys)) if xs else None
         if curve is None:
             result.update({"status": "unsupported_transform",
-                           "detail": f"cannot measure the '{settings['transform']}' response"})
+                           "detail": f"cannot measure the '{transform}' response"})
             return result
+        curves[transform] = curve
+
+    def exposure_of(camera: str, exposure: float) -> float:
+        """The set-wide *exposure* on the baseline of one camera."""
+        return float(exposure) + (float(_display_of(settings, camera)["exposure"])
+                                  - baseline_exposure)
 
     def evaluate(exposure: float) -> Dict[str, dict]:
         out = {}
         for camera, frame in usable.items():
-            if curve is None:
-                display = frame.simulate(exposure, settings["transform"])
+            transform = str(_display_of(settings, camera)["transform"])
+            value = exposure_of(camera, exposure)
+            if transform in curves:
+                display = _apply_curve(_luminance(frame.linear) * (2.0 ** value),
+                                       curves[transform])
             else:
-                display = _apply_curve(_luminance(frame.linear) * (2.0 ** exposure), curve)
+                display = frame.simulate(value, transform)
             out[camera] = frame.metrics(display)
         return out
 
-    baseline = evaluate(float(settings["exposure"]))
-    result["cameras"] = {camera: {"baseline": metrics} for camera, metrics in baseline.items()}
+    baseline = evaluate(baseline_exposure)
+    result["cameras"] = {camera: {"baseline": metrics, "display": _display_of(settings, camera)}
+                         for camera, metrics in baseline.items()}
     model_error = {}
     for camera, frame in usable.items():
         if frame.delivered is None:
@@ -1675,7 +1829,7 @@ def estimate_exposure(artifacts: Artifacts, index: Optional[Dict[str, dict]] = N
                        "detail": "no camera clips indoors beyond the target"})
         return result
     steps = max(1, int(round(max_drop / step)))
-    candidates = [settings["exposure"] - round(index * step, 6) for index in range(steps + 1)]
+    candidates = [baseline_exposure - round(index * step, 6) for index in range(steps + 1)]
     chosen = chosen_metrics = None
     fallback = None
     for exposure in candidates:
@@ -1701,7 +1855,7 @@ def estimate_exposure(artifacts: Artifacts, index: Optional[Dict[str, dict]] = N
     result.update({
         "status": "ok" if clears(chosen_metrics) else "unreachable",
         "exposure_after": round(float(chosen), 3),
-        "delta_stops": round(float(chosen - settings["exposure"]), 3),
+        "delta_stops": round(float(chosen - baseline_exposure), 3),
         "predicted": chosen_metrics,
         "failing_cameras": [camera for camera, item in baseline.items()
                             if item["interior_clip_fraction"] >= clip_limit
@@ -1830,7 +1984,7 @@ def fix_exposure(outdir: str, spec_path: Optional[str] = None, manifest_path: Op
                  max_drop: float = 4.0, use_blender: bool = True, dry_run: bool = False,
                  review_after: bool = True, review_cmd: Optional[str] = None,
                  allow_external_error: bool = False, strict: bool = False,
-                 report_path: Optional[str] = None) -> dict:
+                 report_path: Optional[str] = None, exposure: Optional[float] = None) -> dict:
     """Redo the colour management of an existing render at a better exposure.
 
     The benchmark's exposure repair used to subtract a fixed 0.3 stops from
@@ -1843,6 +1997,12 @@ def fix_exposure(outdir: str, spec_path: Optional[str] = None, manifest_path: Op
     instead of a full rebuild.  ``spec.json`` is left alone; the images are
     re-derived from the same build, which is why ``review_exposure.json``
     records what changed and ``build/pano_pre_exposure/`` keeps the old files.
+
+    Each camera is rewritten with the display transform its panorama was
+    delivered with, at the estimated stop shift; ``exposure`` pins the stop
+    value instead (``--exposure``), which is how a caller redoes the colour
+    management at the exposure the panorama already has without the gate
+    having to ask for it.
 
     Returns the estimate, the per-camera rewrite report and, unless
     ``review_after`` is off, the re-review of the images that were written.
@@ -1859,21 +2019,30 @@ def fix_exposure(outdir: str, spec_path: Optional[str] = None, manifest_path: Op
         "scene": artifacts.outdir,
         "target": target,
         "dry_run": bool(dry_run),
+        "exposure_pinned": None if exposure is None else round(float(exposure), 4),
         "estimate": estimate,
         "cameras": {},
         "changed": False,
     }
-    if estimate.get("status") not in ("ok", "unreachable"):
-        result["status"] = estimate.get("status") or "error"
-        result["detail"] = estimate.get("detail") or estimate.get("warnings")
+    if exposure is None:
+        if estimate.get("status") not in ("ok", "unreachable"):
+            result["status"] = estimate.get("status") or "error"
+            result["detail"] = estimate.get("detail") or estimate.get("warnings")
+            return result
+        chosen = float(estimate["exposure_after"])
+    elif not artifacts.raw_exrs():
+        result["status"] = estimate.get("status") or "no_linear_source"
+        result["detail"] = estimate.get("detail") or "the build kept no linear EXR"
         return result
+    else:
+        chosen = float(exposure)
     settings = _exposure_settings(artifacts)
-    exposure = estimate["exposure_after"]
     blender = _blender_binary() if use_blender else None
-    pure_python = settings["transform"] in _PURE_PYTHON_TRANSFORMS
-    if blender is None and not pure_python:
+    foreign = sorted({str(_display_of(settings, camera)["transform"])
+                      for camera in artifacts.raw_exrs()} - set(_PURE_PYTHON_TRANSFORMS))
+    if blender is None and foreign:
         result.update({"status": "unsupported_transform",
-                       "detail": f"view transform '{settings['transform']}' needs Blender "
+                       "detail": f"view transform(s) {', '.join(foreign)} need Blender "
                                  f"for the colour re-do and none was found"})
         return result
     raw_paths = artifacts.raw_exrs()
@@ -1897,8 +2066,10 @@ def fix_exposure(outdir: str, spec_path: Optional[str] = None, manifest_path: Op
             continue
         if blender is not None:
             jobs.append({"camera": camera, "raw": raw_path, "out": pano,
-                         "work_dir": build_dir, "view_transform": settings["transform"],
-                         "exposure": float(exposure), "denoise": denoise})
+                         "work_dir": build_dir,
+                         "view_transform": str(_display_of(settings, camera)["transform"]),
+                         "exposure": _camera_exposure(settings, camera, chosen),
+                         "denoise": denoise})
         else:
             try:
                 frames[camera] = _ExposureFrame(camera, raw_path, view,
@@ -1927,13 +2098,14 @@ def fix_exposure(outdir: str, spec_path: Optional[str] = None, manifest_path: Op
     if dry_run:
         result.update({"status": "dry_run", "detail": "the estimate is ready, nothing was written",
                        "exposure_before": estimate["exposure_before"],
-                       "exposure_after": exposure, "seconds": round(time.time() - started, 3)})
+                       "exposure_after": chosen, "seconds": round(time.time() - started, 3)})
         return result
     try:
         if jobs:
             _run_blender_rewrite(jobs, blender)
         for camera, frame in frames.items():
-            _python_rewrite(frame, exposure, settings["transform"],
+            _python_rewrite(frame, _camera_exposure(settings, camera, chosen),
+                            str(_display_of(settings, camera)["transform"]),
                             os.path.join(build_dir, f"pano_{camera}.png"))
     except Exception as error:
         result.update({"status": "error", "detail": f"{type(error).__name__}: {error}",
@@ -1947,17 +2119,18 @@ def fix_exposure(outdir: str, spec_path: Optional[str] = None, manifest_path: Op
         if view and not dry_run:
             shutil.copyfile(pano, view)
         record = {"status": "written", "panorama": os.path.relpath(pano, artifacts.outdir),
-                  "exposure": round(float(exposure), 4),
+                  "exposure": _camera_exposure(settings, camera, chosen),
                   "sha256_before": before.get(camera), "sha256_after": _digest(pano),
                   "denoised": bool(denoise and blender is not None),
-                  "view_transform": settings["transform"]}
+                  "view_transform": str(_display_of(settings, camera)["transform"])}
         if camera in estimate.get("predicted", {}):
             record["predicted"] = estimate["predicted"][camera]
         result["cameras"][camera] = record
     result.update({"changed": True, "status": "applied",
-                   "exposure_before": estimate["exposure_before"], "exposure_after": exposure,
-                   "delta_stops": estimate["delta_stops"],
-                   "style_exposure_recommended": round(float(exposure), 3),
+                   "exposure_before": estimate["exposure_before"], "exposure_after": chosen,
+                   "delta_stops": (estimate.get("delta_stops") if exposure is None else
+                                   round(float(chosen - float(estimate["exposure_before"])), 3)),
+                   "style_exposure_recommended": round(float(chosen), 3),
                    "backup": backup_dir})
     exposure_path = os.path.join(artifacts.outdir, "review_exposure.json")
     if review_after:
@@ -2379,6 +2552,9 @@ def main(argv=None) -> int:
                         help="with --fix-exposure: clear the gate (default) or the warning level")
     parser.add_argument("--exposure-max-drop", type=float, default=4.0,
                         help="with --fix-exposure: stop searching after this many stops")
+    parser.add_argument("--exposure", type=float, default=None,
+                        help="with --fix-exposure: redo the colour management at this exposure "
+                             "instead of estimating one (0 = keep the exposure of the render)")
     parser.add_argument("--no-blender", action="store_true",
                         help="with --fix-exposure: never call Blender; only a Standard view "
                              "transform can be redone without it")
@@ -2426,7 +2602,8 @@ def main(argv=None) -> int:
                                   use_blender=not args.no_blender, dry_run=args.dry_run,
                                   review_after=args.review_after, review_cmd=args.review_cmd,
                                   allow_external_error=args.allow_external_error,
-                                  strict=args.strict, report_path=args.json_out)
+                                  strict=args.strict, report_path=args.json_out,
+                                  exposure=args.exposure)
         except Exception as error:                       # a failed re-do must stay legible
             import traceback
 

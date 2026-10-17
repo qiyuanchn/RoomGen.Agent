@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from typing import Optional
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(TESTS_DIR)
@@ -316,14 +317,19 @@ def synthetic_frames(height: int = 32, width: int = 64, blown_rows=None, blown: 
 
 
 def synthetic_render(root: str, spec: dict, cameras: int = 2, display=None,
-                     **frames_kwargs) -> dict:
+                     record_display: Optional[float] = None, **frames_kwargs) -> dict:
     """Add a linear-EXR build to ``root``: the inputs ``--fix-exposure`` reads.
 
     The delivered PNGs are the ``Standard`` display transform of the linear
-    data at exposure 0 -- what ``run_build.py --no-denoise`` plus the denoise
-    pass write -- while the manifest still claims the render's AgX/exposure.
+    data at exposure 0 -- what ``run_build.py --no-denoise`` plus the *older*
+    denoise pass wrote -- while the manifest still claims the render's
+    AgX/exposure and the denoise block records no settings of its own.
     ``display`` replaces that colour management with a callable (a foreign view
-    transform: the manifest then records it as the render's own).
+    transform: the manifest then records it as the render's own, and no denoise
+    block is written).  ``record_display`` builds the *current* product
+    instead: the panoramas are ``display`` (``Standard`` when it is None) at
+    that exposure and every camera's denoise record carries the
+    ``view_transform``/``exposure`` it was written with.
     """
     import numpy as np
 
@@ -331,9 +337,12 @@ def synthetic_render(root: str, spec: dict, cameras: int = 2, display=None,
     render = {"width": 64, "height": 32, "samples": 8, "view_transform": "AgX",
               "exposure": 1.4, "post_denoise": {"denoiser": "OPENIMAGEDENOISE",
                                                 "prefilter": "ACCURATE", "quality": "FAST"}}
-    if display is not None:
+    if display is not None or record_display is not None:
         render = {"width": 64, "height": 32, "samples": 8, "view_transform": "AgX",
-                  "exposure": 0.0}
+                  "exposure": 0.0 if record_display is None else float(record_display)}
+    if record_display is not None:
+        render["post_denoise"] = {"denoiser": "OPENIMAGEDENOISE", "prefilter": "ACCURATE",
+                                  "quality": "FAST", "cameras": []}
     os.makedirs(os.path.join(root, "build"), exist_ok=True)
     entries = []
     for camera in spec["cameras"][:cameras]:
@@ -344,14 +353,20 @@ def synthetic_render(root: str, spec: dict, cameras: int = 2, display=None,
         view = os.path.join(root, "scene", "viewpoints", camera["name"])
         os.makedirs(view, exist_ok=True)
         if display is None:
-            rendered = review_mod._display_rgb(linear, 0.0, "Standard")
+            rendered = review_mod._display_rgb(linear, float(record_display or 0.0), "Standard")
         else:
-            rendered = np.clip(np.asarray(display(linear), dtype="float32"), 0.0, 1.0)
+            scaled = linear if record_display is None else linear * (2.0 ** float(record_display))
+            rendered = np.clip(np.asarray(display(scaled), dtype="float32"), 0.0, 1.0)
         png = os.path.join(root, "build", f"pano_{camera['name']}.png")
         Image.fromarray((rendered * 255.0 + 0.5).astype("uint8")).save(png)
         Image.open(png).save(os.path.join(view, "panoImage_2048.png"))
         entries.append({"camera": camera["name"], "raw_exr": raw,
                         "pano": f"pano_{camera['name']}.png", "pos": camera["pos"] + [1.5]})
+        if record_display is not None:
+            render["post_denoise"]["cameras"].append(
+                {"camera": camera["name"], "raw_exr": raw, "pano": entries[-1]["pano"],
+                 "prefilter": "ACCURATE", "quality": "FAST", "use_hdr": True,
+                 "view_transform": "AgX", "exposure": float(record_display), "size": [64, 32]})
     manifest["render"] = render
     manifest["cameras"] = entries
     manifest["shell"] = {"dome_radius": 25.0}
@@ -791,6 +806,192 @@ class ExposureTest(unittest.TestCase):
         result = review_mod.fix_exposure(package.root, index=index, use_blender=False)
         self.assertEqual(result["status"], "unsupported_transform")
         self.assertFalse(result["changed"])
+
+    @unittest.skipUnless(HAVE_IMAGES, "numpy/PIL not available")
+    def test_a_recorded_denoise_pass_decides_the_display_settings(self):
+        """Counterexample: a recorded AgX/1.4 product was read as Standard/0.
+
+        ``_exposure_settings`` only looked at *whether* a denoise block existed,
+        so an artifact whose pass recorded ``AgX`` at 1.4 stops was modelled
+        with the Standard response at exposure 0: the estimate picked the wrong
+        response model and the rewrite changed the tone of the panorama instead
+        of only its brightness.
+        """
+        import numpy as np
+
+        def filmic(linear):
+            return 1.0 - np.exp(-np.asarray(linear, dtype="float32"))
+
+        package = self._package(display=filmic, record_display=1.4,
+                                blown_rows=(11, 24), blown=6.0, ramp=0.6)
+        artifacts = review_mod.Artifacts(package.root)
+        settings = review_mod._exposure_settings(artifacts)
+        self.assertEqual(settings["source"], "post_denoise.cameras")
+        self.assertEqual(settings["transform"], "AgX")
+        self.assertAlmostEqual(settings["exposure"], 1.4, places=6)
+        self.assertIs(settings["denoised"], True)
+        self.assertEqual({entry["transform"] for entry in settings["cameras"].values()}, {"AgX"})
+
+        estimate = review_mod.estimate_exposure(artifacts)
+        self.assertEqual(estimate["transform"], "AgX", estimate)
+        self.assertEqual(estimate["display_source"], "post_denoise.cameras")
+        self.assertEqual(estimate["exposure_before"], 1.4)
+        self.assertEqual(estimate["display"]["0000"], {"transform": "AgX", "exposure": 1.4})
+        self.assertEqual(estimate["status"], "ok", estimate)
+        self.assertTrue(any("measured" in warning for warning in estimate["warnings"]))
+        # AgX cannot be redone without Blender: refusing is right, writing a
+        # Standard image over the AgX one (the old behaviour) is not
+        result = review_mod.fix_exposure(package.root, use_blender=False)
+        self.assertEqual(result["status"], "unsupported_transform", result)
+        self.assertIn("AgX", result["detail"])
+
+    @unittest.skipUnless(HAVE_IMAGES, "numpy/PIL not available")
+    def test_a_legacy_denoise_pass_falls_back_to_standard(self):
+        """The compat fallback reads the *output*, not the render block.
+
+        A denoise pass that recorded no settings is the older build: its output
+        node hard-coded ``Standard`` at exposure 0 (verified against the
+        panoramas it left on disk), so the manifest's ``AgX``/1.4 render block
+        describes the render -- reading those numbers as the panorama's
+        settings would rewrite a Standard image as AgX.
+        """
+        package = self._package(blown_rows=(11, 24), blown=2.5)
+        settings = review_mod._exposure_settings(review_mod.Artifacts(package.root))
+        self.assertEqual(settings["source"], "post_denoise_legacy")
+        self.assertEqual(settings["transform"], "Standard")
+        self.assertEqual(settings["exposure"], 0.0)
+        self.assertTrue(any("Standard/0" in warning for warning in settings["warnings"]),
+                        settings["warnings"])
+        self.assertEqual({entry["transform"] for entry in settings["cameras"].values()},
+                         {"Standard"})
+        estimate = review_mod.estimate_exposure(review_mod.Artifacts(package.root))
+        self.assertEqual(estimate["transform"], "Standard")
+        self.assertEqual(estimate["status"], "ok", estimate)
+
+    @unittest.skipUnless(HAVE_IMAGES, "numpy/PIL not available")
+    def test_a_camera_the_denoise_pass_left_alone_keeps_the_render_settings(self):
+        """The pass rewrites the cameras it has a linear EXR for, no others.
+
+        A camera it skipped kept the render's own output, so its display
+        settings are the render block's -- not the ones recorded for the
+        cameras the pass did write.
+        """
+        import numpy as np
+
+        def filmic(linear):
+            return 1.0 - np.exp(-np.asarray(linear, dtype="float32"))
+
+        package = self._package(display=filmic, record_display=1.4, cameras=1, ramp=0.6)
+        manifest = load_json(os.path.join(package.root, "build", "build_manifest.json"))
+        manifest["render"]["exposure"] = 0.0            # the render wrote the second one
+        manifest["cameras"].append({"camera": "0001", "pano": "pano_0001.png"})
+        write_json(os.path.join(package.root, "build", "build_manifest.json"), manifest)
+        settings = review_mod._exposure_settings(review_mod.Artifacts(package.root))
+        self.assertEqual(review_mod._display_of(settings, "0000"),
+                         {"transform": "AgX", "exposure": 1.4})
+        self.assertEqual(review_mod._display_of(settings, "0001"),
+                         {"transform": "AgX", "exposure": 0.0})
+
+    @unittest.skipUnless(HAVE_IMAGES, "numpy/PIL not available")
+    def test_a_zero_stop_redo_reproduces_the_delivered_panorama(self):
+        """A re-do at the exposure the panorama already has keeps its pixels.
+
+        ``--exposure 0`` pins the stop value; the rewrite is the same colour
+        management the delivered image came from, so nothing may shift -- not
+        the brightness and not the view transform.
+        """
+        import numpy as np
+
+        package = self._package(blown_rows=(11, 24), blown=2.5)
+        pano = os.path.join(package.root, "build", "pano_0000.png")
+        before = read_png(pano)
+        result = review_mod.fix_exposure(package.root, use_blender=False, review_cmd=None,
+                                         exposure=0.0)
+        self.assertEqual(result["status"], "applied", result)
+        self.assertEqual(result["exposure_after"], 0.0)
+        self.assertEqual(result["delta_stops"], 0.0)
+        self.assertEqual(result["cameras"]["0000"]["view_transform"], "Standard")
+        np.testing.assert_array_equal(read_png(pano), before)
+        sidecar = load_json(os.path.join(package.root, "review_exposure.json"))
+        self.assertEqual(sidecar["exposure_pinned"], 0.0)
+        self.assertEqual(sidecar["cameras"]["0000"]["view_transform"], "Standard")
+        # the re-do is now the record of how the panorama on disk was made
+        redo_settings = review_mod._exposure_settings(review_mod.Artifacts(package.root))
+        self.assertEqual(redo_settings["source"], "review_exposure.json")
+        self.assertEqual(redo_settings["cameras"]["0000"],
+                         {"transform": "Standard", "exposure": 0.0})
+
+    @unittest.skipUnless(HAVE_IMAGES, "numpy/PIL not available")
+    @unittest.skipUnless(os.environ.get("PANOWORLD_BLENDER_TEST") == "1",
+                         "set PANOWORLD_BLENDER_TEST=1 to exercise the Blender re-do")
+    def test_the_real_chain_keeps_agx_at_a_zero_stop_adjustment(self):
+        """AgX/1.4 through the real denoise pass -> review -> exposure re-do.
+
+        ``panorama.denoise_pano_file`` is what ``run_build.py --denoise-only``
+        calls, with the scene's display settings.  Reviewing that product and
+        redoing its colour management at the same exposure must reproduce the
+        delivered panorama -- the old code rewrote it with ``Standard``, which
+        changes the tone of every pixel.
+        """
+        import numpy as np
+
+        blender = review_mod._blender_binary()
+        self.assertIsNotNone(blender, "no Blender found for the real chain")
+        spec = cached_spec()
+        package = self._package(spec=spec)
+        build = os.path.join(package.root, "build")
+        os.makedirs(build, exist_ok=True)
+        camera = spec["cameras"][0]["name"]
+        linear, depth = synthetic_frames(blown_rows=(11, 24), blown=2.5, ramp=0.6)
+        raw = os.path.join(build, f"raw_{camera}0012.exr")
+        pano = os.path.join(build, f"pano_{camera}.png")
+        write_exr(raw, linear)
+        np.save(os.path.join(build, f"depth_{camera}.npy"), depth)
+        expression = (f"import sys; sys.path.insert(0, {REPO_ROOT!r}); "
+                      f"from blender_agent import panorama; "
+                      f"panorama.denoise_pano_file({raw!r}, {pano!r}, prefilter='FAST', "
+                      f"quality='FAST', view_transform='AgX', exposure=1.4)")
+        denoise = subprocess.run([blender, "--background", "--factory-startup",
+                                  "--python-expr", expression],
+                                 capture_output=True, text=True, cwd=REPO_ROOT, timeout=600)
+        self.assertEqual(denoise.returncode, 0, (denoise.stderr or denoise.stdout)[-2000:])
+        manifest = manifest_for(spec)
+        manifest["render"] = {"width": 64, "height": 32, "samples": 8, "view_transform": "AgX",
+                              "exposure": 1.4, "denoising_requested": False,
+                              "post_denoise": {"denoiser": "OPENIMAGEDENOISE",
+                                               "prefilter": "FAST", "quality": "FAST",
+                                               "cameras": [{"camera": camera,
+                                                            "raw_exr": os.path.basename(raw),
+                                                            "pano": os.path.basename(pano),
+                                                            "view_transform": "AgX",
+                                                            "exposure": 1.4}]}}
+        manifest["cameras"] = [{"camera": camera, "raw_exr": os.path.basename(raw),
+                                "pano": os.path.basename(pano),
+                                "pos": spec["cameras"][0]["pos"] + [1.5]}]
+        manifest["shell"] = {"dome_radius": 25.0}
+        write_json(os.path.join(build, "build_manifest.json"), manifest)
+        view = os.path.join(package.root, "scene", "viewpoints", camera)
+        os.makedirs(view, exist_ok=True)
+        Image.open(pano).save(os.path.join(view, "panoImage_2048.png"))
+
+        settings = review_mod._exposure_settings(review_mod.Artifacts(package.root))
+        self.assertEqual(settings["transform"], "AgX")
+        self.assertEqual(settings["source"], "post_denoise.cameras")
+        delivered = read_png(pano)
+        result = review_mod.fix_exposure(package.root, use_blender=True, review_after=False,
+                                         exposure=1.4)
+        self.assertEqual(result["status"], "applied", result)
+        self.assertEqual(result["cameras"][camera]["view_transform"], "AgX")
+        self.assertAlmostEqual(result["cameras"][camera]["exposure"], 1.4, places=4)
+        redone = read_png(pano)
+        self.assertLess(float(np.abs(redone - delivered).mean()), 0.01,
+                        "a 0-stop re-do must reproduce the delivered panorama")
+        imported = {
+            name: review_mod.read_exr(raw)["channels"][name] for name in ("R", "G", "B")}
+        standard = review_mod._display_rgb(
+            np.stack([imported[name] for name in ("R", "G", "B")], -1), 1.4, "Standard")
+        self.assertGreater(float(np.abs(redone - standard).mean()), 0.05,
+                           "the re-do must not fall back to the Standard response")
 
     @unittest.skipUnless(HAVE_IMAGES, "numpy/PIL not available")
     def test_apply_repair_uses_the_measured_exposure(self):
