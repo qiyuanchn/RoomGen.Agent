@@ -422,6 +422,431 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(sample["reasons"]["1"], "new topology structure")
 
 
+# --------------------------------------------------------------------------- #
+# final products: request vs build vs delivery, fallbacks and bias
+# --------------------------------------------------------------------------- #
+BENCHMARK_ROOTS = os.path.join(REPO_ROOT, "outputs", "benchmark100")
+#: arrangements that are not a topology *family*: layout_gen names them in
+#: ``report["shape"]`` and leaves ``report["family"]`` empty
+PLAIN_SHAPES = ("row", "block", "duplex")
+ALL_OK = {"layout_ok": True, "render_ok": True, "validation_ok": True, "bundle_ok": True}
+
+
+def stats_block(**overrides) -> dict:
+    """A layout_report stats block, with the fields layout_gen really writes."""
+    block = {"seed": 0, "attempt": 0, "attempts_used": 1, "floors": 1}
+    block.update(overrides)
+    return block
+
+
+def forecast_block(**rooms) -> dict:
+    """``door_visual_forecast``: per camera name, what it sees."""
+    return {name: {"room": room, "coverage": {"visible_area_fraction": value},
+                   "visible_fraction": 1.0}
+            for name, (room, value) in rooms.items()}
+
+
+def write_scene(root: str, seed: int, spec: dict, family: str, stats: dict = None,
+                ok: dict = None, failure: dict = None, forecast: dict = None,
+                review: dict = None, validation: dict = None) -> dict:
+    """One scene directory of a synthetic batch, plus the batch row describing it."""
+    scene = os.path.join(root, "scene_%04d" % seed)
+    os.makedirs(scene, exist_ok=True)
+    block = stats_block(seed=seed)
+    block.update(stats or {})
+    report = {"shape": family, "family": family if family not in PLAIN_SHAPES else None,
+              "stats": block}
+    if forecast is not None:
+        report["door_visual_forecast"] = forecast
+    levels = dict(ALL_OK if ok is None else ok)
+    with open(os.path.join(scene, "spec.json"), "w", encoding="utf-8") as handle:
+        json.dump(spec, handle)
+    with open(os.path.join(scene, "layout_report.json"), "w", encoding="utf-8") as handle:
+        json.dump(report, handle)
+    summary = {"kind": "layout_gen_run", "seed": seed, "stats": block, "ok": levels,
+               "failure": failure, "render_requested": True,
+               "stages": {"layout": "ok" if levels.get("layout_ok") else "failed",
+                          "render": "ok" if levels.get("render_ok") else "failed",
+                          "validation": "ok" if levels.get("validation_ok") else "failed"}}
+    if review is not None:
+        summary["review"] = review
+    if validation is not None:
+        summary["validation"] = validation
+    with open(os.path.join(scene, "run_summary.json"), "w", encoding="utf-8") as handle:
+        json.dump(summary, handle)
+    return {"seed": seed, "dir": "scene_%04d" % seed,
+            "status": "bundle_ok" if levels.get("bundle_ok") else "failed",
+            "ok": levels, "failure": failure, "resumed": False}
+
+
+def write_root(root: str, rows, request: dict = None, render_requested: bool = True,
+               review_requested: bool = True) -> None:
+    summary = {"kind": "layout_gen_batch", "schema_version": 2, "batch_id": "test",
+               "render_requested": render_requested, "review_requested": review_requested,
+               "request": request, "levels": None, "scenes": rows}
+    with open(os.path.join(root, "batch_summary.json"), "w", encoding="utf-8") as handle:
+        json.dump(summary, handle)
+
+
+def product_report(root: str, **kwargs):
+    blocks = dr._set_role([dr.read_root(root, replay_draw=kwargs.pop("replay", True))],
+                          kwargs.pop("product_root", None))
+    return dr.success_payload(blocks, scenes=kwargs.pop("scenes", False))
+
+
+class SuccessMixTest(unittest.TestCase):
+    """The review's point: the delivered mix is not the requested mix."""
+
+    def test_request_build_and_delivery_are_counted_apart(self):
+        with tempfile.TemporaryDirectory() as root:
+            # four scenes ask for u_shape / l_shape and two of them land on row
+            plan = [(0, "u_shape", "row", {"auto_pick": [5, "u_shape"], "auto_fallback": True,
+                                           "attempts_used": 17}),
+                    (1, "u_shape", "u_shape", {"auto_pick": [5, "u_shape"],
+                                               "auto_fallback": False, "attempts_used": 1}),
+                    (2, "l_shape", "l_shape", {"auto_pick": [5, "l_shape"],
+                                               "auto_fallback": False, "attempts_used": 2}),
+                    (3, "l_shape", "row", {"auto_pick": [5, "l_shape"], "auto_fallback": True,
+                                           "attempts_used": 18})]
+            rows = [write_scene(root, seed, scene_spec(ROW_LAYOUT, CHAIN), family, stats=stats)
+                    for seed, _drawn, family, stats in plan]
+            write_root(root, rows, request={"layout": {"shape": "auto"}})
+            report = product_report(root)
+
+        requested = report["requested"]["generation"]
+        self.assertEqual(requested["basis"], {"recorded": 4})
+        self.assertEqual(requested["share"], {"l_shape": 0.5, "u_shape": 0.5})
+        self.assertEqual(report["generated"]["family_share"], {"l_shape": 0.25, "row": 0.5,
+                                                              "u_shape": 0.25})
+        self.assertEqual(report["generated"]["count"], 4)
+        self.assertEqual(report["success"]["count"], 4)
+        # Half the request never reached a product: tv = |row .5| + |u/l -.25| => .5
+        self.assertEqual(report["bias"]["generation"]["tv_distance"], 0.5)
+        notes = " | ".join(report["bias"]["generation"]["notes"])
+        self.assertIn("'row' grows", notes)
+        survival = {row["family"]: row["survival"]
+                    for row in report["bias"]["generation"]["families"]}
+        self.assertEqual(survival, {"l_shape": 0.5, "row": None, "u_shape": 0.5})
+        # 'row' was never asked for and built twice: the count of a family in
+        # the built set is not its survival, so the two are reported apart
+        rows = {row["family"]: row for row in report["bias"]["generation"]["families"]}
+        self.assertEqual((rows["row"]["asked"], rows["row"]["built"]), (0, 2))
+        self.assertEqual((rows["u_shape"]["asked"], rows["u_shape"]["kept"]), (2, 1))
+
+    def test_fallbacks_are_measured_apart(self):
+        with tempfile.TemporaryDirectory() as root:
+            # seed 0 asked for u_shape, gave up after the sticky attempts and
+            # landed on row; the other two built what they drew
+            plan = [(0, "row", {"auto_pick": [5, "u_shape"], "auto_fallback": True,
+                                "attempts_used": 17}),
+                    (1, "u_shape", {"auto_pick": [5, "u_shape"], "auto_fallback": False,
+                                    "attempts_used": 1}),
+                    (2, "l_shape", {"auto_pick": [5, "l_shape"], "auto_fallback": False,
+                                    "attempts_used": 3})]
+            rows = [write_scene(root, seed, scene_spec(ROW_LAYOUT, CHAIN), family, stats=stats)
+                    for seed, family, stats in plan]
+            write_root(root, rows, request={"layout": {"shape": "auto"}})
+            report = product_report(root)
+
+        fallback = report["success"]["fallback"]
+        self.assertEqual(fallback["attempt_histogram"], {"1": 1, "17": 1, "3": 1})
+        self.assertEqual(fallback["first_attempt_rate"], 0.3333)
+        self.assertEqual(fallback["retry_rate"], 0.6667)
+        self.assertEqual(fallback["auto_fallback"], {"known": 3, "true": 1, "rate": 0.3333,
+                                                     "unknown": 0})
+        switch = fallback["family_switch"]
+        self.assertEqual(switch["known"], 3)
+        self.assertEqual(switch["switched"], 1)
+        self.assertEqual(switch["pairs"], {"u_shape->row": 1})
+        self.assertEqual(switch["by_basis"]["recorded"]["known"], 3)
+
+    def test_the_pipeline_filters_the_success_set(self):
+        """A product that failed its review must not count as a delivered house."""
+        with tempfile.TemporaryDirectory() as root:
+            rows = [
+                write_scene(root, 0, scene_spec(ROW_LAYOUT, CHAIN), "row",
+                            stats=stats_block(auto_pick=[4, "row"])),
+                write_scene(root, 1, scene_spec(RING_LAYOUT, RING), "loop",
+                            stats=stats_block(auto_pick=[4, "loop"])),
+                write_scene(root, 2, scene_spec(STAR_LAYOUT, STAR), "u_shape",
+                            stats=stats_block(auto_pick=[4, "u_shape"]),
+                            ok=dict(ALL_OK, bundle_ok=False, review_ok=False),
+                            failure={"stage": "review", "kind": "review_failed",
+                                     "detail": "exposure"}),
+            ]
+            write_root(root, rows, request={"layout": {"shape": "auto"}})
+            report = product_report(root)
+
+        self.assertEqual(report["success"]["count"], 2)
+        self.assertEqual(report["generated"]["count"], 3)
+        self.assertEqual(report["filtered"]["dropped"], 1)
+        self.assertEqual(report["filtered"]["drop_rate"], 0.3333)
+        self.assertEqual(report["filtered"]["reasons"], {"review:review_failed": 1})
+        self.assertEqual(report["filtered"]["dropped_families"], {"u_shape": 1})
+        self.assertEqual(report["filtered"]["seeds"], [2])
+        self.assertNotIn("u_shape", report["success"]["family_share"])
+        self.assertIn("u_shape", report["generated"]["family_share"])
+        notes = " | ".join(report["bias"]["product"]["notes"])
+        self.assertIn("never delivered: u_shape", notes)
+
+    def test_a_legacy_artifact_is_replayed_not_invented(self):
+        """No stats.auto_pick: the drawn family is re-drawn, and reported as such."""
+        with tempfile.TemporaryDirectory() as root:
+            scene = os.path.join(root, "scene_0007")
+            os.makedirs(scene)
+            with open(os.path.join(scene, "spec.json"), "w", encoding="utf-8") as handle:
+                json.dump(scene_spec(ROW_LAYOUT, CHAIN), handle)
+            # exactly what a report from before the auto_pick contract holds:
+            # stats.shape is the *requested* shape, report.shape the built one
+            with open(os.path.join(scene, "layout_report.json"), "w", encoding="utf-8") as handle:
+                json.dump({"shape": "row", "family": None,
+                           "stats": stats_block(seed=7, shape="auto", attempts_used=2)}, handle)
+            write_root(root, [{"seed": 7, "dir": "scene_0007", "status": "bundle_ok",
+                               "ok": dict(ALL_OK), "failure": None, "resumed": False}],
+                       request={"layout": {"shape": "auto"}})
+            report = product_report(root, scenes=True)
+
+        record = report["scenes"]["success"][0]
+        self.assertEqual(record["family"], "row")
+        self.assertEqual(record["requested_shape"], "auto")
+        self.assertEqual(record["requested_family_basis"], "replayed")
+        self.assertEqual(record["requested_family"], dr.draw_family(7)["family"])
+        fallback = report["success"]["fallback"]
+        # Nothing is known about this artifact's fallback -- and it says so.
+        self.assertEqual(fallback["auto_fallback"]["known"], 0)
+        self.assertEqual(fallback["auto_fallback"]["unknown"], 1)
+        self.assertEqual(fallback["family_switch"]["known"], 0)
+        self.assertEqual(fallback["family_switch"]["by_basis"]["replayed"]["known"], 1)
+        self.assertEqual(report["requested"]["generation"]["basis"], {"replayed": 1})
+
+        with tempfile.TemporaryDirectory() as root:
+            write_root(root, [{"seed": 7, "dir": "scene_0007", "status": "bundle_ok",
+                               "ok": dict(ALL_OK), "failure": None, "resumed": False}])
+            os.makedirs(os.path.join(root, "scene_0007"))
+            with open(os.path.join(root, "scene_0007", "spec.json"), "w", encoding="utf-8") as h:
+                json.dump(scene_spec(ROW_LAYOUT, CHAIN), h)
+            with open(os.path.join(root, "scene_0007", "layout_report.json"), "w",
+                      encoding="utf-8") as h:
+                json.dump({"shape": "row", "family": None,
+                           "stats": stats_block(seed=7, shape="auto")}, h)
+            report = product_report(root, replay=False, scenes=True)
+        self.assertIsNone(report["scenes"]["success"][0]["requested_family"])
+        self.assertEqual(report["scenes"]["success"][0]["requested_family_basis"], "unknown")
+        self.assertEqual(report["requested"]["generation"]["unknown_family"], 1)
+        self.assertTrue(any("record no drawn family" in note
+                            for note in report["bias"]["generation"]["notes"]))
+
+
+class SuccessMetricsTest(unittest.TestCase):
+    """Asset reuse, view coverage, shape and the door graph of the products."""
+
+    def build(self, root, duplex=False):
+        """Two furnished scenes, plus the two-storey fixture when asked."""
+        rows = [
+            write_scene(root, 0, scene_spec(ROW_LAYOUT, CHAIN, furniture=[
+                {"room": "r0", "asset": "gen:sofa"},
+                {"room": "r1", "asset": "gen:sofa"},
+                {"room": "r2", "asset": "builtin:bed"}]),
+                "row", stats=stats_block(auto_pick=[4, "row"]),
+                forecast=forecast_block(c0=("r0", 0.4), c1=("r1", 0.9))),
+            write_scene(root, 1, scene_spec(RING_LAYOUT, RING, furniture=[
+                {"room": "r0", "asset": "gen:sofa"},
+                {"room": "r1", "asset": "gen:lamp"}]),
+                "loop", stats=stats_block(auto_pick=[4, "loop"]),
+                forecast=forecast_block(c0=("r0", 0.8))),
+        ]
+        if duplex:
+            with open(TWO_FLOOR_FIXTURE, encoding="utf-8") as handle:
+                rows.append(write_scene(root, 2, json.load(handle), "duplex",
+                                        stats=stats_block(auto_pick=None, floors=2,
+                                                          shape="duplex", attempts_used=1)))
+        write_root(root, rows, request={"layout": {"shape": "auto", "floors": "1"}})
+        return product_report(root)
+
+    def test_asset_reuse_spans_and_crosses_scenes(self):
+        with tempfile.TemporaryDirectory() as root:
+            report = self.build(root)
+        reuse = report["success"]["furniture_reuse"]
+        self.assertEqual(reuse["scenes"], 2)
+        self.assertEqual(reuse["placements"], 5)
+        self.assertEqual(reuse["distinct_assets"], 3)
+        self.assertEqual(reuse["reuse_rate"], round(1 - 3 / 5, 4))
+        self.assertEqual(reuse["assets_in_many_scenes"], 1)      # gen:sofa in both
+        self.assertEqual(reuse["top"][0], {"asset": "gen:sofa", "placements": 3, "scenes": 2})
+        self.assertEqual(reuse["by_prefix"]["gen"]["distinct"], 2)
+        self.assertEqual(reuse["by_prefix"]["builtin"]["placements"], 1)
+
+    def test_view_coverage_is_per_scene_and_per_stand(self):
+        with tempfile.TemporaryDirectory() as root:
+            report = self.build(root)
+        views = report["success"]["view_coverage"]
+        self.assertEqual(views["views_with_forecast"], 3)
+        self.assertEqual(views["views_below_half"], 1)           # the 0.4 stand
+        self.assertEqual(views["scenes_without_forecast"], 0)
+        self.assertAlmostEqual(views["scene_visible_area_fraction"]["min"], 0.65, places=3)
+        self.assertEqual(views["cameras"], 2)
+        self.assertEqual(views["rooms_without_camera"], 6)       # one camera per scene
+        self.assertEqual(views["room_coverage"], 0.25)
+
+    def test_floors_shape_and_door_graph_are_reported(self):
+        with tempfile.TemporaryDirectory() as root:
+            report = self.build(root, duplex=True)
+        success = report["success"]
+        self.assertEqual(success["count"], 3)
+        self.assertEqual(success["floors"], {"1": 2, "2": 1})
+        # the row plan is 4:1, the ring square, the duplex 1.33:1
+        self.assertEqual(success["shape_bins"]["aspect"], {"1.0-1.5": 2, "1.5-2.0": 0,
+                                                           "2.0-3.0": 0, ">=3.0": 1})
+        graph = success["door_graph"]
+        self.assertEqual(graph["kinds"], {"door": 12, "open_passage": 1, "stair": 1})
+        self.assertEqual(graph["cross_floor"], 1)
+        self.assertEqual(graph["scenes_with_cycles"], 1)
+        self.assertEqual(graph["degree_histogram"], {"1": 6, "2": 8, "3": 2})
+        self.assertEqual(graph["leaf_rooms"], 6)
+        self.assertEqual(graph["topologies"]["unique"], 3)
+        self.assertEqual(success["family_share"], {"duplex": round(1 / 3, 4),
+                                                   "loop": round(1 / 3, 4),
+                                                   "row": round(1 / 3, 4)})
+        # the duplex carries no door_visual_forecast: reported, not zeroed
+        self.assertEqual(success["view_coverage"]["scenes_without_forecast"], 1)
+
+    def test_a_root_without_a_batch_summary_still_reads(self):
+        with tempfile.TemporaryDirectory() as root:
+            write_scene(root, 0, scene_spec(ROW_LAYOUT, CHAIN), "row",
+                        stats=stats_block(auto_pick=[4, "row"], shape="auto"))
+            block = dr.read_root(root)
+        self.assertEqual(block["source"], "scene_dirs")
+        self.assertEqual(len(block["records"]), 1)
+        self.assertEqual(block["records"][0]["family"], "row")
+
+    def test_every_product_failing_still_produces_a_report(self):
+        with tempfile.TemporaryDirectory() as root:
+            rows = [write_scene(root, 0, scene_spec(ROW_LAYOUT, CHAIN), "row",
+                                ok=dict(ALL_OK, bundle_ok=False, review_ok=False),
+                                failure={"stage": "review", "kind": "review_failed",
+                                         "detail": "exposure"})]
+            write_root(root, rows, request={"layout": {"shape": "auto"}})
+            report = product_report(root)
+        self.assertEqual(report["success"]["count"], 0)
+        self.assertEqual(report["success"]["family_share"], {})
+        self.assertEqual(report["success"]["furniture_reuse"]["placements"], 0)
+        self.assertIsNone(report["success"]["fallback"]["retry_rate"])
+        self.assertIsNone(report["success"]["view_coverage"]["room_coverage"])
+        self.assertEqual(report["filtered"]["kept"], 0)
+        self.assertEqual(report["filtered"]["reasons"], {"review:review_failed": 1})
+        # every requested house vanished: half the distribution moved away
+        self.assertEqual(report["bias"]["product"]["tv_distance"], 0.5)
+
+    def test_quality_is_reported_next_to_the_diversity(self):
+        """A more varied mix of worse houses is not a better dataset: both sides."""
+        with tempfile.TemporaryDirectory() as root:
+            rows = [
+                write_scene(root, 0, scene_spec(ROW_LAYOUT, CHAIN), "row",
+                            stats=stats_block(auto_pick=[4, "row"]),
+                            review={"pass": True, "score": 0.9, "failed_checks": []},
+                            validation={"pass": True, "pass_at_resolution": True}),
+                write_scene(root, 1, scene_spec(RING_LAYOUT, RING), "loop",
+                            stats=stats_block(auto_pick=[4, "loop"]),
+                            ok=dict(ALL_OK, bundle_ok=False, review_ok=False),
+                            failure={"stage": "review", "kind": "review_failed"},
+                            review={"pass": False, "score": 0.4, "failed_checks": ["exposure"]}),
+            ]
+            write_root(root, rows, request={"layout": {"shape": "auto"}})
+            report = product_report(root)
+        success = report["success"]["quality"]
+        self.assertEqual((success["reviewed"], success["review_passed"]), (1, 1))
+        self.assertEqual(success["review_score"]["mean"], 0.9)
+        self.assertEqual(success["validation_passed_at_resolution"], 1)
+        self.assertEqual(success["by_family"]["row"]["review_pass"], 1)
+        # the generated set still holds the one that the review rejected
+        generated = report["generated"]["quality"]
+        self.assertEqual((generated["reviewed"], generated["review_passed"]), (2, 1))
+        self.assertEqual(generated["review_score"]["mean"], 0.65)
+        self.assertEqual(generated["review_failed_checks"], {"exposure": 1})
+
+    def test_a_scene_directory_supplies_the_seed_when_the_summary_lacks_it(self):
+        with tempfile.TemporaryDirectory() as root:
+            write_scene(root, 42, scene_spec(ROW_LAYOUT, CHAIN), "row",
+                        stats=stats_block(auto_pick=[4, "row"], shape="auto"))
+            path = os.path.join(root, "scene_0042", "run_summary.json")
+            with open(path, encoding="utf-8") as handle:
+                summary = json.load(handle)
+            summary.pop("seed")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(summary, handle)
+            block = dr.read_root(root)
+        self.assertEqual([record["seed"] for record in block["records"]], [42])
+        self.assertEqual(block["skipped_rows"], 0)
+
+    def test_a_root_with_neither_summary_nor_scenes_is_an_error(self):
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(ValueError):
+                dr.read_root(root)
+
+
+class SuccessCommandLineTest(unittest.TestCase):
+    """`success` runs standalone, writes its own file and never overwrites."""
+
+    def test_the_command_writes_a_second_report_next_to_the_old_ones(self):
+        with tempfile.TemporaryDirectory() as root:
+            write_scene(root, 0, scene_spec(ROW_LAYOUT, CHAIN), "row",
+                        stats=stats_block(auto_pick=[4, "row"], shape="auto"))
+            write_root(root, [{"seed": 0, "dir": "scene_0000", "status": "bundle_ok",
+                               "ok": dict(ALL_OK), "failure": None, "resumed": False}],
+                       request={"layout": {"shape": "auto"}})
+            old_path = os.path.join(root, "diversity.json")
+            with open(old_path, "w", encoding="utf-8") as handle:
+                handle.write('{"old": true}')
+            out = os.path.join(root, "diversity_success.json")
+            result = subprocess.run([sys.executable, TOOL, "success", "--root", root,
+                                     "--out", out, "--scenes"],
+                                    capture_output=True, text=True, cwd=REPO_ROOT)
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            self.assertIn("success fam.", result.stdout)
+            self.assertIn("auto fallback", result.stdout)
+            with open(old_path, encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle), {"old": True})
+            with open(out, encoding="utf-8") as handle:
+                payload = json.load(handle)
+            self.assertEqual(payload["kind"], "panoworld_success_diversity")
+            self.assertEqual(payload["success"]["count"], 1)
+            self.assertEqual(len(payload["scenes"]["success"]), 1)
+
+    def test_a_root_that_cannot_be_read_exits_two(self):
+        with tempfile.TemporaryDirectory() as root:
+            result = subprocess.run([sys.executable, TOOL, "success", "--root", root],
+                                    capture_output=True, text=True, cwd=REPO_ROOT)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("no batch_summary.json", result.stderr)
+
+    @unittest.skipUnless(os.path.isdir(BENCHMARK_ROOTS), "benchmark100 artifacts are not present")
+    def test_the_benchmark_products_recompute(self):
+        """The shipped benchmark: a layout-only sweep plus a rendered sample."""
+        argv = [sys.executable, TOOL, "success",
+                "--root", os.path.join(BENCHMARK_ROOTS, "layout"),
+                "--root", os.path.join(BENCHMARK_ROOTS, "sample")]
+        result = subprocess.run(argv, capture_output=True, text=True, cwd=REPO_ROOT)
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertIn("products       :", result.stdout)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = os.path.join(tmpdir, "diversity_success.json")
+            written = subprocess.run(argv + ["--out", out], capture_output=True, text=True,
+                                     cwd=REPO_ROOT)
+            self.assertEqual(written.returncode, 0, written.stderr[-2000:])
+            with open(out, encoding="utf-8") as handle:
+                payload = json.load(handle)
+        # The sweep was built before stats.auto_pick existed: every drawn family
+        # of it must come back marked as replayed, never as recorded.
+        self.assertEqual(payload["requested"]["generation"]["basis"], {"replayed": 100})
+        self.assertEqual(payload["generated"]["count"], 100)
+        self.assertEqual(payload["filtered"]["requested"], 10)
+        self.assertTrue(payload["filtered"]["kept"] < payload["filtered"]["products"])
+        self.assertGreater(payload["bias"]["generation"]["tv_distance"], 0.3)
+        # The products are a stratified sample of the sweep: the report says so
+        # instead of reading the sample as the delivered mix of all 100 seeds.
+        self.assertIn("the product batch covers", payload["bias"]["product"]["notes"][0])
+
+
 class CommandLineTest(unittest.TestCase):
     """The CLI still runs standalone and prints the corrected sections."""
 

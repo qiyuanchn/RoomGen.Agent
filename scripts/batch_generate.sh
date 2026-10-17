@@ -39,6 +39,14 @@
 # ("degraded" / "degraded_seeds"), and the table prints the reduced profile, so
 # a quality-downgraded scene can never be read as a full-quality completion.
 #
+# Every row also carries a "family" block -- the arrangement the scene was
+# built as, the family the seed drew (stats.auto_pick), whether the sticky auto
+# draw had to fall back and how many attempts it took -- and the summary counts
+# the built mix ("families").  Without it a reader can only count what the
+# batch *asked* for, which is exactly how a sweep that keeps failing on the
+# hard families looks diverse while delivering row after row; see
+# `tools/diversity_report.py success`.
+#
 # Environment:
 #   PANOWORLD_BATCH_RENDER=1        also run the Blender pipeline for every
 #                                   scene (default 0: layout + checks only,
@@ -813,6 +821,46 @@ def render_quality(summary):
     return {"requested": requested, "effective": effective, "degraded": degraded}
 
 
+def load_json(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return None
+
+
+def family_block(scene_dir, summary):
+    """What the scene asked for and built: drawn family, fallback, attempts.
+
+    ``layout_gen.py`` records the arrangement on its own stream
+    (``stats.auto_pick``), whether the sticky draw had to give up
+    (``stats.auto_fallback``) and how many attempts the seed needed.  The batch
+    summary carries them per row so a reader (and
+    ``tools/diversity_report.py success``) can tell the *requested* family mix
+    from the delivered one without opening every layout report."""
+    report = load_json(os.path.join(scene_dir, "layout_report.json"))
+    report = report if isinstance(report, dict) else {}
+    stats = report.get("stats") if isinstance(report.get("stats"), dict) else None
+    if not stats:
+        stats = summary.get("stats") if isinstance(summary.get("stats"), dict) else {}
+    auto_pick = stats.get("auto_pick")
+    if not isinstance(auto_pick, (list, tuple)):
+        auto_pick = None
+    attempts = stats.get("attempts_used")
+    if attempts is None and stats.get("attempt") is not None:
+        attempts = int(stats["attempt"]) + 1
+    return {
+        "built": stats.get("family") or report.get("family") or report.get("shape")
+        or stats.get("shape"),
+        "requested_shape": stats.get("shape") or report.get("shape"),
+        "auto_pick": [auto_pick[0], auto_pick[1]] if auto_pick else None,
+        "auto_fallback": None if stats.get("auto_fallback") is None
+        else bool(stats.get("auto_fallback")),
+        "attempts_used": attempts,
+        "floors": stats.get("floors"),
+    }
+
+
 def bundle_problems(scene_dir, render_expected, review_expected):
     """Final artifacts a bundle_ok row must still have on disk: the stage
     reports plus, per camera of the spec, a non-empty viewpoint directory."""
@@ -943,6 +991,7 @@ for seed in seeds:
         row["cameras"] = len(summary.get("cameras") or [])
         row["furniture"] = summary.get("furniture")
         row["generation_attempts"] = (summary.get("stats") or {}).get("attempts_used")
+        row["family"] = family_block(scene_dir, summary)
         row["checks_pass"] = bool((summary.get("checks") or {}).get("pass"))
         row["render"] = (summary.get("render") or {}).get("status")
         row["render_quality"] = render_quality(summary)
@@ -994,6 +1043,24 @@ for seed in seeds:
 
 pending_retry = sum(1 for row in rows if row["status"] == "pending_retry")
 failed = len(rows) - levels["bundle_ok"] - pending_retry
+
+# The family mix of the batch: the arrangements it really built, the fallbacks
+# behind them, and how many rows predate the contract fields.  tools/
+# diversity_report.py success compares this with the drawn families (per row) and
+# with the delivered products, instead of counting the request as the result.
+family_mix = {}
+family_fallback = []
+family_unknown = 0
+for row in rows:
+    block = row.get("family") or {}
+    name = block.get("built")
+    if name:
+        family_mix[name] = family_mix.get(name, 0) + 1
+    else:
+        family_unknown += 1
+    if block.get("auto_fallback") is True:
+        family_fallback.append(row["seed"])
+
 summary = {
     "kind": "layout_gen_batch",
     "schema_version": 2,
@@ -1031,6 +1098,17 @@ summary = {
     "failure_reasons": failure_reasons,
     "failed_checks": failed_checks,
     "review_issues": review_issues,
+    "families": {
+        "built": dict(sorted(family_mix.items())),
+        "unknown": family_unknown,
+        "requested_shape": ((request_template or {}).get("layout") or {}).get("shape"),
+        "auto_fallback": len(family_fallback),
+        "auto_fallback_seeds": family_fallback,
+        "definition": "families.built counts each row's family.built (the arrangement the "
+                      "scene was really built as, not the one it asked for); rows without a "
+                      "family block predate the contract.  See each row's family for the "
+                      "drawn family (auto_pick), the auto fallback and the attempts",
+    },
     "scenes": rows,
 }
 summary["finished_at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1065,10 +1143,12 @@ for row in rows:
     if row["status"] != "bundle_ok" and row.get("failure"):
         detail = "  <- %s: %s" % (("%s:%s" % (row['failure'].get('stage'), row['failure'].get('kind'))),
                                   row["failure"].get("detail", ""))
-    print("  seed %-4d %-13s%s layout=%s render=%s validation=%s%s rooms=%s cams=%s furniture=%s attempts=%s%s%s"
+    print("  seed %-4d %-13s%s layout=%s render=%s validation=%s%s family=%s rooms=%s cams=%s "
+          "furniture=%s attempts=%s%s%s"
           % (row["seed"], row["status"], " (resumed)" if row["resumed"] else "",
              row["stages"].get("layout"), row["stages"].get("render"),
              row["stages"].get("validation"), review_note,
+             (row.get("family") or {}).get("built") or "-",
              len(row.get("rooms") or []), row.get("cameras"), row.get("furniture"),
              row.get("generation_attempts"), render_note, detail))
 if render_requested:
@@ -1088,6 +1168,13 @@ else:
     print("  levels: layout_ok %d/%d%s, bundle_ok %d/%d (render not requested; pending_retry %d, failed %d)"
           % (levels["layout_ok"], len(rows), review_level, levels["bundle_ok"], len(rows),
              pending_retry, failed))
+if family_mix:
+    fallback_note = " (auto fallback %d)" % len(family_fallback) if family_fallback else ""
+    print("  families(built): %s%s"
+          % (", ".join("%s %d" % (name, family_mix[name]) for name in sorted(family_mix)),
+             fallback_note))
+if family_unknown:
+    print("  families(built): %d row(s) carry no family block (pre-contract summary)" % family_unknown)
 for key in sorted(failure_reasons):
     print("  failure %-40s %d" % (key, failure_reasons[key]))
 if review_requested:

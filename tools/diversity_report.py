@@ -48,6 +48,23 @@ Command line::
     python tools/diversity_report.py benchmark --seeds 0-99 --sample 10 \
         --root outputs/benchmark100
 
+    # the *delivered* products of a batch: requested vs built vs surviving
+    # families, fallbacks, floors, layout shape, door graph, asset reuse and
+    # camera view coverage -- reading batch_summary.json plus each scene's
+    # spec/layout_report/run_summary
+    python tools/diversity_report.py success \
+        --root outputs/benchmark100/layout --root outputs/benchmark100/sample \
+        --out outputs/benchmark100/diversity_success.json
+
+The `success` mode is the one that answers "did we deliver a diverse dataset?"
+rather than "does the generator cover a lot?": it grades the request, the built
+specs and the final ``bundle_ok`` products separately, so a hard family that
+falls back (``stats.auto_pick`` -> ``stats.auto_fallback``) or a product the
+pipeline filtered (a failed review, an interrupted render) shows up as a mix
+that moved instead of hiding inside a request count.  Legacy artifacts that do
+not record the drawn family are re-drawn with the current generator and marked
+``replayed``, never counted as "asked for what it built".
+
 The `benchmark` mode drives the real scripts (`scripts/batch_generate.sh`), so
 its timings are the pipeline's own and its failure distribution comes from the
 same grading the batch prints: `layout_ok` / `render_ok` / `validation_ok` /
@@ -65,6 +82,7 @@ import hashlib
 import json
 import math
 import os
+import random
 
 import statistics
 import subprocess
@@ -89,6 +107,18 @@ DEFAULT_CAMERA_Z_M = 1.5
 
 #: individualisation/refinement visits budget for one structure fingerprint
 CANONICAL_BUDGET = 4096
+
+#: stage grades a batch row and a run summary share, weakest first; the success
+#: report walks them as a funnel instead of collapsing everything into "passed"
+SUCCESS_LEVELS = ("layout_ok", "render_ok", "validation_ok", "bundle_ok")
+
+#: seed salt of layout_gen's per-attempt rng; the ``--shape auto`` draw lives on
+#: its own stream ``seed * ATTEMPT_SALT + AUTO_PICK_SALT`` (layout_gen.generate)
+ATTEMPT_SALT = 1000003
+
+#: bins of the shape histograms: what a mean aspect or area hides
+ASPECT_BINS = (1.0, 1.5, 2.0, 3.0)
+AREA_BINS = (0.0, 40.0, 80.0, 120.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -856,6 +886,980 @@ def diversity_summary(metrics: Sequence[dict]) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# final products: the request, the build and what survived the pipeline
+#
+# A diversity number over the *successful* scenes answers a different question
+# than one over the generated specs: the pipeline filters (a render that failed,
+# a review that failed) and the generator falls back (a family that could not be
+# built is replaced, or re-drawn per attempt), so the delivered mix can be much
+# narrower than the requested one.  This section reads a batch root --
+# ``batch_summary.json`` plus each scene's ``spec.json`` / ``layout_report.json``
+# / ``run_summary.json`` -- and reports the request, the build and the surviving
+# products side by side, with the fallbacks and the filtering that moved one into
+# the other.  It never counts a generation request as a product.
+# --------------------------------------------------------------------------- #
+def _layout_module():
+    """``blender_agent.layout_gen`` when importable (it is pure python, no bpy)."""
+    try:
+        from blender_agent import layout_gen as layout_mod  # noqa: PLC0415 - optional import
+    except Exception:
+        return None
+    return layout_mod
+
+
+def draw_family(seed: int, rooms: Optional[int] = None) -> Optional[dict]:
+    """The ``{"rooms", "family"}`` ``--shape auto`` draws for one seed.
+
+    The draw runs on the generator's own stream, so this reproduces what
+    ``layout_gen.py --seed <seed> --shape auto`` asks for.  It is only used for
+    artifacts that predate ``stats.auto_pick``: without it a legacy batch reads
+    as "every scene asked for the family it happened to build", which is exactly
+    the bias the report is supposed to expose.
+    """
+    module = _layout_module()
+    if module is None:
+        return None
+    try:
+        count, family = module._pick_auto_shape(
+            random.Random(seed * ATTEMPT_SALT + module.AUTO_PICK_SALT), rooms)
+    except Exception:
+        return None
+    return {"rooms": int(count), "family": str(family)}
+
+
+def auto_weight_share() -> Optional[Dict[str, float]]:
+    """The generator's draw weights, normalized: the *a priori* ``auto`` mix."""
+    module = _layout_module()
+    weights = getattr(module, "AUTO_FAMILY_WEIGHT", None) if module else None
+    if not isinstance(weights, dict) or not weights:
+        return None
+    return _shares({str(name): float(value) for name, value in weights.items()}) or None
+
+
+def _read_json(path: Optional[str]):
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return None
+
+
+def scene_facts(scene_dir: str) -> dict:
+    """The three per-scene files a success report reads, plus where they are."""
+    paths = {name: os.path.join(scene_dir, name)
+             for name in ("spec.json", "layout_report.json", "run_summary.json")}
+    return {"dir": scene_dir, "paths": paths,
+            "spec": _read_json(paths["spec.json"]),
+            "layout_report": _read_json(paths["layout_report.json"]),
+            "run_summary": _read_json(paths["run_summary.json"])}
+
+
+def scene_family(facts: dict) -> dict:
+    """What one scene asked for -- as far as its artifacts record it -- and built.
+
+    ``layout_report.json`` and ``run_summary.json`` carry the same ``stats``
+    block, so either answers when the other is missing.  ``stats.auto_pick`` and
+    ``stats.auto_fallback`` are the contract fields of the current generator; a
+    report that predates them yields ``None`` here instead of a made-up "no
+    fallback".
+    """
+    layout = facts.get("layout_report") or {}
+    summary = facts.get("run_summary") or {}
+    stats = layout.get("stats")
+    if not isinstance(stats, dict) or not stats:
+        stats = summary.get("stats") if isinstance(summary.get("stats"), dict) else {}
+    # the *report* carries the arrangement the attempt built ("shape" of the
+    # attempt, next to "family" for the topology families); stats.shape is the
+    # same value on the current generator but the *requested* shape on a report
+    # that predates stats.family, so it comes last
+    requested_shape = stats.get("shape") or layout.get("shape") or summary.get("shape")
+    built = (stats.get("family") or layout.get("family")
+             or layout.get("shape") or stats.get("shape") or summary.get("shape"))
+    recorded = None
+    auto_pick = stats.get("auto_pick")
+    if isinstance(auto_pick, (list, tuple)) and auto_pick:
+        recorded = {"rooms": int(auto_pick[0]) if len(auto_pick) > 0 else None,
+                    "family": str(auto_pick[1]) if len(auto_pick) > 1 else None}
+    attempts = stats.get("attempts_used")
+    if attempts is None and stats.get("attempt") is not None:
+        attempts = int(stats["attempt"]) + 1
+    fallback = stats.get("auto_fallback")
+    return {"built": str(built) if built else None,
+            "requested_shape": str(requested_shape) if requested_shape else None,
+            "recorded_draw": recorded,
+            "attempts": None if attempts is None else int(attempts),
+            "auto_fallback": None if fallback is None else bool(fallback),
+            "floors": stats.get("floors")}
+
+
+def _requested_family(family: dict, root_block: dict, seed: int,
+                      replay: bool) -> Tuple[Optional[str], str]:
+    """The family a scene was asked for, and how that was established.
+
+    ``recorded`` is the generator's own ``stats.auto_pick``, ``declared`` a
+    request that names a family (or the duplex plan, which ``--floors 2``
+    forces), ``replayed`` a re-draw with the current generator for an artifact
+    that records nothing, ``unknown`` neither.
+    """
+    drawn = (family.get("recorded_draw") or {}).get("family")
+    if drawn:
+        return str(drawn), "recorded"
+    # the batch request names the shape; a legacy layout report recorded it in
+    # stats.shape, which the current generator overwrites with the built one
+    shape = root_block.get("shape") or family.get("requested_shape")
+    if family.get("floors") == 2 or shape == "duplex":
+        return "duplex", "declared"
+    module = _layout_module()
+    families = set(getattr(module, "ROOM_FAMILIES", {}) or {}) if module else set()
+    if shape and (shape in families or shape in ("row", "block")):
+        return str(shape), "declared"
+    if replay and shape == "auto":
+        replayed = draw_family(seed, root_block.get("rooms"))
+        if replayed is not None:
+            return str(replayed["family"]), "replayed"
+    return None, "unknown"
+
+
+def _coverage_facts(facts: dict) -> dict:
+    """How much of its room each camera of one scene sees.
+
+    ``door_visual_forecast`` (written by layout_gen and copied into the run
+    summary) is the only record of the walkable floor a stand covers; a scene
+    without it reports ``None`` rather than a zero that would read as a blind
+    camera.
+    """
+    forecast = (facts.get("layout_report") or {}).get("door_visual_forecast")
+    if not isinstance(forecast, dict) or not forecast:
+        forecast = (facts.get("run_summary") or {}).get("door_visual_forecast")
+    areas: List[float] = []
+    doors: List[float] = []
+    if isinstance(forecast, dict):
+        for entry in forecast.values():
+            if not isinstance(entry, dict):
+                continue
+            coverage = entry.get("coverage")
+            value = coverage.get("visible_area_fraction") if isinstance(coverage, dict) else None
+            if isinstance(value, (int, float)):
+                areas.append(float(value))
+            fraction = entry.get("visible_fraction")
+            if isinstance(fraction, (int, float)):
+                doors.append(float(fraction))
+    return {"views": len(areas),
+            "visible_area_fraction_min": round(min(areas), 3) if areas else None,
+            "visible_area_fraction_mean": round(statistics.fmean(areas), 3) if areas else None,
+            "visible_area_fraction_max": round(max(areas), 3) if areas else None,
+            "views_below_half": sum(1 for value in areas if value < 0.5),
+            "door_visible_fraction_mean": round(statistics.fmean(doors), 3) if doors else None}
+
+
+def _quality_facts(facts: dict) -> dict:
+    """What a scene's own run summary says about how good it turned out."""
+    summary = facts.get("run_summary") or {}
+    review = summary.get("review") if isinstance(summary.get("review"), dict) else {}
+    validation = summary.get("validation") if isinstance(summary.get("validation"), dict) else {}
+    render = summary.get("render") if isinstance(summary.get("render"), dict) else {}
+    ok = summary.get("ok") if isinstance(summary.get("ok"), dict) else {}
+    return {"review_pass": review.get("pass"),
+            "review_score": review.get("score"),
+            "review_failed_checks": list(review.get("failed_checks") or []),
+            "review_ok": ok.get("review_ok"),
+            "validation_pass": validation.get("pass"),
+            "validation_pass_at_resolution": validation.get("pass_at_resolution"),
+            "render_status": render.get("status")}
+
+
+def quality_stats(records: Sequence[dict]) -> dict:
+    """The quality of a set next to its diversity: review, validation, profile.
+
+    Diversity alone is half an answer -- a mix that grew more varied by shipping
+    worse houses is not a better dataset -- so the review verdicts, the
+    validation result and the effective render profile of the very scenes the
+    mix was measured on are reported family by family.
+    """
+    reviewed = review_passed = validated = at_resolution = degraded = 0
+    per_family: Dict[str, dict] = {}
+    failed_checks: Dict[str, int] = {}
+    for record in records:
+        quality = record.get("quality") or {}
+        family = str(record.get("family") or "unknown")
+        bucket = per_family.setdefault(family, {"scenes": 0, "reviewed": 0, "review_pass": 0,
+                                                "scores": []})
+        bucket["scenes"] += 1
+        if quality.get("review_pass") is not None:
+            reviewed += 1
+            bucket["reviewed"] += 1
+            if quality["review_pass"]:
+                review_passed += 1
+                bucket["review_pass"] += 1
+        if isinstance(quality.get("review_score"), (int, float)):
+            bucket["scores"].append(float(quality["review_score"]))
+        if quality.get("validation_pass") is not None:
+            validated += 1 if quality["validation_pass"] else 0
+        if quality.get("validation_pass_at_resolution") is not None:
+            at_resolution += 1 if quality["validation_pass_at_resolution"] else 0
+        for name in quality.get("review_failed_checks") or []:
+            failed_checks[str(name)] = failed_checks.get(str(name), 0) + 1
+        if (record.get("render_quality") or {}).get("degraded"):
+            degraded += 1
+    scene_scores = [score for bucket in per_family.values() for score in bucket["scores"]]
+    return {
+        "scenes": len(records),
+        "reviewed": reviewed,
+        "review_passed": review_passed,
+        "review_score": {"mean": round(statistics.fmean(scene_scores), 3) if scene_scores else None,
+                         "min": min(scene_scores) if scene_scores else None,
+                         "max": max(scene_scores) if scene_scores else None},
+        "validation_passed": validated,
+        "validation_passed_at_resolution": at_resolution,
+        "degraded": degraded,
+        "review_failed_checks": dict(sorted(failed_checks.items(), key=lambda item: (-item[1],
+                                                                                    item[0]))),
+        "by_family": {family: {"scenes": bucket["scenes"], "reviewed": bucket["reviewed"],
+                               "review_pass": bucket["review_pass"],
+                               "review_score_mean": round(statistics.fmean(bucket["scores"]), 3)
+                               if bucket["scores"] else None}
+                      for family, bucket in sorted(per_family.items())},
+    }
+
+
+def _seed_of(row: dict, scene_dir: str) -> Optional[int]:
+    """The seed of a batch row: recorded, else the ``scene_<seed>`` directory."""
+    seed = row.get("seed")
+    if seed is not None:
+        try:
+            return int(seed)
+        except (TypeError, ValueError):
+            return None
+    name = os.path.basename(str(scene_dir).rstrip("/"))
+    if name.startswith("scene_"):
+        try:
+            return int(name[len("scene_"):])
+        except ValueError:
+            return None
+    return None
+
+
+def _summary_row(scene_dir: str, summary: dict) -> dict:
+    """A batch-shaped row for a scene directory that has no batch summary."""
+    ok = summary.get("ok") if isinstance(summary.get("ok"), dict) else None
+    if ok is None:
+        layout_ok = bool((summary.get("checks") or {}).get("pass"))
+        ok = {"layout_ok": layout_ok, "render_ok": None, "validation_ok": None,
+              "bundle_ok": layout_ok}
+    status = "bundle_ok" if ok.get("bundle_ok") else "failed"
+    return {"seed": summary.get("seed"), "dir": os.path.basename(scene_dir.rstrip("/")),
+            "status": status, "ok": ok, "failure": summary.get("failure"),
+            "render_quality": None, "render_requested": summary.get("render_requested")}
+
+
+def read_root(root: str, replay_draw: bool = True) -> dict:
+    """One batch root: its ``batch_summary.json``, its rows and its records.
+
+    A root without a ``batch_summary.json`` still works -- every ``scene_*``
+    directory is read through its own ``run_summary.json``, which carries the
+    same grades and failure record (older output directories have no batch
+    summary).  The request the root was bound to is taken from the batch
+    summary's ``request`` block, or from a benchmark ``report.json`` next to it.
+    """
+    root = os.path.abspath(root)
+    if os.path.isfile(root) and os.path.basename(root) == "batch_summary.json":
+        root = os.path.dirname(root)
+    summary = _read_json(os.path.join(root, "batch_summary.json"))
+    if isinstance(summary, dict):
+        block = {
+            "root": root,
+            "batch_id": summary.get("batch_id"),
+            "levels": summary.get("levels"),
+            "passed": summary.get("passed"),
+            "count": summary.get("count"),
+            "request": summary.get("request") if isinstance(summary.get("request"), dict) else None,
+            "render_requested": bool(summary.get("render_requested")),
+            "review_requested": bool(summary.get("review_requested")),
+            "rows": [row for row in _as_list(summary.get("scenes")) if isinstance(row, dict)],
+            "source": "batch_summary",
+        }
+    else:
+        rows = []
+        for path in sorted(glob.glob(os.path.join(root, "scene_*"))):
+            if not os.path.isdir(path):
+                continue
+            summary_of_scene = _read_json(os.path.join(path, "run_summary.json"))
+            if isinstance(summary_of_scene, dict):
+                rows.append(_summary_row(path, summary_of_scene))
+        if not rows:
+            raise ValueError("no batch_summary.json and no scene_*/run_summary.json under %s" % root)
+        block = {"root": root, "batch_id": None, "levels": None, "passed": None,
+                 "count": len(rows), "request": None, "rows": rows,
+                 "render_requested": any(row.get("render_requested") for row in rows),
+                 "review_requested": any("review_ok" in (row.get("ok") or {}) for row in rows),
+                 "source": "scene_dirs"}
+
+    report = _read_json(os.path.join(root, "report.json"))
+    config = (report or {}).get("config") if isinstance(report, dict) else None
+    request = block["request"] or {}
+    layout = request.get("layout") if isinstance(request.get("layout"), dict) else {}
+    if isinstance(config, dict):
+        layout = dict(layout, **{key: layout.get(key) or config.get(key)
+                                 for key in ("shape", "rooms")})
+    block["shape"] = layout.get("shape")
+    block["rooms"] = int(layout["rooms"]) if str(layout.get("rooms") or "").isdigit() else None
+    block["role"] = None
+    block["records"] = [scene_record(block, row, replay_draw) for row in block["rows"]
+                        if _seed_of(row, os.path.join(root, str(row.get("dir") or ""))) is not None]
+    block["skipped_rows"] = len(block["rows"]) - len(block["records"])
+    return block
+
+
+def scene_record(root_block: dict, row: dict, replay_draw: bool = True) -> dict:
+    """One scene of one batch: grades, family facts, spec metrics and coverage."""
+    scene_dir = os.path.join(root_block["root"], str(row.get("dir") or ""))
+    seed = _seed_of(row, scene_dir)
+    facts = scene_facts(scene_dir)
+    family = scene_family(facts)
+    spec = facts["spec"]
+    metrics = None
+    if isinstance(spec, dict):
+        try:
+            metrics = scene_metrics(spec, seed=seed, layout_report=facts["layout_report"],
+                                    path=facts["paths"]["spec.json"])
+        except Exception:
+            metrics = None
+    if metrics is not None:
+        # the family the *report* names wins over the reader's tolerant guess
+        # (a scene without a layout report falls back to its own shape); a scene
+        # that records neither is counted as unknown, never as a family named
+        # "None"
+        metrics["family"] = family["built"] or metrics.get("family") or "unknown"
+    requested, basis = _requested_family(family, root_block, seed, replay_draw)
+    cameras = (metrics or {}).get("cameras") or {}
+    return {
+        "seed": seed,
+        "root": root_block["root"],
+        "role": root_block.get("role"),
+        "dir": row.get("dir"),
+        "status": row.get("status"),
+        "ok": row.get("ok") or {},
+        "failure": row.get("failure"),
+        "render_quality": row.get("render_quality"),
+        "family": family["built"],
+        "requested_shape": root_block.get("shape") or family["requested_shape"],
+        "requested_family": requested,
+        "requested_family_basis": basis,
+        "requested_rooms": (family["recorded_draw"] or {}).get("rooms")
+        or root_block.get("rooms"),
+        "attempts": family["attempts"],
+        "auto_fallback": family["auto_fallback"],
+        "floors": (metrics or {}).get("floors") or family["floors"] or row.get("floors"),
+        "rooms": (metrics or {}).get("rooms") or len(row.get("rooms") or []) or None,
+        "cameras": cameras.get("count") or row.get("cameras"),
+        "furniture": ((metrics or {}).get("furniture") or {}).get("count")
+        or row.get("furniture"),
+        "quality": _quality_facts(facts),
+        "coverage": _coverage_facts(facts),
+        "metrics": metrics,
+        "spec": spec,
+    }
+
+
+def _set_role(blocks: Sequence[dict], product_roots: Optional[Sequence[str]]) -> List[dict]:
+    """Mark which roots define the final products.
+
+    Explicit ``product_roots`` win.  Otherwise a root that asked for a render is
+    a product batch and a layout-only root is not; when no root asked for one
+    (a layout sweep) every root is a product batch, because bundle_ok *is*
+    layout_ok there.
+    """
+    named = {os.path.abspath(path) for path in (product_roots or [])}
+    rendered = any(block["render_requested"] for block in blocks)
+    for block in blocks:
+        if named:
+            block["role"] = "product" if block["root"] in named else "generation"
+        else:
+            block["role"] = "product" if (not rendered
+                                           or block["render_requested"]) else "generation"
+        # the records were built before the roles were known; `_merge_by_seed`
+        # prefers the product record of a seed, so they carry it too
+        for record in block["records"]:
+            record["role"] = block["role"]
+    return blocks
+
+
+def _merge_by_seed(blocks: Sequence[dict]) -> List[dict]:
+    """One record per seed, the batch that delivered the most of that seed first.
+
+    A seed can sit in two batches (a layout sweep and the rendered sample): the
+    generated set takes the spec that passed the layout stage, the product set
+    the run that actually produced artifacts.
+    """
+    def rank(record: dict) -> tuple:
+        ok = record.get("ok") or {}
+        return (bool(ok.get("layout_ok")), record.get("role") == "product",
+                record.get("metrics") is not None)
+
+    best: Dict[int, dict] = {}
+    for block in blocks:
+        for record in block["records"]:
+            seed = record["seed"]
+            if seed not in best or rank(record) > rank(best[seed]):
+                best[seed] = record
+    return [best[seed] for seed in sorted(best)]
+
+
+def _shares(counts: Dict[str, float]) -> Dict[str, float]:
+    total = float(sum(counts.values()))
+    if total <= 0:
+        return {}
+    return {str(key): round(float(value) / total, 4) for key, value in sorted(counts.items())}
+
+
+def _tv_distance(left: Dict[str, float], right: Dict[str, float]) -> float:
+    """Total variation of two mixes: half the sum of the share differences."""
+    keys = set(left) | set(right)
+    return round(0.5 * sum(abs(left.get(key, 0.0) - right.get(key, 0.0)) for key in keys), 4)
+
+
+def _bin_label(low: float, high: Optional[float]) -> str:
+    return "%.1f-%.1f" % (low, high) if high is not None else ">=%.1f" % low
+
+
+def _bin_counts(values: Sequence[float], edges: Sequence[float]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for low, high in zip(edges, list(edges[1:]) + [None]):
+        out[_bin_label(low, high)] = sum(1 for value in values
+                                         if value >= low and (high is None or value < high))
+    return out
+
+
+def shape_bins(metrics: Sequence[dict]) -> dict:
+    """Aspect and area bins next to the means: a 4:1 railroad is not a block."""
+    return {"aspect": _bin_counts([entry["shape"]["aspect"] for entry in metrics], ASPECT_BINS),
+            "footprint_area_m2": _bin_counts(
+                [entry["shape"]["footprint_area_m2"] for entry in metrics], AREA_BINS),
+            "total_floor_area_m2": _bin_counts(
+                [entry["shape"]["total_floor_area_m2"] for entry in metrics], AREA_BINS)}
+
+
+def door_graph(metrics: Sequence[dict], summary: Optional[dict] = None) -> dict:
+    """The connection graph of a set: kinds, loops, room degrees and repeats.
+
+    The degree histogram says *how* connected the set is -- a house of chain
+    rooms is mostly leaves (degree 1) and one hub, a loop plan is not -- and the
+    topology repeats say how much of it is the same room graph with other rooms.
+    """
+    kinds: Dict[str, int] = {}
+    degrees: Dict[int, int] = {}
+    cycles: List[int] = []
+    rooms = edges_total = cross_floor = without = 0
+    for entry in metrics:
+        structure = entry.get("structure") or {}
+        connections = entry.get("connections") or {}
+        rooms += int(entry.get("rooms") or 0)
+        edges_total += int(connections.get("count") or 0)
+        cross_floor += int(connections.get("cross_floor") or 0)
+        without += 0 if connections.get("count") else 1
+        for kind, count in (structure.get("edge_kinds") or {}).items():
+            kinds[str(kind)] = kinds.get(str(kind), 0) + int(count)
+        degree: Dict[str, int] = {}
+        for edge in structure.get("edges") or []:
+            for node in edge.get("rooms") or []:
+                degree[str(node)] = degree.get(str(node), 0) + 1
+        for value in list(degree.values()) + [0] * max(0, int(entry.get("rooms") or 0)
+                                                       - len(degree)):
+            degrees[value] = degrees.get(value, 0) + 1
+        cycles.append(int(structure.get("cycles") or 0))
+    structures = (summary or {}).get("structures") or {}
+    plans = (summary or {}).get("plans") or {}
+    return {
+        "rooms": rooms,
+        "edges": edges_total,
+        "kinds": dict(sorted(kinds.items())),
+        "cross_floor": cross_floor,
+        "cycles": _histogram(cycles),
+        "scenes_with_cycles": sum(1 for value in cycles if value > 0),
+        "scenes_without_connection": without,
+        "degree_histogram": {str(degree): count for degree, count in sorted(degrees.items())},
+        "leaf_rooms": degrees.get(1, 0),
+        "leaf_share": round(degrees.get(1, 0) / rooms, 4) if rooms else None,
+        "topologies": {"unique": structures.get("unique"),
+                       "duplicate_rate": structures.get("duplicate_rate")},
+        "plans": {"unique": plans.get("unique"), "duplicate_rate": plans.get("duplicate_rate")},
+    }
+
+
+def fallback_stats(records: Sequence[dict]) -> dict:
+    """How many products are the *first* attempt, and how many fell back.
+
+    Three fallbacks stay apart because the artifacts record them differently:
+    a **retry** (``attempts_used > 1``: the first attempt was rejected), the
+    generator's **auto fallback** (the sticky ``--shape auto`` draw gave up and
+    re-drew per attempt) and a **family switch** (the drawn family is not the
+    built one -- a failure *and* a fallback).  ``unknown`` counts the scenes
+    whose report predates a field, so a legacy batch cannot read as "nothing
+    fell back".
+
+    The headline family-switch number is over the **recorded** draws only: a
+    re-drawn (``replayed``) family is a *today's* request for a legacy artifact,
+    not the request it was built against, so it stays in ``by_basis`` next to
+    the real one instead of inflating the rate.
+    """
+    attempts: Dict[str, int] = {}
+    switch_pairs: Dict[str, int] = {}
+    by_basis: Dict[str, Dict[str, int]] = {}
+    retried = fallback_known = fallback_true = 0
+    unknown_attempts = unknown_fallback = unknown_draw = 0
+    for record in records:
+        used = record.get("attempts")
+        if used is None:
+            unknown_attempts += 1
+        else:
+            attempts[str(int(used))] = attempts.get(str(int(used)), 0) + 1
+            if int(used) > 1:
+                retried += 1
+        if record.get("auto_fallback") is None:
+            unknown_fallback += 1
+        else:
+            fallback_known += 1
+            fallback_true += 1 if record["auto_fallback"] else 0
+        drawn, built = record.get("requested_family"), record.get("family")
+        if drawn is None or built is None:
+            unknown_draw += 1
+            continue
+        basis = str(record.get("requested_family_basis") or "unknown")
+        bucket = by_basis.setdefault(basis, {"known": 0, "switched": 0})
+        bucket["known"] += 1
+        if str(drawn) != str(built):
+            bucket["switched"] += 1
+            if basis == "recorded":
+                pair = "%s->%s" % (drawn, built)
+                switch_pairs[pair] = switch_pairs.get(pair, 0) + 1
+    total = len(records)
+    first = attempts.get("1", 0)
+    recorded = by_basis.get("recorded", {"known": 0, "switched": 0})
+
+    def rate(value: int, denominator: int) -> Optional[float]:
+        return round(value / denominator, 4) if denominator else None
+
+    return {
+        "scenes": total,
+        "attempt_histogram": dict(sorted(attempts.items(), key=lambda item: int(item[0]))),
+        "first_attempt": first,
+        "first_attempt_rate": rate(first, total),
+        "retried": retried,
+        "retry_rate": rate(retried, total),
+        "auto_fallback": {"known": fallback_known, "true": fallback_true,
+                          "rate": rate(fallback_true, fallback_known),
+                          "unknown": unknown_fallback},
+        "family_switch": {"known": recorded["known"], "switched": recorded["switched"],
+                          "rate": rate(recorded["switched"], recorded["known"]),
+                          "unknown": unknown_draw,
+                          "by_basis": {basis: dict(bucket, rate=rate(bucket["switched"],
+                                                                     bucket["known"]))
+                                       for basis, bucket in sorted(by_basis.items())},
+                          "pairs": dict(sorted(switch_pairs.items(),
+                                               key=lambda item: (-item[1], item[0])))},
+        "unknown": {"attempts": unknown_attempts, "auto_fallback": unknown_fallback,
+                    "draw": unknown_draw},
+    }
+
+
+def asset_reuse(records: Sequence[dict]) -> dict:
+    """How much of the furniture library the products reuse.
+
+    ``reuse_rate`` is ``1 - distinct / placements``: 0 when every placed item is
+    a different asset, high when a handful of assets furnish every scene.  The
+    cross-scene numbers say whether the reuse is *within* a scene (the same
+    wardrobe twice) or across the whole set (the same sofa in every house).
+    """
+    placements = 0
+    per_asset: Dict[str, int] = {}
+    scenes_of: Dict[str, set] = {}
+    by_prefix: Dict[str, Dict[str, int]] = {}
+    distinct_per_scene: List[int] = []
+    scene_count = 0
+    for record in records:
+        spec = record.get("spec")
+        if not isinstance(spec, dict):
+            continue
+        scene_count += 1
+        assets = [str(item.get("asset")) for item in _as_list(spec.get("furniture"))
+                  if isinstance(item, dict)]
+        placements += len(assets)
+        for asset in assets:
+            per_asset[asset] = per_asset.get(asset, 0) + 1
+            scenes_of.setdefault(asset, set()).add(record.get("seed"))
+            prefix = asset.split(":", 1)[0] if ":" in asset else "other"
+            bucket = by_prefix.setdefault(prefix, {"placements": 0, "distinct": 0})
+            bucket["placements"] += 1
+        distinct_per_scene.append(len(set(assets)))
+    for asset, count in per_asset.items():
+        prefix = asset.split(":", 1)[0] if ":" in asset else "other"
+        by_prefix[prefix]["distinct"] += 1
+    shared = sum(1 for asset in per_asset if len(scenes_of[asset]) > 1)
+    top = sorted(per_asset.items(), key=lambda item: (-item[1], item[0]))[:12]
+    return {
+        "scenes": scene_count,
+        "placements": placements,
+        "distinct_assets": len(per_asset),
+        "reuse_rate": round(1.0 - len(per_asset) / placements, 4) if placements else None,
+        "assets_in_one_scene": sum(1 for asset in per_asset if len(scenes_of[asset]) == 1),
+        "assets_in_many_scenes": shared,
+        "cross_scene_reuse_rate": round(shared / len(per_asset), 4) if per_asset else None,
+        "distinct_per_scene_mean": round(statistics.fmean(distinct_per_scene), 2)
+        if distinct_per_scene else None,
+        "items_per_scene_mean": round(placements / scene_count, 2) if scene_count else None,
+        "by_prefix": {prefix: dict(bucket, placements=bucket["placements"])
+                      for prefix, bucket in sorted(by_prefix.items())},
+        "top": [{"asset": asset, "placements": count, "scenes": len(scenes_of[asset])}
+                for asset, count in top],
+    }
+
+
+def view_coverage(records: Sequence[dict]) -> dict:
+    """View coverage of a set: stands per room, rooms left without one, what they see.
+
+    ``room_coverage`` counts a room as covered when it has at least one camera;
+    transit rooms (corridor / balcony / entry) are exempt in the per-scene
+    ``rooms_without_camera`` list, exactly as the metric itself defines it.
+    ``visible_area_fraction`` is the share of the walkable floor a stand sees.
+    """
+    cameras_per_scene: List[int] = []
+    doors: List[float] = []
+    scene_means: List[float] = []
+    views = below_half = rooms = missing_rooms = covered_rooms = scenes_without_forecast = 0
+    for record in records:
+        metrics = record.get("metrics") or {}
+        cameras = metrics.get("cameras") or {}
+        if cameras.get("count") is not None:
+            cameras_per_scene.append(int(cameras["count"]))
+        rooms += int(metrics.get("rooms") or 0)
+        missing_rooms += len(cameras.get("rooms_without_camera") or [])
+        covered_rooms += len(cameras.get("per_room") or {})
+        coverage = record.get("coverage") or {}
+        views += int(coverage.get("views") or 0)
+        below_half += int(coverage.get("views_below_half") or 0)
+        if coverage.get("views"):
+            scene_means.append(float(coverage["visible_area_fraction_mean"]))
+        else:
+            scenes_without_forecast += 1
+        if coverage.get("door_visible_fraction_mean") is not None:
+            doors.append(float(coverage["door_visible_fraction_mean"]))
+    return {
+        "scenes": len(records),
+        "cameras": sum(cameras_per_scene),
+        "cameras_per_scene": {"min": min(cameras_per_scene) if cameras_per_scene else None,
+                              "mean": round(statistics.fmean(cameras_per_scene), 2)
+                              if cameras_per_scene else None,
+                              "max": max(cameras_per_scene) if cameras_per_scene else None,
+                              "histogram": _histogram(cameras_per_scene)},
+        "rooms": rooms,
+        "rooms_with_camera": covered_rooms,
+        "rooms_without_camera": missing_rooms,
+        "room_coverage": round(covered_rooms / rooms, 4) if rooms else None,
+        "views_with_forecast": views,
+        "views_below_half": below_half,
+        "views_below_half_rate": round(below_half / views, 4) if views else None,
+        "scenes_without_forecast": scenes_without_forecast,
+        "scene_visible_area_fraction": {"min": min(scene_means) if scene_means else None,
+                                        "mean": round(statistics.fmean(scene_means), 3)
+                                        if scene_means else None,
+                                        "max": max(scene_means) if scene_means else None},
+        "door_visible_fraction_mean": round(statistics.fmean(doors), 3) if doors else None,
+    }
+
+
+def requested_stats(records: Sequence[dict]) -> dict:
+    """What a set of scenes *asked for*: the drawn family, floors and rooms."""
+    basis: Dict[str, int] = {}
+    families: Dict[str, int] = {}
+    floors: Dict[str, int] = {}
+    rooms: Dict[str, int] = {}
+    shapes: Dict[str, int] = {}
+    for record in records:
+        basis[str(record.get("requested_family_basis"))] = \
+            basis.get(str(record.get("requested_family_basis")), 0) + 1
+        if record.get("requested_family"):
+            families[str(record["requested_family"])] = \
+                families.get(str(record["requested_family"]), 0) + 1
+        if record.get("floors") is not None:
+            floors[str(record["floors"])] = floors.get(str(record["floors"]), 0) + 1
+        if record.get("requested_rooms"):
+            rooms[str(record["requested_rooms"])] = rooms.get(str(record["requested_rooms"]), 0) + 1
+        if record.get("requested_shape"):
+            shapes[str(record["requested_shape"])] = \
+                shapes.get(str(record["requested_shape"]), 0) + 1
+    return {"scenes": len(records),
+            "basis": dict(sorted(basis.items())),
+            "families": dict(sorted(families.items())),
+            "share": _shares(families),
+            "unknown_family": sum(1 for record in records if not record.get("requested_family")),
+            "requested_shapes": dict(sorted(shapes.items())),
+            "floors": dict(sorted(floors.items())),
+            "rooms": dict(sorted(rooms.items())),
+            "auto_weight_share": auto_weight_share()}
+
+
+def _survival(requested: Sequence[dict], actual: Sequence[dict]) -> Dict[str, dict]:
+    """Of the seeds that asked for a family, how many delivered *that* family.
+
+    Counting the delivered set by family and dividing by the requested count is
+    not a survival rate: a fallback moves a seed from the family it asked for to
+    another one, so the family it lands in can be built more often than it was
+    requested (``built`` > ``asked``).  Joining the two sets by seed is what the
+    rate has to mean.
+    """
+    built_by_seed = {record["seed"]: record.get("family") for record in actual}
+    out: Dict[str, dict] = {}
+    for record in requested:
+        drawn = record.get("requested_family")
+        if drawn is None:
+            continue
+        bucket = out.setdefault(str(drawn), {"asked": 0, "kept": 0})
+        bucket["asked"] += 1
+        if built_by_seed.get(record["seed"]) is not None \
+                and str(built_by_seed[record["seed"]]) == str(drawn):
+            bucket["kept"] += 1
+    return out
+
+
+def _set_block(records: Sequence[dict]) -> dict:
+    """Every statistic a set of final products is graded on, in one block."""
+    metrics = [record["metrics"] for record in records if record.get("metrics")]
+    summary = diversity_summary(metrics)
+    summary["family_share"] = _shares(summary.get("families") or {})
+    summary["shape_bins"] = shape_bins(metrics)
+    summary["door_graph"] = door_graph(metrics, summary)
+    summary["fallback"] = fallback_stats(records)
+    summary["furniture_reuse"] = asset_reuse(records)
+    summary["view_coverage"] = view_coverage(records)
+    summary["quality"] = quality_stats(records)
+    return summary
+
+
+def _filtered_block(product_records: Sequence[dict], success: Sequence[dict],
+                    requested: Sequence[dict]) -> dict:
+    """What the pipeline dropped between the request and the delivered set."""
+    kept = {record["seed"] for record in success}
+    dropped = [record for record in product_records if record["seed"] not in kept]
+    reasons: Dict[str, int] = {}
+    families: Dict[str, int] = {}
+    for record in dropped:
+        failure = record.get("failure") or {}
+        key = "%s:%s" % (failure.get("stage", "unknown"), failure.get("kind", "not_bundle_ok"))
+        reasons[key] = reasons.get(key, 0) + 1
+        families[str(record.get("family"))] = families.get(str(record.get("family")), 0) + 1
+    return {"requested": len(product_records),
+            "generated_requested": len({record["seed"] for record in requested}),
+            "products": len(product_records),
+            "kept": len(success),
+            "dropped": len(dropped),
+            "drop_rate": round(len(dropped) / len(product_records), 4) if product_records else None,
+            "reasons": dict(sorted(reasons.items(), key=lambda item: (-item[1], item[0]))),
+            "dropped_families": dict(sorted(families.items())),
+            "seeds": sorted(record["seed"] for record in dropped)}
+
+
+def _bias_notes(requested: dict, actual: dict, label: str) -> List[str]:
+    """Sentences a reader can act on: what moved, what vanished, what is unknown."""
+    notes: List[str] = []
+    req = requested.get("share") or {}
+    act = actual.get("family_share") or {}
+    for family in sorted(set(req) | set(act)):
+        if req.get(family, 0.0) - act.get(family, 0.0) > 0.05:
+            notes.append("%s: '%s' loses %.0f%% -> %.0f%% of the mix"
+                         % (label, family, 100 * req.get(family, 0.0),
+                            100 * act.get(family, 0.0)))
+        elif act.get(family, 0.0) - req.get(family, 0.0) > 0.05:
+            notes.append("%s: '%s' grows %.0f%% -> %.0f%% of the mix"
+                         % (label, family, 100 * req.get(family, 0.0),
+                            100 * act.get(family, 0.0)))
+    lost = [family for family in sorted(req) if not (actual.get("families") or {}).get(family)]
+    if lost:
+        notes.append("%s: requested but never delivered: %s" % (label, ", ".join(lost)))
+    if requested.get("unknown_family"):
+        notes.append("%s: %d scene(s) record no drawn family (artifact predates "
+                     "stats.auto_pick and the replay is off)" % (label, requested["unknown_family"]))
+    if (requested.get("basis") or {}).get("replayed"):
+        notes.append("%s: %d drawn famil(ies) re-drawn with the current generator "
+                     "(layout_report.json records no stats.auto_pick)"
+                     % (label, requested["basis"]["replayed"]))
+    return notes
+
+
+def bias_block(generation_records: Sequence[dict], generated: dict,
+               product_records: Sequence[dict], success_records: Sequence[dict],
+               success: dict) -> dict:
+    """How far the built and the delivered mix moved away from the request.
+
+    The two comparisons answer different questions: *generation* (drawn family
+    vs the specs the generator produced) isolates the fallback inside the
+    generator, *product* (drawn family vs the scenes the pipeline delivered)
+    adds the failure filtering on top of it.  Each row carries the drawn count,
+    the delivered count, the share delta and the **survival** of the family --
+    of the seeds that asked for it, how many were delivered as it.
+    """
+    def compare(records: Sequence[dict], actual: Sequence[dict], block: dict,
+                label: str, level: str) -> dict:
+        requested = requested_stats(records)
+        req, act = requested.get("share") or {}, block.get("family_share") or {}
+        counts_req = requested.get("families") or {}
+        counts_act = block.get("families") or {}
+        survival = _survival(records, actual)
+        rows = []
+        for family in sorted(set(req) | set(act) | set(counts_req) | set(counts_act)
+                             | set(survival)):
+            kept = survival.get(family) or {"asked": 0, "kept": 0}
+            rows.append({"family": family,
+                         "requested": counts_req.get(family, 0),
+                         "built": counts_act.get(family, 0),
+                         "requested_share": round(req.get(family, 0.0), 4),
+                         "actual_share": round(act.get(family, 0.0), 4),
+                         "share_delta": round(act.get(family, 0.0) - req.get(family, 0.0), 4),
+                         "asked": kept["asked"], "kept": kept["kept"],
+                         "survival": round(kept["kept"] / kept["asked"], 4)
+                         if kept["asked"] else None})
+        return {"level": level,
+                "tv_distance": _tv_distance(req, act),
+                "families": rows,
+                "notes": _bias_notes(requested, block, label)}
+
+    return {"generation": compare(generation_records, generation_records, generated,
+                                  "generated", "layout_ok"),
+            "product": compare(product_records, success_records, success,
+                               "success", "bundle_ok")}
+
+
+def success_payload(blocks: Sequence[dict], scenes: bool = False) -> dict:
+    """The whole success report: request, generated mix, delivered mix, the gap."""
+    product = [block for block in blocks if block["role"] == "product"] or list(blocks)
+    product_records = _merge_by_seed(product)
+    requested = _merge_by_seed(blocks)
+    generated = [record for record in requested
+                 if (record.get("ok") or {}).get("layout_ok") and record.get("metrics")]
+    success = [record for record in product_records if (record.get("ok") or {}).get("bundle_ok")]
+
+    funnel: Dict[str, Optional[int]] = {"seeds": len(product_records)}
+    levels = list(SUCCESS_LEVELS)
+    if any((record.get("ok") or {}).get("review_ok") is not None for record in product_records):
+        levels.append("review_ok")
+    for level in levels:
+        values = [(record.get("ok") or {}).get(level) for record in product_records]
+        # a level the batch never asked for stays null: a layout-only batch must
+        # not read as "0 scenes rendered"
+        funnel[level] = None if all(value is None for value in values) \
+            else sum(1 for value in values if value is True)
+
+    generated_block = _set_block(generated)
+    success_block = _set_block(success)
+    requested_generation = requested_stats(generated or requested)
+    requested_product = requested_stats(product_records)
+
+    payload = {
+        "kind": "panoworld_success_diversity",
+        "schema_version": 1,
+        "created_utc": _utc_now(),
+        "roots": [{"root": block["root"], "source": block["source"],
+                   "batch_id": block["batch_id"], "role": block["role"],
+                   "count": block["count"], "levels": block["levels"],
+                   "render_requested": block["render_requested"],
+                   "review_requested": block["review_requested"],
+                   "request": block["request"], "shape": block["shape"],
+                   "rooms": block["rooms"]} for block in blocks],
+        "product_roots": [block["root"] for block in product],
+        "levels": funnel,
+        "requested": {"generation": requested_generation,
+                      "product": requested_product},
+        "generated": generated_block,
+        "success": success_block,
+        "filtered": _filtered_block(product_records, success, requested),
+        "bias": bias_block(generated, generated_block, product_records, success, success_block),
+        "note": "generated = specs that passed the layout stage (every root); "
+                "success = bundle_ok products of the roots marked 'product'. "
+                "'requested' is what the seed asked for: stats.auto_pick when the "
+                "artifact records it, a re-draw with the current generator for "
+                "legacy reports (basis 'replayed'), else the declared shape.",
+    }
+    all_seeds = {record["seed"] for record in requested}
+    product_seeds = {record["seed"] for record in product_records}
+    if product_seeds and product_seeds < all_seeds:
+        payload["sample"] = {
+            "product_seeds": len(product_seeds),
+            "generated_seeds": len(all_seeds),
+            "covered_share": round(len(product_seeds) / len(all_seeds), 4),
+            "note": "the product batch covers %d of the %d requested seeds, so its mix is the "
+                    "sample's, not the sweep's" % (len(product_seeds), len(all_seeds))}
+        payload["bias"]["product"]["notes"].insert(0, payload["sample"]["note"])
+    if scenes:
+        payload["scenes"] = {"generated": [_scene_payload(record) for record in generated],
+                             "success": [_scene_payload(record) for record in success],
+                             "filtered": [_scene_payload(record) for record in product_records
+                                          if record["seed"] not in {row["seed"]
+                                                                    for row in success}]}
+    return payload
+
+
+def _scene_payload(record: dict) -> dict:
+    out = {key: value for key, value in record.items() if key not in ("spec", "metrics")}
+    out["metrics"] = record.get("metrics")
+    return out
+
+
+def _print_success(payload: dict) -> None:
+    roots = ", ".join("%s (%s)" % (os.path.basename(block["root"]), block["role"])
+                      for block in payload["roots"])
+    print("roots          : %s" % roots)
+    print("products       : %d of %d product seeds, %d generated (product roots: %s)"
+          % (payload["filtered"]["kept"], payload["filtered"]["requested"],
+             payload["filtered"]["generated_requested"],
+             ", ".join(os.path.basename(path) for path in payload["product_roots"])))
+    print("levels         : %s" % payload["levels"])
+    print("filtered       : %s" % (payload["filtered"]["reasons"] or "nothing dropped"))
+    for name in ("generation", "product"):
+        requested = payload["requested"][name]
+        print("requested (%s) : %s (basis %s)" % (name, requested["share"], requested["basis"]))
+    print("generated fam. : %s" % payload["generated"].get("family_share"))
+    print("success fam.   : %s" % payload["success"].get("family_share"))
+    print("floors         : %s" % payload["success"].get("floors"))
+    print("shape          : %s" % payload["success"].get("shape"))
+    print("shape bins     : %s" % payload["success"].get("shape_bins"))
+    print("doors          : %s" % payload["success"].get("door_graph"))
+    fallback = payload["success"].get("fallback") or {}
+    switch = fallback.get("family_switch") or {}
+    auto = fallback.get("auto_fallback") or {}
+    print("fallback       : first attempt %s, retried %s, auto fallback %s (of %s known), "
+          "family switch %s (recorded draws)"
+          % (fallback.get("first_attempt_rate"), fallback.get("retry_rate"),
+             "not recorded" if auto.get("rate") is None else auto.get("rate"), auto.get("known"),
+             "not recorded" if switch.get("rate") is None else switch.get("rate")))
+    for basis in ("replayed", "declared"):
+        bucket = (switch.get("by_basis") or {}).get(basis)
+        if bucket:
+            print("  - %s draws: %s of %s differ from the built family (not a recorded fallback)"
+                  % (basis, bucket["switched"], bucket["known"]))
+    reuse = payload["success"].get("furniture_reuse") or {}
+    print("furniture      : %s placements, %s distinct, reuse %s, cross-scene %s"
+          % (reuse.get("placements"), reuse.get("distinct_assets"), reuse.get("reuse_rate"),
+             reuse.get("cross_scene_reuse_rate")))
+    views = payload["success"].get("view_coverage") or {}
+    print("camera views   : %s cameras (%s/scene), rooms without camera %s, coverage %s"
+          % (views.get("cameras"), (views.get("cameras_per_scene") or {}).get("mean"),
+             views.get("rooms_without_camera"),
+             views.get("scene_visible_area_fraction")))
+    quality = payload["success"].get("quality") or {}
+    print("quality        : review %s/%s passed (score mean %s), validation %s at resolution, "
+          "degraded %s"
+          % (quality.get("review_passed"), quality.get("reviewed"),
+             (quality.get("review_score") or {}).get("mean"),
+             quality.get("validation_passed_at_resolution"), quality.get("degraded")))
+    for name in ("generation", "product"):
+        bias = payload["bias"][name]
+        print("bias %-10s : tv(request, actual) %s" % (name, bias["tv_distance"]))
+        for note in bias["notes"][:4]:
+            print("  - %s" % note)
+
+
+# --------------------------------------------------------------------------- #
 # benchmark: layout sweep -> diversity -> stratified sample -> render + review
 # --------------------------------------------------------------------------- #
 def _run_batch(start: int, count: int, root: str, env_overrides: Dict[str, str],
@@ -1115,6 +2119,22 @@ def _write(path: Optional[str], payload: dict) -> None:
         json.dump(payload, handle, indent=2)
 
 
+def success_command(args) -> int:
+    """Read every batch root, compare the request with the delivered products."""
+    try:
+        blocks = _set_role([read_root(root, replay_draw=not args.no_replay_draw)
+                            for root in args.roots], args.product_root)
+    except ValueError as error:
+        print("success: %s" % error, file=sys.stderr)
+        return 2
+    payload = success_payload(blocks, scenes=args.scenes)
+    if args.out:
+        _write(args.out, payload)
+        print("success report: %s" % args.out)
+    _print_success(payload)
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Structural diversity of generated houses")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1132,6 +2152,17 @@ def main(argv=None) -> int:
     seeds_cmd.add_argument("--scenes", action="store_true")
     seeds_cmd.add_argument("--hostpy", default=DEFAULT_HOSTPY,
                            help="interpreter that generates the specs")
+
+    success_cmd = sub.add_parser("success", help="final products: family mix, fallback and bias")
+    success_cmd.add_argument("--root", action="append", required=True, dest="roots",
+                             help="batch root with batch_summary.json + scene_*/ (repeatable)")
+    success_cmd.add_argument("--product-root", action="append", default=None,
+                             help="root whose bundle_ok scenes are the final products "
+                                  "(default: every root that requested a render, else every root)")
+    success_cmd.add_argument("--no-replay-draw", action="store_true",
+                             help="do not re-draw the family of artifacts that record none")
+    success_cmd.add_argument("--out", default=None)
+    success_cmd.add_argument("--scenes", action="store_true", help="keep the per-scene records")
 
     bench_cmd = sub.add_parser("benchmark", help="layout sweep + stratified render/review sample")
     bench_cmd.add_argument("--seeds", default="0-99")
@@ -1153,6 +2184,9 @@ def main(argv=None) -> int:
 
     if args.command == "benchmark":
         return benchmark(args)
+
+    if args.command == "success":
+        return success_command(args)
 
     if args.command == "specs":
         entries = load_specs(args.paths)
