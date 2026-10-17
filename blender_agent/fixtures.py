@@ -17,6 +17,15 @@ computed from the same data (:func:`_part` normalises the boxes: XY-centred,
 bottom at z = 0), so the collision box of ``checks.py`` is exactly what the
 render shows -- a part can never drift from its check.
 
+**Scaling**: a spec may scale a ``builtin:`` item (``FurnitureSpec.scale``) and
+``checks.item_dims`` multiplies the resolved footprint by it, so the generator
+has to emit scaled geometry.  :func:`world_boxes` is where that happens: every
+box -- centres, sizes and the bottom offset -- is multiplied by the same factor
+around the part's local origin (the centre of its footprint, bottom at z = 0),
+which leaves the union XY-centred with its bottom at ``base_z``.  ``dims``,
+``usage_m`` and the built geometry therefore all carry the same ``scale`` and the
+checker's numbers stay the world numbers.
+
 **Blender side**: :func:`build` turns one part into mesh objects in the
 furniture collection, with the conventions of ``details.py`` (world-space
 vertices, metres, Z-up, floor at z = 0) and of ``assets.py`` for the yaw
@@ -59,7 +68,9 @@ def _part(boxes: Sequence[Box], usage: float = 0.0, category: str = "") -> dict:
     The boxes are shifted so the union is centred on the local origin in X/Y and
     starts at z = 0 -- the placement convention of ``spec.py``: ``pos`` is the
     centre of the footprint, ``z`` its bottom.  ``dims`` is the size of that
-    union, so ``checks.item_dims`` and the geometry cannot disagree.
+    union, so ``checks.item_dims`` and the geometry cannot disagree: a scaled
+    item multiplies this table *and* the emitted boxes by the same factor
+    (:func:`world_boxes`).
 
     Box coordinates: ``(centre_x, centre_y, bottom_z)`` and ``(width, depth,
     height)`` -- the z of a box is its *bottom*, matching the part convention
@@ -304,14 +315,23 @@ BUILTIN_DIMS_M: Dict[str, Tuple[float, float, float]] = {
 }
 
 
-def dims(part: str) -> Tuple[float, float, float]:
-    """Measured ``(width, depth, height)`` of a fixture part, un-rotated."""
-    return FIXTURE_PARTS[part]["dims"]
+def dims(part: str, scale: float = 1.0) -> Tuple[float, float, float]:
+    """Measured ``(width, depth, height)`` of a fixture part, un-rotated.
+
+    ``scale`` is the spec's ``FurnitureSpec.scale``: the table holds the 1:1
+    part, so this is the size the built geometry really has.
+    """
+    base = FIXTURE_PARTS[part]["dims"]
+    return (base[0] * float(scale), base[1] * float(scale), base[2] * float(scale))
 
 
-def usage_m(part: str) -> float:
-    """Clear space the part needs in front of it (door swing / pull-out)."""
-    return float(FIXTURE_PARTS[part]["usage_m"])
+def usage_m(part: str, scale: float = 1.0) -> float:
+    """Clear space the part needs in front of it (door swing / pull-out).
+
+    A direct ratio of the part's own size, so it scales with the geometry a
+    scaled ``builtin:`` item emits.
+    """
+    return float(FIXTURE_PARTS[part]["usage_m"]) * float(scale)
 
 
 def is_fixture(kind: str) -> bool:
@@ -339,33 +359,59 @@ def _material(key: str):
     return material
 
 
+def world_boxes(kind: str, pos: Sequence[float], rot_z_deg: float, base_z: float = 0.0,
+                scale: float = 1.0) -> List[dict]:
+    """The boxes :func:`build` emits, in world coordinates -- pure stdlib.
+
+    One entry per part box: ``suffix``, ``material`` key, the ``center`` of the
+    box in XY, the yaw ``direction``, the box ``size`` ``(width, depth, height)``
+    and its world ``z0`` / ``z1``.  ``scale`` multiplies the local centre, the
+    size and the height above ``base_z``, i.e. the whole assembly is scaled
+    around its own origin, so the union stays XY-centred on ``pos`` with its
+    bottom at ``base_z`` -- the footprint ``checks.item_dims`` resolves for the
+    same ``scale``.  Tests measure this; :func:`build` only turns it into meshes.
+    """
+    part = FIXTURE_PARTS[kind]
+    theta = math.radians(float(rot_z_deg))
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    factor = float(scale)
+    out: List[dict] = []
+    for suffix, material_key, (cx, cy, cz), (width, depth, height) in part["boxes"]:
+        if width <= 0.0 or depth <= 0.0 or height <= 0.0:
+            continue
+        out.append({
+            "suffix": suffix,
+            "material": material_key,
+            "center": (float(pos[0]) + cos_t * cx * factor - sin_t * cy * factor,
+                       float(pos[1]) + sin_t * cx * factor + cos_t * cy * factor),
+            "direction": (cos_t, sin_t),
+            "size": (width * factor, depth * factor, height * factor),
+            "z0": float(base_z) + cz * factor,
+            "z1": float(base_z) + (cz + height) * factor,
+        })
+    return out
+
+
 def build(kind: str, pos: Sequence[float], rot_z_deg: float, collection,
-          name: Optional[str] = None, base_z: float = 0.0) -> List:
+          name: Optional[str] = None, base_z: float = 0.0, scale: float = 1.0) -> List:
     """Build one fixture part as mesh objects in ``collection``.
 
     ``pos`` is the centre of the part's footprint (the spec convention),
     ``rot_z_deg`` rotates about Z with the front facing -Y at 0 (the asset
     convention of ``assets.py``), ``base_z`` lifts the whole assembly (a
-    wall-mounted upper cabinet).  Returns the created objects, bottom face at
+    wall-mounted upper cabinet) and ``scale`` is the spec's item scale, applied
+    by :func:`world_boxes`.  Returns the created objects, bottom face at
     ``base_z``.
     """
     from blender_agent import shell as shell_mod
 
-    part = FIXTURE_PARTS[kind]
     label = name or f"fixture_{kind}"
-    theta = math.radians(float(rot_z_deg))
-    cos_t, sin_t = math.cos(theta), math.sin(theta)
-    direction = (cos_t, sin_t)
     objects = []
-    for suffix, material_key, (cx, cy, cz), (width, depth, height) in part["boxes"]:
-        wx = float(pos[0]) + cos_t * cx - sin_t * cy
-        wy = float(pos[1]) + sin_t * cx + cos_t * cy
-        if width <= 0.0 or depth <= 0.0 or height <= 0.0:
-            continue
+    for box in world_boxes(kind, pos, rot_z_deg, base_z=base_z, scale=scale):
         obj = shell_mod.add_oriented_box(
-            f"{label}_{suffix}", (wx, wy), direction, width, depth,
-            float(base_z) + cz, float(base_z) + cz + height, collection,
+            f"{label}_{box['suffix']}", box["center"], box["direction"],
+            box["size"][0], box["size"][1], box["z0"], box["z1"], collection,
         )
-        obj.data.materials.append(_material(material_key))
+        obj.data.materials.append(_material(box["material"]))
         objects.append(obj)
     return objects

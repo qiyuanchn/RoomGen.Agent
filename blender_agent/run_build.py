@@ -34,11 +34,21 @@ if REPO_ROOT not in sys.path:
 import bpy  # noqa: E402  (must come after the sys.path fix)
 
 from blender_agent import assets, details, export_glb, front3d, materials, panorama, render_selftest, settle, shell  # noqa: E402
+from blender_agent import checks as checks_mod  # noqa: E402
 from blender_agent import spec as spec_mod, stage  # noqa: E402
 
 DEFAULT_CACHE = os.path.join(REPO_ROOT, "third_party", "assets", "polyhaven")
 FURNITURE_COLLECTION = "furniture"
 DETAILS_COLLECTION = "details"
+
+#: point light of a table lamp: inside its shade, which spans 0.58..1.0 of the
+#: lamp's height (``details.make_table_lamp``) -- a ratio, so a scaled lamp
+#: keeps its light where the checker expects the fixture to be
+LAMP_LIGHT_HEIGHT_RATIO = 0.88
+
+#: built height of the rug slab (``details.make_rug``); the checker's
+#: ``RUG_THICKNESS_M`` is the conservative AABB it measures rugs with
+RUG_SLAB_HEIGHT_M = 0.012
 
 
 def parse_args(argv):
@@ -286,8 +296,11 @@ def place_furniture(spec: spec_mod.SceneSpec, libraries: dict, scene_materials: 
             floor_z = spec.room_elevation(item.room)
             if kind == "rug":
                 size = item.size
+                # the checker scales a rug's size with the item; the built slab
+                # has to carry the same footprint or the two disagree
+                scaled = [float(size[0]) * item.scale, float(size[1]) * item.scale]
                 obj = details.make_rug(
-                    item.pos, size, item.rot_z_deg,
+                    item.pos, scaled, item.rot_z_deg,
                     scene_materials.get("rug"), collection, name=f"rug_{name}",
                 )
                 if scene_materials.get("rug") is not None:
@@ -296,37 +309,48 @@ def place_furniture(spec: spec_mod.SceneSpec, libraries: dict, scene_materials: 
                 obj.location.z += floor_z
                 placements.append({"name": name, "asset": item.asset, "kind": "builtin",
                                    "pos": item.pos, "rot_z_deg": item.rot_z_deg,
-                                   "z": round(floor_z, 4),
-                                   "size_m": [size[0], size[1], 0.012]})
+                                   "z": round(floor_z, 4), "mount": item.mount,
+                                   "scale": float(item.scale),
+                                   "size_m": [scaled[0], scaled[1], RUG_SLAB_HEIGHT_M],
+                                   "bbox_z": [round(floor_z, 4),
+                                              round(floor_z + RUG_SLAB_HEIGHT_M, 4)]})
                 continue
             if kind == "table_lamp":
-                base_z = float(item.z) if item.z is not None else floor_z
-                parts = details.make_table_lamp(item.pos, collection=collection, name=f"lamp_{name}")
+                # the prop size comes from the same table the checker reads, so a
+                # scaled lamp is built at the size the checker measures
+                dims = tuple(v * item.scale for v in checks_mod.BUILTIN_DIMS_M["builtin:table_lamp"])
+                _floor_z, base_z, top_z = checks_mod.item_world_z(spec, item, dims)
+                parts = details.make_table_lamp(item.pos, height=dims[2], radius=dims[0] / 2.0,
+                                                collection=collection, name=f"lamp_{name}")
                 shade = materials_mod_plain_principled("mat_lamp_shade", (0.95, 0.90, 0.82), 0.7)
                 _add_emission(shade, strength=1.6)
                 body = materials_mod_plain_principled("mat_lamp_body", (0.35, 0.33, 0.30), 0.35)
                 for part in parts:
                     part.data.materials.append(shade if "shade" in part.name else body)
                     part.location.z += base_z
-                lamp_lights.append((item.pos[0], item.pos[1], base_z + 0.30))
+                lamp_lights.append((item.pos[0], item.pos[1], base_z + LAMP_LIGHT_HEIGHT_RATIO * dims[2]))
                 placements.append({"name": name, "asset": item.asset, "kind": "builtin",
                                    "pos": item.pos, "rot_z_deg": item.rot_z_deg, "z": base_z,
-                                   "size_m": [0.22, 0.22, 0.34]})
+                                   "mount": item.mount, "scale": float(item.scale),
+                                   "size_m": [round(v, 4) for v in dims],
+                                   "bbox_z": [round(base_z, 4), round(top_z, 4)]})
                 continue
             # functional furniture (kitchen run, bathroom set, desk ...) built as
             # box assemblies by blender_agent/fixtures.py; the placement records
             # the created objects, which is how settle.resolve_targets finds them
             from blender_agent import fixtures as fixtures_mod
             if fixtures_mod.is_fixture(kind):
-                base_z = float(item.z) if item.z is not None else floor_z
+                scale = float(item.scale)
+                dims = fixtures_mod.dims(kind, scale)
+                _floor_z, base_z, top_z = checks_mod.item_world_z(spec, item, dims)
                 objects = fixtures_mod.build(kind, item.pos, item.rot_z_deg, collection,
-                                             name=f"fixture_{name}", base_z=base_z)
+                                             name=f"fixture_{name}", base_z=base_z, scale=scale)
                 placements.append({"name": name, "asset": item.asset, "kind": "builtin",
                                    "pos": item.pos, "rot_z_deg": item.rot_z_deg, "z": base_z,
-                                   "mount": item.mount,
-                                   "size_m": [round(v, 4) for v in fixtures_mod.dims(kind)],
-                                   "bbox_z": [round(base_z, 4),
-                                              round(base_z + fixtures_mod.dims(kind)[2], 4)],
+                                   "mount": item.mount, "scale": scale,
+                                   "size_m": [round(v, 4) for v in dims],
+                                   "usage_m": round(fixtures_mod.usage_m(kind, scale), 4),
+                                   "bbox_z": [round(base_z, 4), round(top_z, 4)],
                                    "objects": [obj.name for obj in objects]})
                 continue
             raise SystemExit(f"[run_build] unknown builtin prop '{kind}'")
@@ -334,11 +358,9 @@ def place_furniture(spec: spec_mod.SceneSpec, libraries: dict, scene_materials: 
         asset_collection = assets.append_asset(libraries[asset_id], asset_id)
         asset_object = asset_collection.objects[0]
         size = [float(v) * item.scale for v in asset_object.dimensions]
-        floor_z = spec.room_elevation(item.room)
-        # ``z`` is a world height; without one the piece stands on its room's floor
-        height = float(item.z) if item.z is not None else floor_z
-        if item.mount == "ceiling":
-            height = spec.room_top(item.room) - size[2]
+        # ``z`` is a world height; without one the piece stands on its room's
+        # floor, and a ceiling mount hangs it from that room's own ceiling
+        _floor_z, height, top_z = checks_mod.item_world_z(spec, item, size)
         instance = assets.place_asset(
             asset_collection, f"furn_{name}", item.pos, item.rot_z_deg,
             height, item.scale,
@@ -349,7 +371,8 @@ def place_furniture(spec: spec_mod.SceneSpec, libraries: dict, scene_materials: 
             "name": name, "asset": item.asset, "kind": "model", "instance": instance.name,
             "pos": item.pos, "rot_z_deg": item.rot_z_deg, "z": round(height, 4),
             "size_m": [round(v, 4) for v in size], "mount": item.mount,
-            "bbox_z": [round(height, 4), round(height + size[2], 4)],
+            "scale": float(item.scale),
+            "bbox_z": [round(height, 4), round(top_z, 4)],
         })
     return {"collection": collection, "placements": placements, "lamp_lights": lamp_lights,
             "skipped": skipped}
