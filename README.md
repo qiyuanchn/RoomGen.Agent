@@ -37,7 +37,13 @@ shower entry); `checks.py --functional-usage` runs it standalone.  The browser
 viewer’s Walk mode follows GLB support surfaces through stairs and slabs with
 collision and floor sections.  Asset libraries carry a content fingerprint:
 same-path byte replacement invalidates resume, while an mtime-only touch does
-not re-read unchanged files.
+not re-read unchanged files.  Cross-level layouts now include `--shape void`
+(double-height living room with gallery railings), `mezzanine` (partial upper
+storey with real ceilings elsewhere) and `split_level` (height-stepped rooms
+joined by ramps); voids, rails and walk tracks share the same support/clearance
+checks.  Settled proxies are keyed per placement (duplicate cabinets and rugs
+stay separate), and glTF footprints are axis-aligned to the registry during
+asset normalisation.
 
 ## Why build the scene in 3D first
 
