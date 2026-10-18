@@ -674,8 +674,16 @@ class ObservationBackend:
 # --------------------------------------------------------------------------- #
 def env_observation_provider(backend: "ObservationBackend", *,
                              pitch: float = 0.0,
-                             resolution: Tuple[int, int] = DEFAULT_RESOLUTION):
+                             resolution: Tuple[int, int] = DEFAULT_RESOLUTION,
+                             eye_height: float = 1.5):
     """Adapter for ``roomgen_nav.env.PointNavEnv.set_observation_provider``.
+
+    ``PointNavEnv.position`` is the body on the walking surface (the NavMesh /
+    floor y), while observations are taken from the camera.  The provider adds
+    ``eye_height`` metres to y, matching ``scene3d_manifest.json``'s
+    ``eye_height`` of 1.5; on an upper storey the floor elevation is already in
+    ``env.position[1]``, so the result lands on 4.4 m, exactly where the
+    manifest cameras sit.
 
     ``PointNavEnv.yaw_deg`` is the same compass heading as the backend's
     default ``"manifest"`` convention (0 = +X, 90 = -Z), so the provider passes
@@ -684,8 +692,13 @@ def env_observation_provider(backend: "ObservationBackend", *,
     """
 
     def provider(env):
+        position = (
+            float(env.position[0]),
+            float(env.position[1]) + float(eye_height),
+            float(env.position[2]),
+        )
         observation = backend.get_observation(
-            tuple(env.position), float(env.yaw_deg), pitch, resolution)
+            position, float(env.yaw_deg), pitch, resolution)
         return observation.as_sensor_dict()
 
     return provider

@@ -392,18 +392,23 @@ class BlenderObservationTest(unittest.TestCase):
 
     def test_env_provider_adapter(self):
         class FakeEnv:
-            position = (0.0, 0.0, 0.0)
-            yaw_deg = 90.0  # manifest heading -Z: the red wall is 2 m away
+            position = (0.0, -ROOM_HALF_Y, 0.0)  # body on the walking surface
+            yaw_deg = 90.0  # manifest heading -Z
 
         with ob.ObservationBackend(self.scene_dir, samples=4, timeout=120.0) as backend:
-            provider = ob.env_observation_provider(backend, resolution=(63, 63))
+            provider = ob.env_observation_provider(
+                backend, pitch=-45.0, resolution=(63, 63), eye_height=ROOM_HALF_Y)
             result = provider(FakeEnv())
         self.assertIsInstance(result, dict)
         self.assertEqual(result["provider"], "blender_cycles")
         self.assertEqual(result["rgb"].shape, (63, 63, 3))
         self.assertEqual(result["depth"].shape, (63, 63))
         self.assertEqual(result["intrinsics"].shape, (3, 3))
-        self.assertAlmostEqual(float(result["depth"][31, 31]), ROOM_HALF_Z, delta=0.01)
+        # eye_height lifts the camera from y=-1.5 to y=0; looking down 45 deg
+        # then reaches the floor at 1.5 / cos(45 deg), not immediately.
+        self.assertAlmostEqual(float(result["depth"][31, 31]),
+                               ROOM_HALF_Y / math.cos(math.radians(45.0)), delta=0.01)
+        self.assertAlmostEqual(float(result["position"][1]), 0.0)
 
 
 if __name__ == "__main__":
