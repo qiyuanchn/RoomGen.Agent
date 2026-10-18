@@ -13,6 +13,9 @@ Checks (exit code 1 on any failure):
     (rays from the pose hit surfaces in most directions)
   * the triangle count is in the same ballpark as furnished.ply, i.e. the
     furniture made it through the export
+  * every GLB mesh node carries (or inherits from a collection-instance parent)
+    the four semantic ids and they match ``scene3d_manifest.json``
+    (``semantics.objects``); legacy GLBs without the table are only warned about
 """
 
 from __future__ import annotations
@@ -25,6 +28,12 @@ import sys
 
 import numpy as np
 import trimesh
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+
+from blender_agent.export_glb import read_glb_document, verify_glb_semantics  # noqa: E402
 
 GLB_CANDIDATES = ("scene.glb", os.path.join("build", "scene.glb"))
 RAY_DIRECTIONS = (
@@ -209,6 +218,25 @@ def main(argv=None) -> int:
             if not inside:
                 failures.append(f"camera {entry['name']} at {position} looks outside the geometry")
         report["cameras_checked"] = len(report["cameras"])
+
+        document = None
+        try:
+            document = read_glb_document(glb_path)
+        except Exception as exc:  # noqa: BLE001 - report the parse problem, keep checking
+            failures.append(f"could not parse the GLB JSON chunk for semantics: {exc}")
+        if document is not None:
+            sem_failures, sem_warnings, sem_report = verify_glb_semantics(document, manifest)
+            failures.extend(sem_failures)
+            warnings.extend(sem_warnings)
+            report["semantics"] = sem_report
+            if manifest.get("semantics"):
+                print(f"[check_scene_glb] semantics: {sem_report.get('instances', 0)} instances, "
+                      f"{sem_report.get('objects', 0)} objects, "
+                      f"{sem_report.get('categories', 0)} categories, "
+                      f"{sem_report.get('resolved_mesh_nodes', 0)}/"
+                      f"{sem_report.get('mesh_nodes', 0)} mesh nodes resolved to extras")
+            else:
+                print("[check_scene_glb] semantics: absent (legacy GLB, extras not checked)")
     else:
         warnings.append(f"no {os.path.basename(manifest_path)} next to the GLB")
 
