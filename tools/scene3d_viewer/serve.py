@@ -5,6 +5,7 @@ One scene per server instance, no dependencies beyond the standard library:
 
     /                tools/scene3d_viewer/index.html
     /viewer.js       /viewer.css        the viewer page's own assets
+    /walk.mjs        the walk / ground-following geometry module
     /vendor/<path>   three.js r180 + GLTFLoader / OrbitControls / RoomEnvironment
     /scene.glb       the build's GLB (``<scene_dir>/scene.glb`` or ``<scene_dir>/build/scene.glb``)
     /manifest.json   scene3d_manifest.json (cameras, rooms, bounds) + the page's load URLs
@@ -70,6 +71,15 @@ def _gltf_point(point) -> list:
 def manifest_from_build_manifest(build_manifest: dict) -> dict:
     """Fallback manifest from ``build_manifest.json`` (older builds, no GLB manifest)."""
     spec = build_manifest.get("spec") or {}
+    raw_floors = spec.get("floors") or []
+    floor_by_id = {str(floor.get("id")): floor for floor in raw_floors}
+    room_floor = {}
+    room_elevation = {}
+    for room in spec.get("rooms") or []:
+        floor = floor_by_id.get(str(room.get("floor_id"))) if room.get("floor_id") is not None else None
+        room_floor[room.get("id")] = floor
+        room_elevation[room.get("id")] = float(floor.get("elevation", 0.0)) if floor else 0.0
+
     entries = list(build_manifest.get("cameras") or [])
     if not entries:
         # a --skip-render build has no rendered camera stats; the spec dump still
@@ -83,9 +93,12 @@ def manifest_from_build_manifest(build_manifest: dict) -> dict:
         if not pos:
             continue
         yaw = float(entry.get("yaw", 0.0) or 0.0)  # radians, as written by run_build.py
+        floor = room_floor.get(entry.get("room"))
         cameras.append({
             "name": entry.get("camera") or entry.get("name"),
             "room": entry.get("room"),
+            "floor_id": floor.get("id") if floor else None,
+            "floor_elevation": float(floor.get("elevation", 0.0)) if floor else 0.0,
             "position": _gltf_point(pos),
             "yaw_deg": math.degrees(yaw) if abs(yaw) <= 2 * math.pi else yaw,
             "forward": [math.cos(yaw), 0.0, -math.sin(yaw)],
@@ -98,16 +111,42 @@ def manifest_from_build_manifest(build_manifest: dict) -> dict:
             continue
         xs = [float(p[0]) for p in polygon]
         ys = [float(p[1]) for p in polygon]
-        height = float(spec.get("wall_height", 2.7))
+        elevation = room_elevation.get(room.get("id"), 0.0)
+        floor = room_floor.get(room.get("id"))
+        height = float(room.get("height") or (floor.get("height", spec.get("wall_height", 2.7))
+                                              if floor else spec.get("wall_height", 2.7)))
         camera = next((cam["name"] for cam in cameras if cam.get("room") == room.get("id")), None)
         rooms.append({
             "id": room.get("id"),
             "type": room.get("type"),
             "camera": camera,
-            "center": _gltf_point(((min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0, DEFAULT_EYE_HEIGHT)),
+            "floor_id": floor.get("id") if floor else room.get("floor_id"),
+            "floor_elevation": elevation,
+            "floor_height": height,
+            "center": _gltf_point(((min(xs) + max(xs)) / 2.0,
+                                   (min(ys) + max(ys)) / 2.0,
+                                   elevation + DEFAULT_EYE_HEIGHT)),
             "size": [max(xs) - min(xs), max(ys) - min(ys), height],
+            "polygon": [[float(p[0]), -float(p[1])] for p in polygon],
         })
-    return {"cameras": cameras, "rooms": rooms, "bounds": None, "stats": None}
+
+    floors = []
+    for floor in raw_floors:
+        floor_id = str(floor.get("id"))
+        elevation = float(floor.get("elevation", 0.0))
+        height = float(floor.get("height", spec.get("wall_height", 2.7)))
+        slab = float(floor.get("slab_thickness", 0.15))
+        floors.append({
+            "id": floor_id,
+            "elevation": elevation,
+            "height": height,
+            "slab_thickness": slab,
+            "slab_bottom": elevation - slab,
+            "top": elevation + height,
+            "rooms": [room.get("id") for room in (spec.get("rooms") or [])
+                      if room.get("floor_id") == floor.get("id")],
+        })
+    return {"cameras": cameras, "rooms": rooms, "floors": floors, "bounds": None, "stats": None}
 
 
 def build_payload(scene_root: Path, glb_path: Path) -> dict:
@@ -138,6 +177,7 @@ def build_payload(scene_root: Path, glb_path: Path) -> dict:
         "eye_height": DEFAULT_EYE_HEIGHT,
         "cameras": [],
         "rooms": [],
+        "floors": [],
         "bounds": None,
         "stats": None,
     }
@@ -147,6 +187,7 @@ def build_payload(scene_root: Path, glb_path: Path) -> dict:
             "eye_height": manifest.get("eye_height", DEFAULT_EYE_HEIGHT),
             "cameras": manifest.get("cameras", []),
             "rooms": manifest.get("rooms", []),
+            "floors": manifest.get("floors", []),
             "bounds": manifest.get("bounds"),
             "stats": manifest.get("stats"),
             "blender_version": manifest.get("blender_version"),
@@ -179,7 +220,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
         if route == "/scene.glb":
             self.send_file(self.server.glb_path, head_only, cache="no-store")
             return
-        if route in ("/viewer.js", "/viewer.css"):
+        if route in ("/viewer.js", "/viewer.css", "/walk.mjs"):
             self.send_file(ASSET_DIR / route.lstrip("/"), head_only, cache="no-store")
             return
         if route.startswith("/vendor/"):
@@ -204,7 +245,7 @@ class ViewerHandler(BaseHTTPRequestHandler):
         self.send_file(path, head_only, cache="no-store")
 
     def content_type(self, path: Path) -> str:
-        if path.suffix == ".js":
+        if path.suffix in (".js", ".mjs"):
             return "text/javascript"
         if path.suffix == ".glb":
             return "model/gltf-binary"

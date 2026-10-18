@@ -12,7 +12,10 @@ fully dressed (shell, details, furniture, materials) and writes:
                                   export statistics
 
 Only ``bpy``/``mathutils`` (both inside Blender) plus the standard library are
-used, so the module imports inside a Blender process and nowhere else.
+used at build time.  The pure manifest helpers (:func:`blender_to_gltf` and
+:func:`viewer_manifest`) also import on a host Python for ``tests/``: the bpy and
+mathutils imports below are optional, and nothing outside the GLB-export path
+touches them.
 
 Coordinate conversion: the Blender scene is Z-up metres, glTF is Y-up metres,
 so ``p_gltf = (x, z, -y)`` - the same mapping ``bpy.ops.export_scene.gltf``
@@ -26,8 +29,12 @@ import json
 import math
 import os
 
-import bpy
-from mathutils import Matrix, Quaternion, Vector
+try:  # inside Blender
+    import bpy
+    from mathutils import Matrix, Quaternion, Vector
+except ImportError:  # host Python: the manifest helpers are still testable
+    bpy = None
+    Matrix = Quaternion = Vector = None
 
 GLB_NAME = "scene.glb"
 MANIFEST_NAME = "scene3d_manifest.json"
@@ -198,14 +205,41 @@ def glb_bounds(document: dict) -> dict:
 # viewer manifest
 # --------------------------------------------------------------------------- #
 def viewer_manifest(spec, glb_name: str, stats: dict, bounds: dict, skipped: list) -> dict:
-    """Cameras + rooms + bounds in glTF coordinates for the web viewer."""
+    """Cameras + rooms + floors + bounds in glTF coordinates for the web viewer.
+
+    Every room and camera carries the storey it belongs to (``floor_id``,
+    ``floor_elevation`` in Blender metres).  A room centre is placed at
+    ``floor elevation + eye height`` in glTF Y, so the viewer can jump to a
+    second-storey room without guessing from a global constant; camera poses
+    keep their authored world Z (already elevation + eye height).
+    """
+    floor_by_room = {}
+    floors = []
+    if spec is not None:
+        for floor in getattr(spec, "floors", []):
+            floors.append({
+                "id": floor.id,
+                "elevation": float(floor.elevation),
+                "height": float(floor.height),
+                "slab_thickness": float(floor.slab_thickness),
+                "slab_bottom": float(floor.slab_bottom),
+                "top": float(floor.top),
+                "rooms": [room.id for room in spec.rooms if room.floor_id == floor.id],
+            })
+            for room in spec.rooms:
+                if room.floor_id == floor.id:
+                    floor_by_room[room.id] = floor
+
     cameras = []
     if spec is not None:
         for camera in spec.cameras:
             yaw_deg = float(getattr(camera, "yaw", 0.0) or 0.0)
+            floor = floor_by_room.get(camera.room)
             cameras.append({
                 "name": camera.name,
                 "room": getattr(camera, "room", None),
+                "floor_id": floor.id if floor is not None else None,
+                "floor_elevation": float(floor.elevation) if floor is not None else 0.0,
                 "position": blender_to_gltf(camera.pos),
                 "yaw_deg": yaw_deg,
                 "forward": blender_heading_to_gltf(yaw_deg),
@@ -219,26 +253,34 @@ def viewer_manifest(spec, glb_name: str, stats: dict, bounds: dict, skipped: lis
         for room in spec.rooms:
             xs = [float(p[0]) for p in room.polygon]
             ys = [float(p[1]) for p in room.polygon]
+            floor = floor_by_room.get(room.id)
+            elevation = float(floor.elevation) if floor is not None else 0.0
+            height = float(spec.room_height(room.id))
             center = blender_to_gltf(((min(xs) + max(xs)) / 2.0,
                                       (min(ys) + max(ys)) / 2.0,
-                                      EYE_HEIGHT_M))
+                                      elevation + EYE_HEIGHT_M))
             rooms.append({
                 "id": room.id,
                 "type": room.type,
                 "camera": first_camera.get(room.id),
+                "floor_id": floor.id if floor is not None else room.floor_id,
+                "floor_elevation": elevation,
+                "floor_height": height,
                 "center": center,
-                "size": [max(xs) - min(xs), max(ys) - min(ys), float(spec.wall_height)],
+                "size": [max(xs) - min(xs), max(ys) - min(ys), height],
+                "polygon": [[float(p[0]), -float(p[1])] for p in room.polygon],
             })
 
     return {
         "kind": "roomgen_scene3d",
         "created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
-        "blender_version": bpy.app.version_string,
+        "blender_version": getattr(getattr(bpy, "app", None), "version_string", None),
         "glb": glb_name,
         "up_axis": "Y",
         "units": "meter",
         "eye_height": EYE_HEIGHT_M,
         "bounds": bounds,
+        "floors": floors,
         "cameras": cameras,
         "rooms": rooms,
         "stats": stats,

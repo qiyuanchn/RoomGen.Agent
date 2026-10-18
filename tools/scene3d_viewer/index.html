@@ -34,9 +34,19 @@
       <div class="hud-modes" role="group" aria-label="Camera mode">
         <button id="mode-orbit" class="mode-button is-active" type="button" title="Orbit around the scene (1)">Orbit</button>
         <button id="mode-fly" class="mode-button" type="button" title="Free flight, WASD + mouse look (2)">Fly</button>
-        <button id="mode-walk" class="mode-button" type="button" title="Walk at 1.5 m eye height, WASD + mouse look (3)">Walk</button>
+        <button id="mode-walk" class="mode-button" type="button" title="Walk the GLB floors and stairs at eye height, WASD + mouse look (3)">Walk</button>
       </div>
       <button id="reset-view" class="mode-button" type="button" title="Back to the overview (R)">Reset</button>
+    </div>
+    <div class="hud-row hud-controls">
+      <label class="hud-field" for="floor-select">
+        Floor
+        <select id="floor-select" disabled>
+          <option value="">All floors</option>
+        </select>
+      </label>
+      <button id="section-toggle" class="mode-button" type="button" disabled
+              aria-pressed="false" title="Cut the selected floor at eye height">Section</button>
     </div>
   </header>
 
