@@ -137,9 +137,13 @@ def main() -> int:
                 "categories": entry.get("categories") or [],
                 "gltf_variants": {"1k": variant},
             }
-        args.midi3d_cache_index.write_text(
-            json.dumps({"version": 2, "models": models, "textures": {}}, indent=1, sort_keys=True))
-        print(f"[merged] midi3d cache index: {len(models)} glbs -> {args.midi3d_cache_index}")
+        if models:
+            args.midi3d_cache_index.parent.mkdir(parents=True, exist_ok=True)
+            args.midi3d_cache_index.write_text(
+                json.dumps({"version": 2, "models": models, "textures": {}}, indent=1, sort_keys=True))
+            print(f"[merged] midi3d cache index: {len(models)} glbs -> {args.midi3d_cache_index}")
+        else:
+            print("[merged] no midi3d glbs, skipping the cache index")
 
     by_src = {}
     for v in merged.values():

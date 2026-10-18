@@ -18,7 +18,8 @@ if [[ -x "${ENV_DIR}/bin/python" && "${FORCE}" == "0" ]]; then
   echo "nav env already present: ${ENV_DIR}"
 else
   command -v conda >/dev/null || { echo "conda is required" >&2; exit 1; }
-  conda create -y -p "${ENV_DIR}" -c aihabitat -c conda-forge \
+  conda create -y -p "${ENV_DIR}" --override-channels \
+    -c aihabitat -c conda-forge \
     "habitat-sim=0.3.3" headless libegl python=3.9 numpy
 fi
 

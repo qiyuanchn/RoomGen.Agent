@@ -35,12 +35,12 @@ for name, entry in sorted(models.items()):
 PY
 )
 if [[ ${#PH_REFS[@]} -gt 0 ]]; then
-  "${HOSTPY}" "${REPO_ROOT}/blender_agent/assets.py" fetch --resolution 1k \
-    --cache "${ASSETS_DIR}/polyhaven" --assets "${PH_REFS[@]}"
+  "${HOSTPY}" "${REPO_ROOT}/blender_agent/assets.py" --cache "${ASSETS_DIR}/polyhaven" \
+    fetch --resolution 1k --assets "${PH_REFS[@]}"
 else
   # First run: fetch the assets the shipped demo specs reference.
-  "${HOSTPY}" "${REPO_ROOT}/blender_agent/assets.py" fetch --resolution 1k \
-    --cache "${ASSETS_DIR}/polyhaven" \
+  "${HOSTPY}" "${REPO_ROOT}/blender_agent/assets.py" --cache "${ASSETS_DIR}/polyhaven" \
+    fetch --resolution 1k \
     --assets ph:oak_wood_planks ph:beige_wall_001 ph:poly_wool_herringbone \
              ph:sofa_02 ph:modern_coffee_table_01 ph:modern_arm_chair_01 \
              ph:GothicBed_01 ph:old_bed_frame ph:painted_wooden_nightstand \
