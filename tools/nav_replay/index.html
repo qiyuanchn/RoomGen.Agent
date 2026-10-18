@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="RoomGen.Agent PointNav episode replay: floor plans, reference path, trajectory and failure evidence.">
+  <title>RoomGen.Agent PointNav replay</title>
+  <link rel="stylesheet" href="replay.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <header class="brand">
+        <h1>PointNav replay</h1>
+        <p id="run-meta">loading…</p>
+      </header>
+
+      <section class="filters" aria-label="Episode filters">
+        <label class="field" for="scene-filter">
+          <span>Scene</span>
+          <select id="scene-filter"></select>
+        </label>
+        <label class="field" for="result-filter">
+          <span>Result</span>
+          <select id="result-filter">
+            <option value="all">All results</option>
+            <option value="success">Success only</option>
+            <option value="failure">Failure only</option>
+          </select>
+        </label>
+        <label class="field" for="category-filter">
+          <span>Failure type</span>
+          <select id="category-filter"></select>
+        </label>
+        <button id="reset-filters" class="text-button" type="button">Reset filters</button>
+      </section>
+
+      <div class="list-head">
+        <span id="episode-count">No episodes</span>
+      </div>
+      <ol id="episode-list" class="episode-list" aria-label="Episodes"></ol>
+
+      <section class="global-metrics" id="global-metrics" aria-label="Run metrics"></section>
+    </aside>
+
+    <main class="main">
+      <header class="episode-header">
+        <div class="episode-heading">
+          <h2 id="episode-title">Select an episode</h2>
+          <p id="episode-subtitle"></p>
+        </div>
+        <span id="result-badge" class="badge badge-empty">—</span>
+      </header>
+
+      <section class="stage">
+        <div class="stage-toolbar">
+          <label class="field field-inline" for="floor-select">
+            <span>Floor</span>
+            <select id="floor-select"></select>
+          </label>
+          <button id="zoom-reset" class="text-button" type="button" title="Reset zoom and pan">Fit view</button>
+          <div id="floor-legend" class="floor-legend"></div>
+        </div>
+
+        <div class="canvas-wrap" id="canvas-wrap">
+          <canvas id="map-canvas" aria-label="Top-down floor plan with reference path and trajectory"></canvas>
+          <div id="canvas-empty" class="canvas-empty" hidden>No episode selected</div>
+          <div id="map-tooltip" class="map-tooltip" hidden></div>
+          <div class="map-hint">wheel zoom · drag pan · double-click fit</div>
+        </div>
+
+        <div class="map-legend" aria-label="Map legend">
+          <span><i class="lg-dot" style="background:#5dd39e"></i>start</span>
+          <span><i class="lg-diamond" style="background:#ff7b72"></i>goal</span>
+          <span><i class="lg-line lg-reference"></i>reference</span>
+          <span><i class="lg-line lg-trajectory"></i>trajectory</span>
+          <span><i class="lg-cross"></i>collision</span>
+          <span><i class="lg-ring"></i>stuck / door</span>
+          <span><i class="lg-triangle"></i>through wall</span>
+          <span><i class="lg-square"></i>cross void</span>
+          <span><i class="lg-jump"></i>floor jump</span>
+        </div>
+
+        <div class="playback" aria-label="Trajectory playback">
+          <div class="playback-buttons">
+            <button id="play-button" class="primary-button" type="button">Play</button>
+            <button id="step-back" class="icon-button" type="button" title="Previous step (←)">◀</button>
+            <button id="step-forward" class="icon-button" type="button" title="Next step (→)">▶</button>
+            <button id="restart-button" class="text-button" type="button" title="First step (Home)">Restart</button>
+            <button id="end-button" class="text-button" type="button" title="Last step (End)">End</button>
+          </div>
+          <input id="step-slider" class="step-slider" type="range" min="0" max="0" value="0" step="1" aria-label="Trajectory step">
+          <div class="playback-readout">
+            <span id="step-label">step —</span>
+            <span id="action-label"></span>
+            <label class="field field-inline" for="speed-select">
+              <span>Speed</span>
+              <select id="speed-select">
+                <option value="0.5">0.5×</option>
+                <option value="1" selected>1×</option>
+                <option value="2">2×</option>
+                <option value="4">4×</option>
+              </select>
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <section class="details">
+        <div id="episode-metrics" class="metrics-grid" aria-label="Episode metrics"></div>
+
+        <div class="detail-columns">
+          <section class="panel">
+            <h3>Failure evidence</h3>
+            <div id="failure-box" class="failure-box">No episode selected.</div>
+          </section>
+          <section class="panel">
+            <h3>Events <span id="event-count" class="muted"></span></h3>
+            <ol id="event-list" class="event-list"></ol>
+          </section>
+        </div>
+
+        <section class="panel" id="warnings-panel">
+          <h3>Warnings</h3>
+          <ul id="warnings" class="warnings"></ul>
+        </section>
+      </section>
+
+      <footer class="footer">
+        <span id="footer-info"></span>
+        <span id="footer-hint">Space play/pause · ←/→ step · Home/End · double-click fit</span>
+      </footer>
+    </main>
+  </div>
+
+  <script src="replay-data.js"></script>
+  <script src="replay.js"></script>
+</body>
+</html>
