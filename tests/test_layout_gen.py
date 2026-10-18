@@ -1663,6 +1663,88 @@ class DuplexLayoutTest(unittest.TestCase):
                 self.assertEqual(dark, [], f"seed {seed}: unlit rooms {dark}")
 
 
+class CrossLevelLayoutTest(unittest.TestCase):
+    """Generated void / mezzanine / split-level scenes pass the shared checks."""
+
+    def _scene(self, shape, seed=0, floors=None):
+        floors = 2 if floors is None and shape in ("void", "mezzanine") else (
+            1 if floors is None else floors)
+        scene = layout_gen.generate(seed, None, ASSETS_INDEX, verbose=False,
+                                    shape=shape, floors=floors)
+        spec = spec_mod.parse_spec(copy.deepcopy(scene.spec))
+        report = checks_mod.check_spec(spec, ASSETS_INDEX)
+        return scene, spec, report
+
+    def test_void_scene_generates_and_passes(self):
+        scene, spec, report = self._scene("void", 0)
+        self.assertTrue(report["pass"], report["violations"][:4])
+        self.assertTrue(scene.report["cross_level_checks"]["pass"])
+        self.assertEqual(len(spec.voids), 1)
+        self.assertTrue(spec.voids[0].railing)
+        gallery = next(room for room in spec.rooms if room.id == "gallery")
+        self.assertIn(gallery.id, [room.id for room in spec.floor_rooms("F2")])
+        point = (4.0, 2.5)
+        self.assertIn("floor", [surface.kind for surface in spec.support_surfaces(point, "F1")])
+        self.assertNotIn("floor", [surface.kind for surface in spec.support_surfaces(point, "F2")])
+        self.assertTrue(spec.railing_spans())
+        self.assertEqual(len({span.floor for span in spec.railing_spans()}), 1)
+        # the lower living room is fully covered by the gallery: no duplicate ceiling
+        self.assertEqual(spec.ceiling_regions("living"), [])
+
+    def test_mezzanine_scene_leaves_the_uncovered_rooms_a_ceiling(self):
+        scene, spec, report = self._scene("mezzanine", 0)
+        self.assertTrue(report["pass"], report["violations"][:4])
+        self.assertTrue(scene.report["cross_level_checks"]["pass"])
+        lower = spec.floor_rooms("F1")
+        upper = spec.floor_rooms("F2")
+        lower_area = sum(abs(spec_mod.polygon_area(room.polygon)) for room in lower)
+        upper_area = sum(abs(spec_mod.polygon_area(room.polygon)) for room in upper)
+        self.assertLess(upper_area, lower_area - 5.0)
+        uncovered = [room.id for room in lower if spec.ceiling_regions(room.id)]
+        self.assertTrue(uncovered, "the uncovered lower rooms must keep a ceiling")
+        # the covered lower rooms are exactly those under an upper room
+        for room_id in ("living", "kitchen"):
+            self.assertEqual(spec.ceiling_regions(room_id), [])
+
+    def test_split_level_scene_generates_a_ramp_and_passes(self):
+        scene, spec, report = self._scene("split_level", 0)
+        self.assertTrue(report["pass"], report["violations"][:4])
+        self.assertTrue(scene.report["split_level_checks"]["pass"])
+        self.assertAlmostEqual(spec.room_elevation("dining"), 0.45, places=6)
+        self.assertAlmostEqual(spec.room_elevation("living"), 0.0, places=6)
+        plans = spec.ramp_plans()
+        self.assertEqual(len(plans), 1)
+        plan = plans[0]
+        self.assertAlmostEqual(plan.rise_total, 0.45, places=6)
+        self.assertLessEqual(plan.slope, spec_mod.RAMP_SLOPE_MAX + 1e-9)
+        supports = spec.support_surfaces(plan.head_point, "F1")
+        self.assertTrue(any(surface.kind == "floor"
+                            and abs(surface.z - 0.45) < 1e-6 for surface in supports))
+        track = checks_mod.walk_track_report(spec)
+        self.assertTrue(track["pass"], track["violations"])
+        self.assertEqual(len(track["tracks"]), 1)
+
+    def test_cross_level_shapes_are_deterministic(self):
+        for shape in ("void", "mezzanine"):
+            with self.subTest(shape=shape):
+                first = layout_gen.generate(0, None, ASSETS_INDEX, verbose=False,
+                                            shape=shape, floors=2).spec
+                second = layout_gen.generate(0, None, ASSETS_INDEX, verbose=False,
+                                             shape=shape, floors=2).spec
+                self.assertEqual(first, second)
+
+    def test_cross_level_shapes_reject_the_wrong_floor_count(self):
+        with self.assertRaisesRegex(ValueError, "floors 2"):
+            layout_gen.generate(0, None, ASSETS_INDEX, verbose=False,
+                                shape="void", floors=1)
+        with self.assertRaisesRegex(ValueError, "floors 1"):
+            layout_gen.generate(0, None, ASSETS_INDEX, verbose=False,
+                                shape="split_level", floors=2)
+        with self.assertRaisesRegex(ValueError, "omit --rooms"):
+            layout_gen.generate(0, 4, ASSETS_INDEX, verbose=False,
+                                shape="mezzanine", floors=2)
+
+
 class LightingDefaultsTest(unittest.TestCase):
     """The lamp wattage the dark-room fix pins (see blender_agent/README.md)."""
 

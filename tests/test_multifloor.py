@@ -79,6 +79,7 @@ STAIR_CAMERA_SPEC = os.path.join(TESTS_DIR, "fixtures", "stair_well_camera.json"
 PARTIAL_CEILING_SPEC = os.path.join(TESTS_DIR, "fixtures", "partial_upper_floor.json")
 CEILING_BREAKER_SPEC = os.path.join(TESTS_DIR, "fixtures", "ceiling_breaker.json")
 CEILING_BREAKER_ASSETS = os.path.join(TESTS_DIR, "fixtures", "ceiling_breaker_assets.json")
+DOUBLE_HEIGHT_SPEC = os.path.join(TESTS_DIR, "fixtures", "double_height_living.json")
 
 
 def _demo_dict() -> dict:
@@ -779,6 +780,157 @@ class CeilingCoverageTest(unittest.TestCase):
         self.assertAlmostEqual(_vertical_hit(caster, 3.0, 3.0, 1.5), 1.20, places=2)
         # the covered [1, 1] hits the upper slab, also at 2.70
         self.assertAlmostEqual(_vertical_hit(caster, 1.0, 1.0, 1.5), 1.20, places=2)
+
+
+class DoubleHeightTest(unittest.TestCase):
+    """A declared void opens a lower room through the storey above, with a rail.
+
+    ``double_height_living.json``: the 8 x 6 m f0 living room is open through
+    the f1 slab inside a 3 x 3 m void, the f1 gallery rings it, the straight
+    stair lands on the gallery.  The fixture has a different upper partition
+    (gallery + bedroom) than the lower floor (living + entry + kitchen).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.data = _load_dict(DOUBLE_HEIGHT_SPEC)
+        cls.spec = spec_mod.parse_spec(copy.deepcopy(cls.data))
+        cls.report = checks_mod.check_spec(cls.spec)
+
+    def _entry(self, name: str) -> dict:
+        return next(entry for entry in self.report["checks"] if entry["name"] == name)
+
+    def _failing(self, report=None):
+        report = report or self.report
+        return [entry["name"] for entry in report["checks"] if not entry["pass"]]
+
+    def test_the_fixture_parses_with_a_void_and_a_different_upper_plan(self):
+        self.assertEqual([void.name for void in self.spec.voids], ["living_void"])
+        self.assertEqual(self.spec.voids[0].floor, "f0")
+        self.assertTrue(self.spec.voids[0].railing)
+        self.assertEqual(len(self.spec.floor_rooms("f0")), 3)
+        self.assertEqual(len(self.spec.floor_rooms("f1")), 2)
+        self.assertEqual(self.spec.room_elevation("gallery"), 2.85)
+        self.assertEqual(self.spec.support_surfaces((4.5, 2.5), "f0")[0].z, 0.0)
+
+    def test_the_void_cuts_the_upper_slab_and_leaves_no_floor(self):
+        point = (4.5, 2.5)
+        self.assertTrue(self.spec.in_slab_opening("f1", point))
+        self.assertEqual(self.spec.support_surfaces(point, "f1"), [])
+        kinds = [surface.kind for surface in self.spec.support_surfaces(point, "f0")]
+        self.assertIn("floor", kinds)
+
+    def test_the_lower_room_loses_its_ceiling_only_over_the_void(self):
+        self.assertEqual(self.spec.ceiling_regions("living"), [])
+        self.assertFalse(self.spec.ceiling_above("living", (4.5, 2.5)))
+        # the gallery keeps its own roof; the void opens *to* it
+        self.assertTrue(self.spec.ceiling_regions("gallery"))
+        self.assertTrue(self.spec.ceiling_above("gallery", (4.5, 2.5)))
+
+    def test_the_void_edges_border_a_railing_on_the_gallery_floor(self):
+        spans = self.spec.railing_spans()
+        self.assertEqual(len(spans), 4, spans)
+        self.assertTrue(all(span.floor == "f1" for span in spans))
+        self.assertTrue(all(abs(span.z - 2.85) < 1e-9 for span in spans))
+        self.assertGreaterEqual(sum(span.length for span in spans), 10.5)
+        boxes = self.spec.railing_boxes()
+        self.assertGreater(len(boxes), 12)
+        self.assertTrue(all(box["z0"] >= 2.85 - 1e-9 for box in boxes))
+
+    def test_every_check_passes(self):
+        self.assertTrue(self.report["pass"], self.report["violations"])
+        for name in ("voids_open", "railing_clear", "cameras_stand", "circulation_reachable",
+                     "stairs_walk_track", "furniture_containment"):
+            self.assertIn(name, {entry["name"] for entry in self.report["checks"]})
+        opening = self._entry("voids_open")["voids"][0]
+        self.assertEqual(opening["upper_floor_probes"], 0)
+        self.assertGreater(opening["lower_floor_probes"], 0)
+
+    def test_a_stand_over_the_void_is_rejected(self):
+        data = copy.deepcopy(self.data)
+        data["cameras"] = [{"name": "0000", "room": "gallery", "pos": [4.5, 2.5, 4.35]}]
+        report = checks_mod.check_spec(spec_mod.parse_spec(data))
+        self.assertIn("cameras_stand", self._failing(report))
+        self.assertIn("voids_open", self._failing(report))
+        stand = next(entry for entry in report["checks"] if entry["name"] == "cameras_stand")
+        self.assertIn("no surface under it", " ".join(stand["violations"]))
+
+    def test_furniture_through_the_railing_is_rejected(self):
+        data = copy.deepcopy(self.data)
+        data["furniture"].append({"asset": "builtin:storage_shelf", "room": "gallery",
+                                  "pos": [4.5, 4.2], "rot_z_deg": 0, "name": "rail_shelf"})
+        report = checks_mod.check_spec(spec_mod.parse_spec(data))
+        self.assertIn("railing_clear", self._failing(report))
+        message = " ".join(next(entry for entry in report["checks"]
+                                if entry["name"] == "railing_clear")["violations"])
+        self.assertIn("rail_shelf", message)
+
+    def test_a_void_cannot_be_declared_without_a_storey_above(self):
+        data = copy.deepcopy(self.data)
+        data["voids"][0]["floor"] = "f1"
+        data["voids"][0]["outline"] = [[8.5, 0.5], [9.5, 0.5], [9.5, 1.5], [8.5, 1.5]]
+        with self.assertRaisesRegex(spec_mod.SpecError, "no storey above"):
+            spec_mod.parse_spec(data)
+
+
+class SplitLevelSchemaTest(unittest.TestCase):
+    """``rooms[].level`` raises one room of a storey; a ramp joins the levels."""
+
+    def _data(self):
+        return {
+            "schema_version": 2, "unit": "meter",
+            "wall_height": 2.7, "wall_thickness": 0.12,
+            "floors": [{"id": "F1", "elevation": 0.0, "height": 2.7,
+                        "slab_thickness": 0.2}],
+            "rooms": [
+                {"id": "living", "type": "living_room", "floor_id": "F1", "level": 0.0,
+                 "polygon": [[0, 0], [5.0, 0], [5.0, 4.8], [0, 4.8]]},
+                {"id": "dining", "type": "dining", "floor_id": "F1", "level": 0.45,
+                 "polygon": [[5.0, 0], [8.0, 0], [8.0, 4.8], [5.0, 4.8]]},
+            ],
+            "connectors": [
+                {"kind": "ramp", "from_room": "living", "to_room": "dining",
+                 "from_floor": "F1", "to_floor": "F1", "width": 1.0, "run": 1.8,
+                 "rise": 0.45, "center": [4.1, 1.2], "direction_deg": 0.0}
+            ],
+            "cameras": [
+                {"name": "0000", "room": "living", "pos": [1.0, 1.0, 1.5]},
+                {"name": "0001", "room": "dining", "pos": [6.5, 1.5, 1.95]},
+            ],
+        }
+
+    def test_the_raised_room_has_its_own_elevation_and_support(self):
+        spec = spec_mod.parse_spec(self._data())
+        self.assertAlmostEqual(spec.room_elevation("living"), 0.0, places=9)
+        self.assertAlmostEqual(spec.room_elevation("dining"), 0.45, places=9)
+        self.assertAlmostEqual(spec.room_top("dining"), 3.15, places=9)
+        plan = spec.ramp_plans()[0]
+        self.assertAlmostEqual(plan.rise_total, 0.45, places=9)
+        self.assertAlmostEqual(plan.slope, 0.25, places=9)
+        supports = spec.support_surfaces(plan.head_point, "F1")
+        self.assertTrue(any(surface.kind == "floor" and abs(surface.z - 0.45) < 1e-9
+                            for surface in supports))
+        report = checks_mod.check_spec(spec)
+        self.assertTrue(report["pass"], report["violations"][:3])
+
+    def test_a_door_may_not_join_two_levels(self):
+        data = self._data()
+        data["openings"] = [{"kind": "door", "between": ["living", "dining"],
+                             "center": [5.0, 1.2], "width": 0.9, "height": 2.05}]
+        with self.assertRaisesRegex(spec_mod.SpecError, "split levels"):
+            spec_mod.parse_spec(data)
+
+    def test_a_level_above_the_limit_is_rejected(self):
+        data = self._data()
+        data["rooms"][1]["level"] = 0.9
+        with self.assertRaisesRegex(spec_mod.SpecError, "level"):
+            spec_mod.parse_spec(data)
+
+    def test_the_ramp_rise_must_match_the_room_levels(self):
+        data = self._data()
+        data["connectors"][0]["rise"] = 0.30
+        with self.assertRaisesRegex(spec_mod.SpecError, "rise"):
+            spec_mod.parse_spec(data)
 
 
 class SettleFloorTest(unittest.TestCase):

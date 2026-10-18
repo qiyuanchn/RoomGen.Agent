@@ -23,6 +23,13 @@ The shell is built from :mod:`blender_agent.spec` with plain mesh data (no
 * ``slab_openings`` punch their outline through the floor slab of every listed
   storey (stairwell / void) and ``kind: "stair"`` / ``"ramp"`` connectors are
   built as real steps / wedges (see ``spec.stair_plan`` / ``spec.ramp_plan``)
+* a declared **void** cuts the outline out of every storey above its lower
+  floor and the lower room loses that ceiling area; the guard rails of
+  ``spec.railing_boxes`` are built as top rail, mid rail and posts
+* a split-level room (``rooms[].level``) gets a solid plinth up to its raised
+  walking surface, its ceiling rises with it, wall spans run from the lowest to
+  the highest room they bound, and a same-storey ramp gets a passage cut in the
+  wall at its head
 """
 
 from __future__ import annotations
@@ -45,6 +52,7 @@ CEILING_SLAB = spec_mod.DEFAULT_SLAB_M
 WALL_END_OVERLAP_M = 0.002
 
 STAIR_COLOR = (0.62, 0.47, 0.33)
+RAILING_COLOR = (0.35, 0.33, 0.30)
 
 
 def ensure_collection(name: str) -> bpy.types.Collection:
@@ -157,6 +165,7 @@ def build_cutters(spec: spec_mod.SceneSpec, collection: bpy.types.Collection) ->
         )
         direction = segment.direction if segment is not None else (1.0, 0.0)
         height = float(connector.height or spec_mod.DEFAULT_DOOR_HEIGHT_M)
+        elevation = spec.room_elevation(connector.from_room)
         cutters.append(
             add_oriented_box(
                 name=f"cutter_{connector.kind}_{index}",
@@ -164,14 +173,15 @@ def build_cutters(spec: spec_mod.SceneSpec, collection: bpy.types.Collection) ->
                 direction=direction,
                 length=connector.width,
                 depth=depth,
-                z_bottom=floor.elevation - 0.2,
-                z_top=floor.elevation + height,
+                z_bottom=elevation - 0.2,
+                z_top=elevation + height,
                 collection=collection,
             )
         )
 
     for index, window in enumerate(spec.windows):
         floor = spec.room_floor(window.room)
+        elevation = spec.room_elevation(window.room)
         x0, y0 = window.wall[0]
         x1, y1 = window.wall[1]
         length = math.hypot(x1 - x0, y1 - y0)
@@ -183,8 +193,42 @@ def build_cutters(spec: spec_mod.SceneSpec, collection: bpy.types.Collection) ->
                 direction=(x1 - x0, y1 - y0),
                 length=length,
                 depth=depth,
-                z_bottom=floor.elevation + window.sill,
-                z_top=floor.elevation + window.sill + window.height,
+                z_bottom=elevation + window.sill,
+                z_top=elevation + window.sill + window.height,
+                collection=collection,
+            )
+        )
+
+    # a split-level ramp stays in the lower room; the shared wall needs a
+    # passage from the lower floor up to the raised walking surface
+    for index, plan in enumerate(spec.ramp_plans()):
+        connector = plan.connector
+        if connector.from_floor != connector.to_floor:
+            continue
+        if abs(plan.to_elevation - plan.from_elevation) < 1e-6:
+            continue
+        wall_point = (plan.center[0] + plan.direction[0] * plan.run / 2.0,
+                      plan.center[1] + plan.direction[1] * plan.run / 2.0)
+        segment = spec_mod.wall_segment_for_point(
+            segments, wall_point, connector.from_room, floor_id=connector.from_floor)
+        if segment is None:
+            segment = spec_mod.wall_segment_for_point(
+                segments, wall_point, connector.to_room, floor_id=connector.to_floor)
+        if segment is None:
+            continue
+        from_room = spec.room(connector.from_room)
+        to_room = spec.room(connector.to_room)
+        z_bottom = min(spec.room_elevation(from_room.id), spec.room_elevation(to_room.id)) - 0.2
+        z_top = min(spec.room_top(from_room.id), spec.room_top(to_room.id))
+        cutters.append(
+            add_oriented_box(
+                name=f"cutter_split_level_{index}",
+                center_xy=wall_point,
+                direction=segment.direction,
+                length=plan.width + 0.10,
+                depth=depth,
+                z_bottom=z_bottom,
+                z_top=z_top,
                 collection=collection,
             )
         )
@@ -240,6 +284,19 @@ def _stair_material() -> bpy.types.Material:
     return material
 
 
+def _railing_material() -> bpy.types.Material:
+    material = bpy.data.materials.get("mat_railing")
+    if material is None:
+        material = bpy.data.materials.new("mat_railing")
+        material.use_nodes = True
+        bsdf = material.node_tree.nodes["Principled BSDF"]
+        bsdf.inputs["Base Color"].default_value = (RAILING_COLOR[0], RAILING_COLOR[1],
+                                                   RAILING_COLOR[2], 1.0)
+        bsdf.inputs["Roughness"].default_value = 0.45
+        bsdf.inputs["Metallic"].default_value = 0.25
+    return material
+
+
 def add_wedge(name: str, bottom: Sequence[Sequence[float]], top: Sequence[Sequence[float]],
               collection: bpy.types.Collection) -> bpy.types.Object:
     """Solid between two matching quads (bottom and a sloped top face)."""
@@ -283,6 +340,18 @@ def build_stairs(spec: spec_mod.SceneSpec, collection: bpy.types.Collection) -> 
     return {"stairs": stairs, "ramps": ramps}
 
 
+def build_railings(spec: spec_mod.SceneSpec, collection: bpy.types.Collection) -> List[bpy.types.Object]:
+    """Guard rails of the declared voids: top rail, mid rail and posts."""
+    railings: List[bpy.types.Object] = []
+    material = None
+    for entry in spec.railing_boxes():
+        obj = add_prism(entry["name"], entry["polygon"], entry["z0"], entry["z1"], collection)
+        material = material or _railing_material()
+        obj.data.materials.append(material)
+        railings.append(obj)
+    return railings
+
+
 def build_shell(spec: spec_mod.SceneSpec, collection_name: str = SHELL_COLLECTION) -> dict:
     """Build floors, ceilings, walls, stairs and slab openings per storey."""
     collection = ensure_collection(collection_name)
@@ -301,16 +370,19 @@ def build_shell(spec: spec_mod.SceneSpec, collection_name: str = SHELL_COLLECTIO
         height = floor.height
         floor_objects: List[bpy.types.Object] = []
         for room in rooms:
+            elevation = spec.room_elevation(room.id)
+            # a split-level room's slab reaches down to the storey slab bottom:
+            # the raised floor is a solid plinth, not a floating plate
             floor_objects.append(
                 add_prism(f"floor_{room.id}", room.polygon,
-                          floor.elevation - floor.slab_thickness, floor.elevation, collection)
+                          floor.elevation - floor.slab_thickness, elevation, collection)
             )
         floors.extend(floor_objects)
         slabs_by_floor[floor.id] = floor_objects
 
         ceiling_objects: List[bpy.types.Object] = []
         for room in rooms:
-            top = floor.elevation + spec.room_height(room.id)
+            top = spec.room_top(room.id)
             parts = spec.ceiling_regions(room.id)
             replaced = spec.ceiling_replaced_by(room.id)
             if not parts:
@@ -335,6 +407,11 @@ def build_shell(spec: spec_mod.SceneSpec, collection_name: str = SHELL_COLLECTIO
         wall_objects = []
         for index, segment in enumerate(segments):
             label = "_".join(segment.owners) or "wall"
+            owner_rooms = [spec.room(owner) for owner in segment.owners]
+            z_bottom = min((spec.room_elevation(room.id) for room in owner_rooms),
+                           default=floor.elevation)
+            z_top = max((spec.room_top(room.id) for room in owner_rooms),
+                        default=floor.elevation + height)
             wall_objects.append(
                 add_oriented_box(
                     name=f"wall_{index:02d}_{label}_{segment.p0[0]:.2f}_{segment.p0[1]:.2f}".replace("-", "m"),
@@ -346,8 +423,8 @@ def build_shell(spec: spec_mod.SceneSpec, collection_name: str = SHELL_COLLECTIO
                     # z-fighting renders as a black stripe at concave corners.
                     length=segment.length + thickness + 2.0 * WALL_END_OVERLAP_M,
                     depth=thickness,
-                    z_bottom=floor.elevation,
-                    z_top=floor.elevation + height,
+                    z_bottom=z_bottom,
+                    z_top=z_top,
                     collection=collection,
                 )
             )
@@ -355,6 +432,7 @@ def build_shell(spec: spec_mod.SceneSpec, collection_name: str = SHELL_COLLECTIO
         storey_report.append({
             "id": floor.id, "elevation": floor.elevation, "height": height,
             "slab_thickness": floor.slab_thickness, "rooms": [room.id for room in rooms],
+            "room_levels": {room.id: round(spec.room_elevation(room.id), 4) for room in rooms},
             "walls": len(wall_objects), "floor_slabs": [obj.name for obj in floor_objects],
             "ceilings": [obj.name for obj in ceiling_objects],
         })
@@ -379,8 +457,34 @@ def build_shell(spec: spec_mod.SceneSpec, collection_name: str = SHELL_COLLECTIO
                     "applied": sum(applied.values()),
                 })
 
+    # -- declared voids: cut every storey above the void's own floor --------- #
+    void_report: List[dict] = []
+    if spec.voids:
+        cutter_collection = ensure_collection(CUTTER_COLLECTION)
+        for index, void in enumerate(spec.voids):
+            lower = spec.floor(void.floor)
+            for floor in spec.floors:
+                if floor.elevation <= lower.elevation + 1e-9:
+                    continue
+                slabs = slabs_by_floor.get(floor.id, [])
+                if not slabs:
+                    continue
+                prism = add_prism(
+                    f"cutter_void_{index}_{floor.id}", void.outline,
+                    floor.elevation - floor.slab_thickness - 0.05, floor.elevation + 0.05,
+                    cutter_collection,
+                )
+                applied = cut_walls(slabs, [prism])
+                delete_objects([prism])
+                void_report.append({
+                    "index": index, "name": void.name or f"void_{index}",
+                    "floor": floor.id, "slabs": [obj.name for obj in slabs],
+                    "applied": sum(applied.values()),
+                })
+
     # -- stairs / ramps ------------------------------------------------------ #
     stair_info = build_stairs(spec, collection)
+    railing_objects = build_railings(spec, collection)
 
     cutter_collection = ensure_collection(CUTTER_COLLECTION)
     cutters = build_cutters(spec, cutter_collection)
@@ -396,9 +500,12 @@ def build_shell(spec: spec_mod.SceneSpec, collection_name: str = SHELL_COLLECTIO
         "walls": walls,
         "stairs": stair_info["stairs"],
         "ramps": stair_info["ramps"],
-        "shell_objects": floors + ceilings + walls + stair_info["stairs"] + stair_info["ramps"],
+        "railings": railing_objects,
+        "shell_objects": floors + ceilings + walls + stair_info["stairs"] + stair_info["ramps"]
+        + railing_objects,
         "cutters_applied": applied,
         "storeys": storey_report,
         "ceiling_from_upper": covered_by_upper,
         "slab_openings": slab_report,
+        "voids": void_report,
     }

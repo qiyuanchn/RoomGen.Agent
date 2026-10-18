@@ -24,7 +24,11 @@ that the existing pipeline can build, render and validate:
    a bathroom and never a 3 m2 bedroom.  ``--floors 2`` builds a **duplex**
    instead: two floors on one footprint, each a row of 2-4 rooms, joined by a
    switchback stair through a slab opening (see the step 7 section below and
-   ``check_duplex_spec``).
+   ``check_duplex_spec``).  ``--shape void`` / ``mezzanine`` build the two
+   cross-level templates of step 7a instead: a double-height living room with an
+   f1 gallery and a guard rail, or a partial upper storey over the west part of
+   the plan.  ``--shape split_level`` (one storey) raises the dining/kitchen
+   wing by 0.45 m and reaches it by a short ramp.
 2. *doors*: a semantic spanning tree over the shared walls -- a corridor serves
    the rooms, the kitchen opens onto the dining room, a bathroom is never
    crossed and a bedroom is never the public way through the flat
@@ -629,6 +633,8 @@ class RoomPlan:
     #: semantic zones of an open-plan physical room
     zones: List[ZonePlan] = field(default_factory=list)
     open_plan: bool = False
+    #: split-level offset of a generated room (spec ``rooms[].level``)
+    level: float = 0.0
     _polygon_cache: Optional[List[List[float]]] = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -4720,7 +4726,178 @@ def _spec_dict_duplex(seed: int, floors: Sequence[dict], plans_floor: Sequence[S
 
 
 # --------------------------------------------------------------------------- #
-# step 7b: the generator-side duplex validator
+# step 7a: cross-level templates -- double-height void, mezzanine, split level
+# --------------------------------------------------------------------------- #
+# The three shapes below are fixed templates with seeded door/furniture choices,
+# not a second topology generator.  They exist to exercise the cross-level
+# contract end to end:
+#
+# * ``void``      -- a double-height living room: the f0 living room is open
+#                    through the f1 slab, the f1 gallery surrounds the void and
+#                    carries the guard rail; the stair lands on the gallery.
+# * ``mezzanine`` -- the upper storey covers only the west part of the lower
+#                    floor; the uncovered entry/bath keep their own ceilings.
+# * ``split_level`` -- one storey with a raised dining/kitchen wing (+0.45 m),
+#                    reached by a short ramp that stays in the lower living
+#                    room, so the raised floor is a plinth and the head steps
+#                    onto it.
+CROSS_LEVEL_SHAPES = ("void", "mezzanine", "split_level")
+SPLIT_LEVEL_RISE_M = 0.45
+SPLIT_LEVEL_RAMP_RUN_M = 1.8
+SPLIT_LEVEL_RAMP_WIDTH_M = 1.0
+
+
+def _rect_plan(room_id: str, room_type: str, rect: Rect, level: float = 0.0) -> RoomPlan:
+    return RoomPlan(room_id=room_id, room_type=room_type, rect=rect, target_area=rect.area,
+                    width=rect.w, depth=rect.h, level=level)
+
+
+def _doors_between(rng: random.Random, plans: Sequence[RoomPlan],
+                   pairs: Sequence[Tuple[str, str]]) -> List[DoorPlan]:
+    """One door on each explicitly named shared wall pair."""
+    by_id = {plan.room_id: plan for plan in plans}
+    doors: List[DoorPlan] = []
+    for a, b in pairs:
+        first, second = by_id[a], by_id[b]
+        shared = shared_wall_span(first.rect, second.rect)
+        if shared is None:
+            raise _AttemptFailed(f"rooms '{a}' and '{b}' do not share a wall")
+        wall, (lo, hi) = shared
+        if hi - lo < DOOR_W + 2 * DOOR_JAMB_M:
+            raise _AttemptFailed(f"shared wall between '{a}' and '{b}' is too short")
+        margin = DOOR_W / 2.0 + DOOR_JAMB_M
+        along = _round(rng.uniform(lo + margin, hi - margin), 0.01)
+        center = (along, wall.line) if wall.side in ("N", "S") else (wall.line, along)
+        direction = (1.0, 0.0) if wall.side in ("N", "S") else (0.0, 1.0)
+        doors.append(DoorPlan(a=a, b=b, center=center,
+                              span=(along - DOOR_W / 2.0, along + DOOR_W / 2.0),
+                              wall=wall, direction=direction))
+    return doors
+
+
+def _avoid_box(rect: Rect, margin: float = 0.35) -> Tuple[str, float, float]:
+    """``avoid`` band helper for a south-wall stair / void (x span)."""
+    return ("S", rect.x0 - margin, rect.x1 + margin)
+
+
+def _spec_dict_cross_level(seed: int, shape: str, floors: Sequence[dict],
+                           plans_floor: Sequence[Sequence[RoomPlan]],
+                           doors_floor: Sequence[Sequence[DoorPlan]],
+                           windows_floor: Sequence[Dict[str, List[dict]]],
+                           cameras: Sequence[dict], items_floor: Sequence[Sequence[Item]],
+                           connectors: Sequence[dict], slab_openings: Sequence[dict],
+                           voids: Sequence[dict], comments: Sequence[str]) -> dict:
+    """Scene spec for a cross-level template (schema 2, room levels + voids)."""
+    room_elevation: Dict[str, float] = {}
+    rooms = []
+    for floor, plans in zip(floors, plans_floor):
+        for plan in plans:
+            room_elevation[plan.room_id] = float(floor["elevation"]) + float(plan.level)
+            entry = {"id": plan.room_id, "type": plan.room_type, "floor_id": floor["id"],
+                     "polygon": plan.polygon,
+                     "floor_color": ROOM_FLOOR_COLOR.get(plan.room_type, ROOM_FLOOR_COLOR_DEFAULT)}
+            if plan.level:
+                entry["level"] = plan.level
+            rooms.append(entry)
+    openings = []
+    for doors in doors_floor:
+        for door in doors:
+            openings.append({"kind": door.kind, "between": [door.a, door.b],
+                             "center": [round(door.center[0], 4), round(door.center[1], 4)],
+                             "width": door.width, "height": door.height})
+    windows_out = []
+    for plans, windows in zip(plans_floor, windows_floor):
+        for plan in plans:
+            for entry in windows.get(plan.room_id, []):
+                windows_out.append({"room": entry["room"], "wall": entry["wall"],
+                                    "sill": entry["sill"], "height": entry["height"]})
+    furniture = []
+    for items in items_floor:
+        for item in items:
+            entry = item.to_json()
+            if entry.get("z") is not None:
+                entry["z"] = round(room_elevation[item.room] + float(entry["z"]), 4)
+            furniture.append(entry)
+    return {
+        "_comment": [
+            f"generated by blender_agent/layout_gen.py --seed {seed} --shape {shape}",
+            *comments,
+        ],
+        "schema_version": 2,
+        "unit": "meter",
+        "wall_height": WALL_HEIGHT,
+        "wall_thickness": WALL_THICKNESS,
+        "floors": list(floors),
+        "rooms": rooms,
+        "openings": openings,
+        "windows": windows_out,
+        "connectors": list(connectors),
+        "slab_openings": list(slab_openings),
+        "voids": list(voids),
+        "cameras": list(cameras),
+        "style": dict(STYLE_DEFAULTS),
+        "materials": json.loads(json.dumps(MATERIAL_DEFAULTS)),
+        "details": dict(DETAIL_DEFAULTS),
+        "lighting": dict(LIGHTING_DEFAULTS),
+        "furniture": furniture,
+    }
+
+
+def _cross_level_report(shape: str, floors: Sequence[dict], plans_floor: Sequence[Sequence[RoomPlan]],
+                        doors_floor: Sequence[Sequence[DoorPlan]],
+                        windows_floor: Sequence[Dict[str, List[dict]]],
+                        cameras: Sequence[dict], items_floor: Sequence[Sequence[Item]],
+                        connectors: Sequence[dict], voids: Sequence[dict],
+                        slab_openings: Sequence[dict],
+                        extra: Optional[dict] = None) -> dict:
+    report = {
+        "shape": shape,
+        "family": shape,
+        "floors": [
+            {"id": floor["id"], "elevation": floor["elevation"], "height": floor["height"],
+             "slab_thickness": floor["slab_thickness"],
+             "programme": [plan.room_type for plan in plans],
+             "rooms": [plan.room_id for plan in plans],
+             "levels": {plan.room_id: plan.level for plan in plans}}
+            for floor, plans in zip(floors, plans_floor)
+        ],
+        "rooms": [{"id": plan.room_id, "type": plan.room_type, "floor_id": floor["id"],
+                   "level": plan.level,
+                   "rect": [plan.rect.x0, plan.rect.y0, plan.rect.x1, plan.rect.y1],
+                   "area_m2": round(plan.area, 2), "polygon": plan.polygon}
+                  for floor, plans in zip(floors, plans_floor) for plan in plans],
+        "room_graph": {
+            "nodes": [plan.room_id for plans in plans_floor for plan in plans],
+            "edges": ([[door.a, door.b, "door"] for doors in doors_floor for door in doors]
+                      + [[item["from_room"], item["to_room"], item["kind"]] for item in connectors]),
+        },
+        "doors": [{"between": [door.a, door.b],
+                   "center": [round(door.center[0], 3), round(door.center[1], 3)],
+                   "width": door.width, "height": door.height,
+                   "wall_side": door.wall.side, "floor_id": floor["id"]}
+                  for floor, doors in zip(floors, doors_floor) for door in doors],
+        "windows": [{"room": entry["room"], "wall": entry["wall"], "sill": entry["sill"],
+                     "height": entry["height"], "floor_id": floor["id"]}
+                    for position, (floor, windows) in enumerate(zip(floors, windows_floor))
+                    for plan in plans_floor[position]
+                    for entry in windows.get(plan.room_id, [])],
+        "cameras": list(cameras),
+        "furniture": [{"name": item.name, "asset": item.asset, "room": item.room,
+                       "pos": [round(item.pos[0], 3), round(item.pos[1], 3)],
+                       "rot_z_deg": item.rot_z_deg, "z": item.z, "mount": item.mount,
+                       "size_m": [round(v, 3) for v in item.dims], "placement": item.placement,
+                       "slot": item.slot, "floor_id": floor["id"]}
+                      for floor, items in zip(floors, items_floor) for item in items],
+        "voids": list(voids), "slab_openings": list(slab_openings),
+        "connectors": list(connectors),
+    }
+    if extra:
+        report.update(extra)
+    return report
+
+
+# --------------------------------------------------------------------------- #
+# step 7b: the generator-side duplex / cross-level validator
 # --------------------------------------------------------------------------- #
 @dataclass
 class _RoomPolygon:
@@ -4755,7 +4932,8 @@ def _opening_zone(opening: dict, segments, wall_thickness: float):
             cx + abs(ux) * half_w + abs(uy) * half_d, cy + abs(uy) * half_w + abs(ux) * half_d)
 
 
-def check_duplex_spec(spec_dict: dict, assets_index: Optional[Dict[str, dict]] = None) -> dict:
+def check_duplex_spec(spec_dict: dict, assets_index: Optional[Dict[str, dict]] = None,
+                      rooms_range: Tuple[int, int] = (2, 4)) -> dict:
     """2.5D validation of a generated two-floor spec, straight from its JSON.
 
     The generator-side acceptance for ``--floors 2``: floor stacking, 2-4 rooms
@@ -4812,8 +4990,9 @@ def check_duplex_spec(spec_dict: dict, assets_index: Optional[Dict[str, dict]] =
             continue
         per_floor_rooms[floor_id].append(room)
     for floor_id, floor_rooms in per_floor_rooms.items():
-        if not 2 <= len(floor_rooms) <= 4:
-            room_problems.append(f"floor {floor_id} has {len(floor_rooms)} rooms (2..4 expected)")
+        if not rooms_range[0] <= len(floor_rooms) <= rooms_range[1]:
+            room_problems.append(f"floor {floor_id} has {len(floor_rooms)} rooms "
+                                 f"({rooms_range[0]}..{rooms_range[1]} expected)")
         rectangles = []
         for room in floor_rooms:
             polygon = [list(map(float, point)) for point in room["polygon"]]
@@ -5113,6 +5292,368 @@ def check_duplex_spec(spec_dict: dict, assets_index: Optional[Dict[str, dict]] =
             "checks": checks, "violations": violations}
 
 
+def _build_void_attempt(rng: random.Random, room_count: Optional[int], index: Dict[str, dict],
+                        attempt: int, seed: int) -> Tuple[dict, dict]:
+    """A double-height living room plus a first-storey gallery around the void."""
+    floors = _floor_records()
+    lower = [
+        _rect_plan("living", "living_room", Rect(0.0, 0.0, 6.4, 4.7)),
+        _rect_plan("kitchen", "kitchen", Rect(6.4, 0.0, 9.2, 3.0)),
+        _rect_plan("hall", "corridor", Rect(6.4, 3.0, 12.8, 4.7)),
+        _rect_plan("entry", "entry", Rect(9.2, 0.0, 10.8, 3.0)),
+        _rect_plan("bath", "bathroom", Rect(10.8, 0.0, 12.8, 3.0)),
+    ]
+    upper = [
+        _rect_plan("gallery", "corridor", Rect(0.0, 0.0, 6.4, 4.7)),
+        _rect_plan("bedroom_up", "bedroom", Rect(6.4, 0.0, 9.4, 4.7)),
+        _rect_plan("bath_up", "bathroom", Rect(9.4, 2.4, 12.8, 4.7)),
+    ]
+    lower_doors = plan_doors_graph(rng, lower)
+    lower_semantics = door_semantics(lower, lower_doors)
+    if not lower_semantics["pass"]:
+        raise _AttemptFailed("void lower floor: " + "; ".join(lower_semantics["violations"][:2]))
+    upper_doors = _doors_between(rng, upper, [("gallery", "bedroom_up"),
+                                              ("bedroom_up", "bath_up")])
+    upper_semantics = door_semantics(upper, upper_doors)
+    if not upper_semantics["pass"]:
+        raise _AttemptFailed("void gallery floor: " + "; ".join(upper_semantics["violations"][:2]))
+
+    living, gallery = lower[0], upper[0]
+    stair = plan_duplex_stair(rng, "W", living, gallery, lower_doors, upper_doors, 12.8, 4.7)
+    void_rect = Rect(2.7, 1.2, 5.3, 3.8)
+    void_outline = void_rect.polygon()
+    void_reserve = (void_rect.x0 - 0.35, void_rect.y0 - 0.35,
+                    void_rect.x1 + 0.35, void_rect.y1 + 0.35)
+    stair_hole = _stair_slab_opening(stair)
+    avoid = {
+        living.room_id: [("S", stair.shaft.x0 - 0.35, stair.shaft.x1 + 0.35), ("W", -10.0, 10.0)],
+        gallery.room_id: [("S", stair.shaft.x0 - 0.35, stair.shaft.x1 + 0.35), ("W", -10.0, 10.0)],
+    }
+    windows_lower = plan_windows(rng, lower, avoid)
+    windows_upper = plan_windows(rng, upper, avoid)
+    reserve = {living.room_id: [stair.reserve()],
+               gallery.room_id: [stair.reserve(), void_reserve]}
+    mouths = {living.room_id: [stair.mouth()], gallery.room_id: [stair.mouth()]}
+    shafts = {living.room_id: [stair.shaft_bounds(), (void_rect.x0, void_rect.y0,
+                                                     void_rect.x1, void_rect.y1)],
+              gallery.room_id: [stair.shaft_bounds(), (void_rect.x0, void_rect.y0,
+                                                       void_rect.x1, void_rect.y1)]}
+    items_lower, slots_lower = furnish_rooms(rng, lower, lower_doors, windows_lower, index,
+                                             reserved_by_room=reserve, mouths_by_room=mouths,
+                                             shafts_by_room=shafts)
+    items_upper, slots_upper = furnish_rooms(rng, upper, upper_doors, windows_upper, index,
+                                             reserved_by_room=reserve, mouths_by_room=mouths,
+                                             shafts_by_room=shafts)
+
+    cameras: List[dict] = []
+    forecast: Dict[str, dict] = {}
+    elevations = [float(record["elevation"]) for record in floors]
+    openings_first: List[Optional[DoorPlan]] = []
+    next_camera = 0
+    for position, plans in enumerate((lower, upper)):
+        rooms_by_id = {plan.room_id: plan.polygon for plan in plans}
+        doors = lower_doors if position == 0 else upper_doors
+        items = items_lower if position == 0 else items_upper
+        model = ShellModel(rooms_by_id, doors, items)
+        holes = [stair_hole, void_outline] if position == 1 else []
+        floor_cameras, opening0, floor_forecast = place_cameras(
+            rng, plans, doors, items, model, want_second=len(plans) <= 3,
+            reserved_by_room=reserve, floor_holes=holes)
+        for camera in floor_cameras:
+            name = f"{next_camera:04d}"
+            next_camera += 1
+            cameras.append({"name": name, "room": camera["room"],
+                            "pos": [camera["pos"][0], camera["pos"][1],
+                                    round(elevations[position] + camera["pos"][2], 4)]})
+            forecast[name] = floor_forecast[camera["name"]]
+        openings_first.append(opening0)
+
+    void = {"floor": FLOOR_IDS[0], "outline": void_outline, "railing": True, "name": "living_void"}
+    connectors = [stair.connector()]
+    slabs = [{"outline": stair_hole, "floors": [stair.to_floor]}]
+    spec = _spec_dict_cross_level(
+        seed, "void", floors, (lower, upper), (lower_doors, upper_doors),
+        (windows_lower, windows_upper), cameras, (items_lower, items_upper),
+        connectors, slabs, [void],
+        ["double-height living room: the f0 living room is open through the f1 slab",
+         "inside the declared void; the f1 gallery rings it, the stair lands on the",
+         "gallery and the railing runs on every void edge that borders gallery floor."])
+    report = _cross_level_report("void", floors, (lower, upper), (lower_doors, upper_doors),
+                                 (windows_lower, windows_upper), cameras,
+                                 (items_lower, items_upper), connectors, [void], slabs,
+                                 extra={"door_semantics": {"F1": lower_semantics,
+                                                           "F2": upper_semantics},
+                                        "stair": {"shaft": [stair.shaft.x0, stair.shaft.y0,
+                                                            stair.shaft.x1, stair.shaft.y1],
+                                                  "reserve": list(stair.reserve())}})
+    spec["_comment"].append(f"rooms={sum(len(plans) for plans in (lower, upper))} "
+                            f"attempt={attempt} furniture={len(items_lower) + len(items_upper)} "
+                            f"shape=void")
+    return spec, report
+
+
+def _build_mezzanine_attempt(rng: random.Random, room_count: Optional[int], index: Dict[str, dict],
+                             attempt: int, seed: int) -> Tuple[dict, dict]:
+    """A partial upper storey over the west part; the rest keeps its ceiling."""
+    floors = _floor_records()
+    lower = [
+        _rect_plan("living", "living_room", Rect(0.0, 0.0, 4.9, 4.8)),
+        _rect_plan("kitchen", "kitchen", Rect(4.9, 0.0, 6.9, 4.8)),
+        _rect_plan("entry", "entry", Rect(6.9, 0.0, 8.3, 4.8)),
+        _rect_plan("bath", "bathroom", Rect(8.3, 0.0, 10.0, 4.8)),
+    ]
+    upper = [
+        _rect_plan("landing", "corridor", Rect(0.0, 0.0, 4.2, 4.8)),
+        _rect_plan("bedroom_up", "bedroom", Rect(4.2, 0.0, 6.9, 4.8)),
+    ]
+    lower_doors = plan_doors_graph(rng, lower)
+    lower_semantics = door_semantics(lower, lower_doors)
+    if not lower_semantics["pass"]:
+        raise _AttemptFailed("mezzanine lower floor: "
+                             + "; ".join(lower_semantics["violations"][:2]))
+    upper_doors = _doors_between(rng, upper, [("landing", "bedroom_up")])
+    upper_semantics = door_semantics(upper, upper_doors)
+    if not upper_semantics["pass"]:
+        raise _AttemptFailed("mezzanine upper floor: "
+                             + "; ".join(upper_semantics["violations"][:2]))
+
+    living, landing = lower[0], upper[0]
+    stair = plan_duplex_stair(rng, "W", living, landing, lower_doors, upper_doors, 10.0, 4.8)
+    stair_hole = _stair_slab_opening(stair)
+    avoid = {
+        living.room_id: [("S", stair.shaft.x0 - 0.35, stair.shaft.x1 + 0.35), ("W", -10.0, 10.0)],
+        landing.room_id: [("S", stair.shaft.x0 - 0.35, stair.shaft.x1 + 0.35), ("W", -10.0, 10.0)],
+    }
+    windows_lower = plan_windows(rng, lower, avoid)
+    windows_upper = plan_windows(rng, upper, avoid)
+    reserve = {living.room_id: [stair.reserve()], landing.room_id: [stair.reserve()]}
+    mouths = {living.room_id: [stair.mouth()], landing.room_id: [stair.mouth()]}
+    shafts = {living.room_id: [stair.shaft_bounds()], landing.room_id: [stair.shaft_bounds()]}
+    items_lower, slots_lower = furnish_rooms(rng, lower, lower_doors, windows_lower, index,
+                                             reserved_by_room=reserve, mouths_by_room=mouths,
+                                             shafts_by_room=shafts)
+    items_upper, slots_upper = furnish_rooms(rng, upper, upper_doors, windows_upper, index,
+                                             reserved_by_room=reserve, mouths_by_room=mouths,
+                                             shafts_by_room=shafts)
+
+    cameras: List[dict] = []
+    forecast: Dict[str, dict] = {}
+    elevations = [float(record["elevation"]) for record in floors]
+    openings_first: List[Optional[DoorPlan]] = []
+    next_camera = 0
+    for position, plans in enumerate((lower, upper)):
+        rooms_by_id = {plan.room_id: plan.polygon for plan in plans}
+        doors = lower_doors if position == 0 else upper_doors
+        items = items_lower if position == 0 else items_upper
+        model = ShellModel(rooms_by_id, doors, items)
+        holes = [stair_hole] if position == 1 else []
+        floor_cameras, opening0, floor_forecast = place_cameras(
+            rng, plans, doors, items, model, want_second=len(plans) <= 3,
+            reserved_by_room=reserve, floor_holes=holes)
+        for camera in floor_cameras:
+            name = f"{next_camera:04d}"
+            next_camera += 1
+            cameras.append({"name": name, "room": camera["room"],
+                            "pos": [camera["pos"][0], camera["pos"][1],
+                                    round(elevations[position] + camera["pos"][2], 4)]})
+            forecast[name] = floor_forecast[camera["name"]]
+        openings_first.append(opening0)
+
+    connectors = [stair.connector()]
+    slabs = [{"outline": stair_hole, "floors": [stair.to_floor]}]
+    spec = _spec_dict_cross_level(
+        seed, "mezzanine", floors, (lower, upper), (lower_doors, upper_doors),
+        (windows_lower, windows_upper), cameras, (items_lower, items_upper),
+        connectors, slabs, [],
+        ["partial mezzanine: the f1 wing covers only x in [0, 6.9]; lower entry and",
+         "bath rooms keep their own ceiling slabs.  The stair rises through the f1",
+         "landing slab and every upstairs room is reached from the landing."])
+    report = _cross_level_report("mezzanine", floors, (lower, upper),
+                                 (lower_doors, upper_doors),
+                                 (windows_lower, windows_upper), cameras,
+                                 (items_lower, items_upper), connectors, [], slabs,
+                                 extra={"door_semantics": {"F1": lower_semantics,
+                                                           "F2": upper_semantics},
+                                        "stair": {"shaft": [stair.shaft.x0, stair.shaft.y0,
+                                                            stair.shaft.x1, stair.shaft.y1],
+                                                  "reserve": list(stair.reserve())}})
+    spec["_comment"].append(f"rooms={sum(len(plans) for plans in (lower, upper))} "
+                            f"attempt={attempt} furniture={len(items_lower) + len(items_upper)} "
+                            f"shape=mezzanine")
+    return spec, report
+
+
+def _build_split_level_attempt(rng: random.Random, room_count: Optional[int],
+                               index: Dict[str, dict], attempt: int,
+                               seed: int) -> Tuple[dict, dict]:
+    """One storey with a raised dining/kitchen wing and a short ramp."""
+    floors = [{"id": FLOOR_IDS[0], "elevation": 0.0, "height": WALL_HEIGHT,
+               "slab_thickness": FLOOR_SLAB_M}]
+    living = _rect_plan("living", "living_room", Rect(0.0, 0.0, 5.4, 5.0))
+    entry = _rect_plan("entry", "entry", Rect(5.4, 2.6, 6.8, 5.0))
+    bath = _rect_plan("bath", "bathroom", Rect(6.8, 2.6, 11.4, 5.0))
+    dining = _rect_plan("dining", "dining", Rect(5.4, 0.0, 8.8, 2.6), level=SPLIT_LEVEL_RISE_M)
+    kitchen = _rect_plan("kitchen", "kitchen", Rect(8.8, 0.0, 11.4, 2.6),
+                         level=SPLIT_LEVEL_RISE_M)
+    plans = [living, entry, bath, dining, kitchen]
+    doors = (_doors_between(rng, plans, [("living", "entry"), ("entry", "bath")])
+             + _doors_between(rng, plans, [("dining", "kitchen")]))
+
+    ramp_center = [5.4 - SPLIT_LEVEL_RAMP_RUN_M / 2.0, 1.3]
+    connectors = [{
+        "kind": "ramp", "from_room": "living", "to_room": "dining",
+        "from_floor": FLOOR_IDS[0], "to_floor": FLOOR_IDS[0],
+        "width": SPLIT_LEVEL_RAMP_WIDTH_M, "run": SPLIT_LEVEL_RAMP_RUN_M,
+        "rise": SPLIT_LEVEL_RISE_M, "center": ramp_center, "direction_deg": 0.0,
+    }]
+    windows = plan_windows(rng, plans)
+    reserve = {
+        living.room_id: [(3.4, 0.6, 5.6, 2.0)],
+        dining.room_id: [(5.3, 0.6, 6.1, 2.0)],
+    }
+    items, slots = furnish_rooms(rng, plans, doors, windows, index, reserved_by_room=reserve)
+    rooms_by_id = {plan.room_id: plan.polygon for plan in plans}
+    model = ShellModel(rooms_by_id, doors, items)
+    cameras: List[dict] = []
+    forecast: Dict[str, dict] = {}
+    floor_cameras, opening0, floor_forecast = place_cameras(
+        rng, plans, doors, items, model, want_second=False, reserved_by_room=reserve)
+    for camera in floor_cameras:
+        name = f"{len(cameras):04d}"
+        plan = next(plan for plan in plans if plan.room_id == camera["room"])
+        cameras.append({"name": name, "room": camera["room"],
+                        "pos": [camera["pos"][0], camera["pos"][1],
+                                round(plan.level + camera["pos"][2], 4)]})
+        forecast[name] = floor_forecast[camera["name"]]
+    spec = _spec_dict_cross_level(
+        seed, "split_level", floors, (plans,), (doors,), (windows,), cameras, (items,),
+        connectors, [], [],
+        ["split level: the dining/kitchen wing is +0.45 m above the living room;",
+         "a 1.8 m ramp inside the living room climbs to the wing and the shared",
+         "wall is cut open at the ramp head.  The raised wing is a solid plinth."])
+    report = _cross_level_report("split_level", floors, (plans,), (doors,), (windows,),
+                                 cameras, (items,), connectors, [], [],
+                                 extra={"door_semantics": None,
+                                        "split_level": {"rise_m": SPLIT_LEVEL_RISE_M,
+                                                        "ramp_run_m": SPLIT_LEVEL_RAMP_RUN_M}})
+    spec["_comment"].append(f"rooms={len(plans)} attempt={attempt} furniture={len(items)} "
+                            f"shape=split_level")
+    return spec, report
+
+
+def check_cross_level_spec(spec_dict: dict, shape: str,
+                           assets_index: Optional[Dict[str, dict]] = None) -> dict:
+    """Shape-specific acceptance for the generated void / mezzanine templates.
+
+    The generic placement, circulation, stair and walk-track rules are
+    ``blender_agent.checks``' job (and ``generate`` runs them); this records the
+    cross-level invariants the shape exists for: a void really opens the storey
+    above and carries a rail, or a partial upper storey really leaves ceiling
+    over the lower rooms it does not cover.
+    """
+    spec = spec_mod.parse_spec(spec_dict)
+    checks: List[dict] = []
+    problems: List[str] = []
+
+    def record(name: str, ok: bool, **payload) -> None:
+        checks.append({"name": name, "pass": bool(ok), **payload})
+        if not ok:
+            problems.extend(payload.get("violations", []))
+
+    if shape == "void":
+        void_ok = bool(spec.voids)
+        violations = [] if spec.voids else ["no declared void"]
+        for index, void in enumerate(spec.voids):
+            probes = [[void.outline[0][0] + (void.outline[1][0] - void.outline[0][0]) * t,
+                       void.outline[0][1] + (void.outline[1][1] - void.outline[0][1]) * t]
+                      for t in (0.25, 0.5, 0.75)]
+            for floor in spec.floors:
+                if floor.elevation <= spec.floor(void.floor).elevation + 1e-9:
+                    continue
+                for point in probes:
+                    if spec_mod.point_in_polygon(point, void.outline) and \
+                            not spec.in_slab_opening(floor.id, point):
+                        violations.append(f"void {index} does not cut floor '{floor.id}'")
+            spans = [span for span in spec.railing_spans()
+                     if span.void == (void.name or f"void_{index}")]
+            if void.railing and not spans:
+                violations.append(f"void {index} has no railing span")
+        record("cross_level_void_open", void_ok and not violations, violations=violations,
+               voids=len(spec.voids), railing_spans=len(spec.railing_spans()))
+        upper_floor = sorted(spec.floors, key=lambda floor: floor.elevation)[-1]
+        gallery = [room for room in spec.floor_rooms(upper_floor.id)
+                   if room.type == "corridor"]
+        record("cross_level_gallery", bool(gallery),
+               gallery=[room.id for room in gallery])
+    elif shape == "mezzanine":
+        floors = sorted(spec.floors, key=lambda floor: floor.elevation)
+        lower, upper = floors[0].id, floors[-1].id
+        lower_area = sum(abs(spec_mod.polygon_area(room.polygon))
+                         for room in spec.floor_rooms(lower))
+        upper_area = sum(abs(spec_mod.polygon_area(room.polygon))
+                         for room in spec.floor_rooms(upper))
+        covered = 0.0
+        for low in spec.floor_rooms(lower):
+            for up in spec.floor_rooms(upper):
+                covered += spec_mod.polygon_overlap_area(low.polygon, up.polygon)
+        uncovered = [room.id for room in spec.floor_rooms(lower)
+                     if spec.ceiling_regions(room.id)]
+        record("cross_level_partial_upper", 0.0 < covered < lower_area - 1.0,
+               lower_area_m2=round(lower_area, 2), upper_area_m2=round(upper_area, 2),
+               covered_m2=round(covered, 2), uncovered_rooms=uncovered)
+        record("cross_level_uncovered_ceiling", bool(uncovered), rooms=uncovered)
+    else:
+        record("cross_level_shape", False, violations=[f"unknown cross-level shape '{shape}'"])
+    return {"kind": "blender_agent_cross_level_checks", "shape": shape,
+            "pass": all(entry["pass"] for entry in checks), "checks": checks,
+            "violations": problems}
+
+
+def check_split_level_spec(spec_dict: dict, assets_index: Optional[Dict[str, dict]] = None) -> dict:
+    """Acceptance of the generated split-level scene: levels, ramp, support."""
+    spec = spec_mod.parse_spec(spec_dict)
+    checks: List[dict] = []
+    problems: List[str] = []
+
+    def record(name: str, ok: bool, **payload) -> None:
+        checks.append({"name": name, "pass": bool(ok), **payload})
+        if not ok:
+            problems.extend(payload.get("violations", []))
+
+    levels = {room.id: spec.room_elevation(room.id) for room in spec.rooms}
+    raised = [room_id for room_id, z in levels.items() if z > 1e-6]
+    ground = [room_id for room_id, z in levels.items() if z <= 1e-6]
+    record("split_level_levels", bool(raised) and bool(ground), levels=levels,
+           raised=raised, ground=ground)
+    ramps = spec.ramp_plans()
+    ramp_problems = []
+    if not ramps:
+        ramp_problems.append("no ramp joins the split levels")
+    for plan in ramps:
+        connector = plan.connector
+        if connector.from_floor != connector.to_floor:
+            ramp_problems.append("the split-level ramp must stay inside one storey")
+        if abs(plan.rise_total - SPLIT_LEVEL_RISE_M) > 0.01:
+            ramp_problems.append(f"ramp rises {plan.rise_total:.3f} m, "
+                                 f"expected {SPLIT_LEVEL_RISE_M:.3f} m")
+        if plan.slope > spec_mod.RAMP_SLOPE_MAX + 1e-9:
+            ramp_problems.append(f"ramp slope {plan.slope * 100:.1f}% is too steep")
+        if not spec_mod.point_in_polygon(plan.head_point, spec.room(connector.to_room).polygon):
+            ramp_problems.append("the ramp head does not reach the raised room")
+        supports = spec.support_surfaces(plan.head_point, connector.to_floor)
+        if not any(surface.kind == "floor" and abs(surface.z - plan.to_elevation) < 1e-6
+                   for surface in supports):
+            ramp_problems.append("the raised floor does not support the ramp head")
+    record("split_level_ramp", not ramp_problems, ramps=len(ramps),
+           violations=ramp_problems)
+    track = checks_mod.walk_track_report(spec)
+    record("split_level_walk_track", track["pass"], tracks=track["tracks"],
+           violations=track["violations"])
+    return {"kind": "blender_agent_split_level_checks",
+            "pass": all(entry["pass"] for entry in checks),
+            "checks": checks, "violations": problems}
+
+
 @dataclass
 class Scene:
     spec: dict
@@ -5238,25 +5779,43 @@ def generate(seed: int, room_count: Optional[int] = None,
     duplex draws its own arrangement.  A duplex spec is validated with
     :func:`check_duplex_spec` (the generator-side 2.5D twin of ``checks.py``'s
     single-floor rule set).
+
+    The cross-level templates are selected by ``shape``: ``"void"`` (a
+    double-height living room, an f1 gallery and a guard rail) and
+    ``"mezzanine"`` (an upper storey over the west part only) need ``floors=2``;
+    ``"split_level"`` (a raised dining/kitchen wing inside one storey, joined by
+    a short ramp) needs ``floors=1``.  They have fixed room programmes (pass no
+    ``room_count``) and are validated with :func:`check_cross_level_spec` /
+    :func:`check_split_level_spec` in addition to the shared checks.
     """
     if floors not in (1, 2):
         raise ValueError(f"only 1 or 2 floors are supported, not {floors}")
-    if floors >= 2 and shape not in ("row", "auto"):
-        raise ValueError(f"--floors 2 builds its own duplex plan, --shape must be row or auto, "
-                         f"not '{shape}'")
-    if shape not in ("row", "block", "auto", "open_plan") and shape not in ROOM_FAMILIES:
-        raise ValueError(f"unknown layout shape '{shape}' (row, block, auto, open_plan or a "
-                         f"topology family)")
-    if shape in ROOM_FAMILIES and room_count is not None and \
-            ROOM_FAMILIES[shape].count != room_count:
-        raise ValueError(f"layout '{shape}' has {ROOM_FAMILIES[shape].count} rooms, "
-                         f"--rooms {room_count} does not match")
-    if shape == "open_plan" and room_count is not None and int(room_count) != OPEN_PLAN_ROOMS:
-        raise ValueError(f"layout 'open_plan' has {OPEN_PLAN_ROOMS} rooms, "
-                         f"--rooms {room_count} does not match")
-    if floors >= 2 and room_count is not None and not 4 <= room_count <= 8:
-        raise ValueError(f"--rooms must be 4..8 with --floors 2 (2-4 rooms per floor), "
-                         f"not {room_count}")
+    if shape in CROSS_LEVEL_SHAPES:
+        if shape == "split_level":
+            if floors != 1:
+                raise ValueError("layout 'split_level' is one storey with room levels; "
+                                 "pass --floors 1")
+        elif floors != 2:
+            raise ValueError(f"layout '{shape}' needs --floors 2")
+        if room_count is not None:
+            raise ValueError(f"layout '{shape}' has a fixed room programme; omit --rooms")
+    else:
+        if floors >= 2 and shape not in ("row", "auto"):
+            raise ValueError(f"--floors 2 builds its own duplex plan, --shape must be row or auto, "
+                             f"not '{shape}'")
+        if shape not in ("row", "block", "auto", "open_plan") and shape not in ROOM_FAMILIES:
+            raise ValueError(f"unknown layout shape '{shape}' (row, block, auto, open_plan, "
+                             f"{', '.join(CROSS_LEVEL_SHAPES)} or a topology family)")
+        if shape in ROOM_FAMILIES and room_count is not None and \
+                ROOM_FAMILIES[shape].count != room_count:
+            raise ValueError(f"layout '{shape}' has {ROOM_FAMILIES[shape].count} rooms, "
+                             f"--rooms {room_count} does not match")
+        if shape == "open_plan" and room_count is not None and int(room_count) != OPEN_PLAN_ROOMS:
+            raise ValueError(f"layout 'open_plan' has {OPEN_PLAN_ROOMS} rooms, "
+                             f"--rooms {room_count} does not match")
+        if floors >= 2 and room_count is not None and not 4 <= room_count <= 8:
+            raise ValueError(f"--rooms must be 4..8 with --floors 2 (2-4 rooms per floor), "
+                             f"not {room_count}")
     index = assets_index if assets_index is not None else checks_mod.load_assets_index()
     started = time.time()
     last_error = "unknown"
@@ -5268,37 +5827,54 @@ def generate(seed: int, room_count: Optional[int] = None,
     for attempt in range(attempts):
         rng = random.Random(seed * 1000003 + attempt)
         try:
-            if floors >= 2:
+            if shape == "void":
+                spec_dict, report = _build_void_attempt(rng, room_count, index, attempt, seed)
+            elif shape == "mezzanine":
+                spec_dict, report = _build_mezzanine_attempt(rng, room_count, index, attempt, seed)
+            elif shape == "split_level":
+                spec_dict, report = _build_split_level_attempt(rng, room_count, index, attempt,
+                                                               seed)
+            elif floors >= 2:
                 spec_dict, report = _build_duplex_attempt(rng, room_count, index, attempt, seed)
             else:
                 spec_dict, report = _build_attempt(rng, room_count, index, attempt, seed, shape,
                                                    auto_pick)
-                spec = spec_mod.parse_spec(spec_dict)
+            spec = spec_mod.parse_spec(spec_dict)
         except (_AttemptFailed, spec_mod.SpecError) as error:
             last_error = f"{type(error).__name__}: {error}"
             continue
-        if floors >= 2:
-            try:
-                spec = spec_mod.parse_spec(spec_dict)
-            except spec_mod.SpecError as error:
-                last_error = f"SpecError: {error}"
-                continue
+        checker = None
+        extra_checks: List[dict] = []
+        if shape in ("void", "mezzanine"):
+            duplex_check = check_duplex_spec(spec_dict, index, rooms_range=(2, 6))
+            report["duplex_checks"] = duplex_check
+            checker = check_cross_level_spec(spec_dict, shape, index)
+            report["cross_level_checks"] = checker
+            extra_checks.append(duplex_check)
+        elif shape == "split_level":
+            checker = check_split_level_spec(spec_dict, index)
+            report["split_level_checks"] = checker
+        elif floors >= 2:
             duplex_check = check_duplex_spec(spec_dict, index)
             report["duplex_checks"] = duplex_check
+            checker = duplex_check
         check_report = checks_mod.check_spec(spec, index)
         report["checks"] = check_report
         if not check_report["pass"]:
             last_error = "; ".join(check_report["violations"][:4]) or "checks failed"
             continue
-        if floors >= 2 and not duplex_check["pass"]:
-            last_error = "; ".join(duplex_check["violations"][:4]) or "duplex checks failed"
+        if checker is not None:
+            extra_checks.append(checker)
+        failed = next((entry for entry in extra_checks if not entry["pass"]), None)
+        if failed is not None:
+            last_error = "; ".join(failed["violations"][:4]) or "cross-level checks failed"
             continue
         report["stats"] = {
             "seed": seed,
             "attempt": attempt,
             "attempts_used": attempt + 1,
             "generation_seconds": round(time.time() - started, 3),
-            "shape": "duplex" if floors >= 2 else shape,
+            "shape": shape if shape in CROSS_LEVEL_SHAPES else ("duplex" if floors >= 2 else shape),
             "floors": floors,
             "rooms": len(spec_dict["rooms"]),
             "doors": len(spec_dict.get("openings", [])),
@@ -5327,10 +5903,12 @@ def main(argv=None) -> int:
     parser.add_argument("--rooms", type=int, default=None,
                         help="2..7, default: drawn from the seed")
     parser.add_argument("--shape", default=os.environ.get("PANOWORLD_LAYOUT_SHAPE", "row"),
-                        choices=("row", "block", "auto", "open_plan") + tuple(sorted(ROOM_FAMILIES)),
+                        choices=("row", "block", "auto", "open_plan") + CROSS_LEVEL_SHAPES
+                        + tuple(sorted(ROOM_FAMILIES)),
                         help="room arrangement: 'row' (one row along +X, default), 'block' (the same "
                              "chain of rooms wrapped into two rows), 'auto' (the seed draws the room "
-                             "count and a topology family), 'open_plan' (open LDK + L-shaped rooms) "
+                             "count and a topology family), 'open_plan' (open LDK + L-shaped rooms), "
+                             "'void'/'mezzanine'/'split_level' (cross-level templates) "
                              "or a family name: "
                              + ", ".join(sorted(ROOM_FAMILIES))
                              + " -- also settable with PANOWORLD_LAYOUT_SHAPE, which is what "
@@ -5339,8 +5917,9 @@ def main(argv=None) -> int:
                         default=os.environ.get("PANOWORLD_LAYOUT_FLOORS", "1"),
                         help="1 (default) or 2: with 2, generate a duplex -- two floors on one "
                              "footprint, each a row of 2-4 rooms, connected by a switchback or "
-                             "straight stair through a slab opening.  --rooms then means the total "
-                             "(4..8) and --shape must stay row/auto; also settable with "
+                             "straight stair through a slab opening -- or a cross-level 'void' / "
+                             "'mezzanine' template (--shape).  With 1, 'split_level' raises one "
+                             "room level inside the storey.  Also settable with "
                              "PANOWORLD_LAYOUT_FLOORS, which is how scripts/layout_gen_run.sh "
                              "passes it through")
     parser.add_argument("--assets-index", default=DEFAULT_ASSETS_INDEX)
@@ -5349,6 +5928,8 @@ def main(argv=None) -> int:
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
     if args.rooms is not None:
+        if args.shape in CROSS_LEVEL_SHAPES:
+            parser.error(f"--shape {args.shape} has a fixed room programme; omit --rooms")
         if args.floors >= 2 and not 4 <= args.rooms <= 8:
             parser.error("--rooms must be 4..8 with --floors 2 (2-4 rooms per floor)")
         if args.floors < 2 and not 2 <= args.rooms <= 7:

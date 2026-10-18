@@ -96,6 +96,49 @@ Semantics frozen with the generator:
   ceiling slab (:meth:`SceneSpec.ceiling_regions`).  A ``slab_opening`` is a
   declared void and stays open in both bodies.
 
+Cross-level space (a double-height room, a gallery, a split level)
+------------------------------------------------------------------
+A ``slab_opening`` is a hole in one storey's floor.  A **void** is the
+architectural version: a region of a lower room that is open through every
+storey above it up to that storey's ceiling, so the lower room gets no ceiling
+there and no upper floor slab is built over it::
+
+    "voids": [{"floor": "f0", "outline": [[x, y], ...],
+               "railing": true, "name": "living_void"}]
+
+Semantics:
+
+* the outline lies inside one room of ``floor`` (the lower room).  The room
+  loses every ceiling part over the outline (:func:`room_ceiling_parts`), and
+  every floor above punches the outline out of its room slabs, exactly like a
+  ``slab_opening`` of that floor: ``in_slab_opening`` is true there, so no
+  camera can stand on it and no furniture can stand on it.  The topmost ceiling
+  above (the gallery/roof of the highest storey crossed) stays -- the void opens
+  *to* it, it is not punched through it.
+* ``railing`` (default true) builds a basic guard rail along every void edge
+  that borders walkable upper floor (:meth:`SceneSpec.railing_spans` /
+  :func:`railing_boxes`): a top rail at 1.0 m, a mid rail, and posts at most
+  0.9 m apart.  Edges that sit against a wall, a stairwell or another opening
+  get no rail.
+* an upper room whose floor is the gallery around the void is an ordinary room:
+  its slab is cut by the void, the remaining ring is walkable floor, and the
+  stairs land on it.  The lower and upper plans need **not** share an outline;
+  only the gallery area that really covers the lower room replaces its ceiling.
+
+A **split level** is a room-level elevation offset inside one storey::
+
+    "rooms": [{"id": "living", "floor_id": "f0", "level": 0.0, ...},
+              {"id": "dining", "floor_id": "f0", "level": 0.45, ...}]
+
+``level`` is added to the floor's elevation for that room only (max 0.60 m).
+Its slab is a solid plinth from the floor slab bottom up to the raised walking
+surface, its ceiling is raised with it, and a wall segment that borders rooms of
+two levels spans from the lower floor to the higher ceiling.  A ``ramp`` (or
+``stair``) connector may join two rooms of the same floor when their room
+elevations differ; a door-like connector may not (a door needs one level).  A
+short ramp whose footprint stays in the lower room and whose head point is on
+the raised floor is the generated split-level link.
+
 Non-rectangular rooms and open-plan zones
 -----------------------------------------
 A room polygon is a general, counter-clockwise, simple polygon.  The generator
@@ -174,6 +217,20 @@ RAMP_WIDTH_MIN_M = 0.90
 #: limit, so the first version bounds the slope loosely (a steep interior ramp)
 #: and leaves long accessible ramps to split levels
 RAMP_SLOPE_MAX = 0.30
+#: a split-level room may sit at most this far above its storey's walking surface
+ROOM_LEVEL_MAX_M = 0.60
+
+#: guard rail of a declared void (see :func:`railing_boxes`)
+RAILING_HEIGHT_M = 1.0
+RAILING_THICKNESS_M = 0.05
+RAILING_POST_M = 0.04
+RAILING_POST_MAX_GAP_M = 0.90
+RAILING_MID_HEIGHT_M = 0.52
+#: a railing span needs this much walkable floor outside the void edge; the
+#: outside sample is taken this far from the edge (wall half thickness + margin)
+RAILING_FLOOR_OFFSET_M = 0.12
+RAILING_SAMPLE_STEP_M = 0.10
+RAILING_MIN_SPAN_M = 0.15
 
 #: eye height of a camera above the surface it stands on: the stands of
 #: ``layout_gen`` place the camera at ``floor elevation + CAMERA_EYE_HEIGHT_M``
@@ -669,10 +726,47 @@ class RoomSpec:
     floor_color: List[float] = field(default_factory=lambda: [0.6, 0.6, 0.6])
     floor_id: Optional[str] = None
     height: Optional[float] = None
+    #: split-level offset above the storey's walking surface (0 for a normal room)
+    level: float = 0.0
     #: semantic zones of an open-plan room (empty for a plain room)
     zones: List[RoomZoneSpec] = field(default_factory=list)
     #: True when the room's areas share one continuous space (internal zones)
     open_plan: bool = False
+
+
+@dataclass
+class VoidSpec:
+    """A region of a lower room open through every storey above it.
+
+    ``floor`` is the *lower* storey (the room that loses its ceiling), ``outline``
+    the CCW XY region.  Every floor above cuts the outline out of its room slabs;
+    ``railing`` builds the guard rail where the void edge borders walkable floor
+    of the first storey above.
+    """
+
+    floor: str
+    outline: List[List[float]]
+    railing: bool = True
+    name: Optional[str] = None
+
+    def contains(self, point: Sequence[float]) -> bool:
+        return point_in_polygon(point, self.outline)
+
+
+@dataclass
+class RailingSpan:
+    """One straight guard-rail span along a void edge, on one upper floor."""
+
+    floor: str
+    void: str
+    p0: Tuple[float, float]
+    p1: Tuple[float, float]
+    z: float
+    height: float = RAILING_HEIGHT_M
+
+    @property
+    def length(self) -> float:
+        return math.dist(self.p0, self.p1)
 
 
 @dataclass
@@ -894,6 +988,7 @@ class SceneSpec:
     floors: List[FloorSpec] = field(default_factory=list)
     connectors: List[ConnectorSpec] = field(default_factory=list)
     slab_openings: List[SlabOpeningSpec] = field(default_factory=list)
+    voids: List[VoidSpec] = field(default_factory=list)
 
     # -- storeys ------------------------------------------------------------ #
     @property
@@ -916,7 +1011,8 @@ class SceneSpec:
         return FloorSpec(id="", elevation=0.0, height=self.wall_height, slab_thickness=DEFAULT_SLAB_M)
 
     def room_elevation(self, room_id: str) -> float:
-        return self.room_floor(room_id).elevation
+        """World walking surface of a room: storey elevation + its split level."""
+        return self.room_floor(room_id).elevation + self.room(room_id).level
 
     def room_height(self, room_id: str) -> float:
         """Net height of a room: its own override, else the storey height."""
@@ -934,8 +1030,31 @@ class SceneSpec:
     def slab_openings_for(self, floor_id: str) -> List[SlabOpeningSpec]:
         return [opening for opening in self.slab_openings if floor_id in opening.floors]
 
+    def voids_for(self, floor_id: str) -> List[VoidSpec]:
+        """Voids whose *lower* room lives on ``floor_id``."""
+        return [void for void in self.voids if void.floor == floor_id]
+
+    def void_cuts(self, floor_id: str, point: Sequence[float]) -> bool:
+        """True when a void of a lower storey punches through this storey's slab.
+
+        This is the ``slab_opening`` semantics of a declared void: the floor of
+        ``floor_id`` is absent at ``point`` even though a room of that storey
+        covers it.  The lower storey itself is never cut (its floor is real).
+        """
+        if not self.voids or not self.floors:
+            return False
+        floor = self.floor(floor_id)
+        for void in self.voids:
+            if self.floor(void.floor).elevation >= floor.elevation - 1e-9:
+                continue
+            if void.contains(point):
+                return True
+        return False
+
     def in_slab_opening(self, floor_id: str, point: Sequence[float]) -> bool:
-        return any(opening.contains(point) for opening in self.slab_openings_for(floor_id))
+        """No floor slab of ``floor_id`` at ``point``: opening or declared void."""
+        return (any(opening.contains(point) for opening in self.slab_openings_for(floor_id))
+                or self.void_cuts(floor_id, point))
 
     # -- walkable surfaces --------------------------------------------------- #
     def ceiling_regions(self, room_id: str) -> List[List[List[float]]]:
@@ -953,6 +1072,14 @@ class SceneSpec:
     def support_surfaces(self, point: Sequence[float], floor_id: str) -> List[SupportSurface]:
         """Walkable surfaces at ``point`` on one storey, see :func:`point_support_surfaces`."""
         return point_support_surfaces(self, point, floor_id)
+
+    def railing_spans(self) -> List[RailingSpan]:
+        """Guard-rail spans of every declared void, see :func:`void_railing_spans`."""
+        return void_railing_spans(self)
+
+    def railing_boxes(self) -> List[dict]:
+        """Solid rail / post boxes, ready for the shell and the furniture check."""
+        return railing_boxes(self)
 
     def walk_tracks(self) -> List[Tuple[ConnectorSpec, List[WalkNode]]]:
         """Every stair / ramp as an ordered walk track, with the connector that made it."""
@@ -1152,9 +1279,9 @@ def stair_plan(spec: "SceneSpec", connector: ConnectorSpec) -> StairPlan:
         raise SpecError(f"{connector.label()}: stairs need a multi-floor spec ('floors')")
     if connector.run is None or connector.rise is None or connector.steps is None:
         raise SpecError(f"{connector.label()}: stair needs 'run', 'rise' and 'steps'")
-    lower_floor = spec.floor(connector.from_floor)
-    upper_floor = spec.floor(connector.to_floor)
-    rise_total = float(upper_floor.elevation) - float(lower_floor.elevation)
+    from_elevation = spec.room_elevation(connector.from_room)
+    to_elevation = spec.room_elevation(connector.to_room)
+    rise_total = to_elevation - from_elevation
     if rise_total <= 0.0:
         raise SpecError(f"{connector.label()}: to_floor '{connector.to_floor}' is not above "
                         f"from_floor '{connector.from_floor}'")
@@ -1176,21 +1303,21 @@ def stair_plan(spec: "SceneSpec", connector: ConnectorSpec) -> StairPlan:
     if switchback:
         per_flight = run / (risers / 2.0)
         length = run + landing
-        half = lower_floor.elevation + rise_total / 2.0
+        half = from_elevation + rise_total / 2.0
         u0 = -length / 2.0
         boxes: List[dict] = []
         for i in range(risers // 2):
-            top = lower_floor.elevation + (i + 1) * riser_m
+            top = from_elevation + (i + 1) * riser_m
             boxes.append({"polygon": _local_box(center, direction, u0 + i * per_flight,
                                                 u0 + (i + 1) * per_flight, 0.0, width),
-                          "z0": lower_floor.elevation, "z1": top, "role": "flight_a"})
+                          "z0": from_elevation, "z1": top, "role": "flight_a"})
         boxes.append({"polygon": _local_box(center, direction, u0 + run, u0 + length, -width, width),
-                      "z0": lower_floor.elevation, "z1": half, "role": "landing"})
+                      "z0": from_elevation, "z1": half, "role": "landing"})
         for i in range(risers // 2):
-            top = lower_floor.elevation + rise_total / 2.0 + (risers / 2 - i) * riser_m
+            top = from_elevation + rise_total / 2.0 + (risers / 2 - i) * riser_m
             boxes.append({"polygon": _local_box(center, direction, u0 + i * per_flight,
                                                 u0 + (i + 1) * per_flight, -width, 0.0),
-                          "z0": lower_floor.elevation, "z1": top, "role": "flight_b"})
+                          "z0": from_elevation, "z1": top, "role": "flight_b"})
         base_point = (
             center[0] + direction[0] * (u0 - 0.30) + (-direction[1]) * (width / 2.0),
             center[1] + direction[1] * (u0 - 0.30) + direction[0] * (width / 2.0),
@@ -1207,10 +1334,10 @@ def stair_plan(spec: "SceneSpec", connector: ConnectorSpec) -> StairPlan:
         u0 = -run / 2.0
         boxes = []
         for i in range(risers):
-            top = lower_floor.elevation + (i + 1) * riser_m
+            top = from_elevation + (i + 1) * riser_m
             boxes.append({"polygon": _local_box(center, direction, u0 + i * tread,
                                                 u0 + (i + 1) * tread, -width / 2.0, width / 2.0),
-                          "z0": lower_floor.elevation, "z1": top, "role": "flight"})
+                          "z0": from_elevation, "z1": top, "role": "flight"})
         per_flight = tread
         base_point = (center[0] + direction[0] * (u0 - 0.30), center[1] + direction[1] * (u0 - 0.30))
         u1 = run / 2.0
@@ -1219,7 +1346,7 @@ def stair_plan(spec: "SceneSpec", connector: ConnectorSpec) -> StairPlan:
         base_rect = _rect_of(center, direction, u0 - 0.80, u0, -width / 2.0, width / 2.0)
         head_rect = _rect_of(center, direction, u1, u1 + 0.80, -width / 2.0, width / 2.0)
     return StairPlan(
-        connector=connector, from_elevation=lower_floor.elevation, to_elevation=upper_floor.elevation,
+        connector=connector, from_elevation=from_elevation, to_elevation=to_elevation,
         center=center, direction=direction, width=width, run=run, landing_m=landing,
         risers=risers, rise_total=rise_total, riser_m=riser_m, tread_m=per_flight,
         pitch_deg=math.degrees(math.atan2(riser_m, per_flight)), switchback=switchback,
@@ -1234,9 +1361,9 @@ def ramp_plan(spec: "SceneSpec", connector: ConnectorSpec) -> RampPlan:
         raise SpecError(f"{connector.label()}: ramps need a multi-floor spec ('floors')")
     if connector.run is None or connector.rise is None:
         raise SpecError(f"{connector.label()}: ramp needs 'run' and 'rise'")
-    lower_floor = spec.floor(connector.from_floor)
-    upper_floor = spec.floor(connector.to_floor)
-    rise_total = float(upper_floor.elevation) - float(lower_floor.elevation)
+    from_elevation = spec.room_elevation(connector.from_room)
+    to_elevation = spec.room_elevation(connector.to_room)
+    rise_total = to_elevation - from_elevation
     if rise_total <= 0.0:
         raise SpecError(f"{connector.label()}: to_floor '{connector.to_floor}' is not above "
                         f"from_floor '{connector.from_floor}'")
@@ -1252,16 +1379,16 @@ def ramp_plan(spec: "SceneSpec", connector: ConnectorSpec) -> RampPlan:
     u1 = run / 2.0
     footprint = _local_box(center, direction, u0, u1, -width / 2.0, width / 2.0)
     # wedge: bottom quad on the lower floor, top quad sloping up towards +direction
-    bottom = [(float(cx), float(cy), float(lower_floor.elevation)) for cx, cy in footprint]
+    bottom = [(float(cx), float(cy), float(from_elevation)) for cx, cy in footprint]
     top = []
     for cx, cy in footprint:
         u = (float(cx) - center[0]) * ux + (float(cy) - center[1]) * uy
         t = (u - u0) / (u1 - u0)
-        top.append((float(cx), float(cy), float(lower_floor.elevation) + t * rise_total))
+        top.append((float(cx), float(cy), float(from_elevation) + t * rise_total))
     base_point = (center[0] + ux * (u0 - 0.30), center[1] + uy * (u0 - 0.30))
     head_point = (center[0] + ux * (u1 + 0.30), center[1] + uy * (u1 + 0.30))
     return RampPlan(
-        connector=connector, from_elevation=lower_floor.elevation, to_elevation=upper_floor.elevation,
+        connector=connector, from_elevation=from_elevation, to_elevation=to_elevation,
         center=center, direction=direction, width=width, run=run, rise_total=rise_total,
         slope=slope, pitch_deg=math.degrees(math.atan(slope)), footprint=footprint,
         wedge={"bottom": bottom, "top": top}, base_point=base_point, head_point=head_point,
@@ -1362,7 +1489,7 @@ def point_support_surfaces(spec: "SceneSpec", point: Sequence[float],
         opened = False
     for room in rooms:
         if not opened and point_in_polygon(point, room.polygon):
-            out.append(SupportSurface(z=floor.elevation, kind="floor", label=room.id))
+            out.append(SupportSurface(z=spec.room_elevation(room.id), kind="floor", label=room.id))
     for plan in spec.stair_plans():
         surface = stair_surface_at(plan, point)
         if surface is not None:
@@ -1381,24 +1508,25 @@ def room_ceiling_covers(spec: "SceneSpec", room_id: str) -> List[dict]:
     room's ceiling plane *and* one of its rooms covers the area.  Each entry is
     ``{"floor": id, "room": id, "polygon": clipped outline, "area_m2": area}`` --
     a list because an upper floor may cover the room only partly, so the rest of
-    the ceiling still has to be built.
+    the ceiling still has to be built.  Room elevations (split levels) are used,
+    not the storey elevation, so a raised room only covers a ceiling when its
+    own slab bottom really meets that plane.
     """
     room = spec.room(room_id)
-    floor = spec.room_floor(room_id)
-    ceiling = floor.elevation + spec.room_height(room_id)
+    ceiling = spec.room_top(room_id)
     covers: List[dict] = []
-    for upper in spec.floors:
-        if upper.elevation <= floor.elevation + 1e-9:
+    for other in spec.rooms:
+        other_floor = spec.room_floor(other.id)
+        if spec.room_elevation(other.id) <= spec.room_elevation(room_id) + 1e-9:
             continue
-        if abs((upper.elevation - upper.slab_thickness) - ceiling) > 1e-6:
+        if abs((spec.room_elevation(other.id) - other_floor.slab_thickness) - ceiling) > 1e-6:
             continue
-        for other in spec.floor_rooms(upper.id):
-            area = polygon_overlap_area(room.polygon, other.polygon)
-            if area <= 1e-6:
-                continue
-            covers.append({"floor": upper.id, "room": other.id,
-                           "polygon": polygon_clip(room.polygon, other.polygon),
-                           "area_m2": area})
+        area = polygon_overlap_area(room.polygon, other.polygon)
+        if area <= 1e-6:
+            continue
+        covers.append({"floor": other_floor.id, "room": other.id,
+                       "polygon": polygon_clip(room.polygon, other.polygon),
+                       "area_m2": area})
     return covers
 
 
@@ -1410,17 +1538,196 @@ def room_ceiling_parts(spec: "SceneSpec", room_id: str) -> List[List[List[float]
     that nothing covers, and one rectangle per surviving region for a partial
     cover -- the "lower 4x4, upper 2x2" case that used to lose the whole ceiling.
     A declared ``slab_opening`` above is *not* filled in: the void is explicit.
+    A declared **void** on this room's own floor is subtracted as well: that area
+    is open to the storey above, so no lower ceiling may be built over it.
     """
     room = spec.room(room_id)
     covers = room_ceiling_covers(spec, room_id)
-    if not covers:
+    own_voids = [void for void in spec.voids_for(spec.room_floor(room_id).id)
+                 if polygon_overlap_area(room.polygon, void.outline) > 1e-6]
+    if not covers and not own_voids:
         return [[[float(p[0]), float(p[1])] for p in room.polygon]]
-    return polygon_difference(room.polygon, [cover["polygon"] for cover in covers])
+    cutters = [cover["polygon"] for cover in covers] + [void.outline for void in own_voids]
+    return polygon_difference(room.polygon, cutters)
 
 
 def room_ceiling_contains(spec: "SceneSpec", room_id: str, point: Sequence[float]) -> bool:
     """True when ``point`` lies under a ceiling the room owns (replacement is not)."""
     return any(point_in_polygon(point, part) for part in room_ceiling_parts(spec, room_id))
+
+
+def _point_segment_distance(px: float, py: float, ax: float, ay: float,
+                            bx: float, by: float) -> float:
+    dx, dy = bx - ax, by - ay
+    length_sq = dx * dx + dy * dy
+    if length_sq < 1e-18:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length_sq))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def polygon_boundary_distance(point: Sequence[float],
+                              polygon: Sequence[Sequence[float]]) -> float:
+    """Shortest distance from ``point`` to the boundary of ``polygon``."""
+    return min(_point_segment_distance(float(point[0]), float(point[1]),
+                                       float(polygon[i][0]), float(polygon[i][1]),
+                                       float(polygon[(i + 1) % len(polygon)][0]),
+                                       float(polygon[(i + 1) % len(polygon)][1]))
+               for i in range(len(polygon)))
+
+
+def _void_upper_floors(spec: "SceneSpec", void: VoidSpec) -> List[FloorSpec]:
+    """Storeys a void punches through, bottom-up (every floor above its own)."""
+    lower = spec.floor(void.floor)
+    return [floor for floor in spec.floors if floor.elevation > lower.elevation + 1e-9]
+
+
+def _edge_walkable_runs(spec: "SceneSpec", floor_id: str, a: Sequence[float],
+                        b: Sequence[float], step: float) -> List[Tuple[float, float]]:
+    """Fractional runs ``(t0, t1)`` of one void edge with walkable floor outside.
+
+    The test point is offset outwards (right of a CCW edge) by
+    ``RAILING_FLOOR_OFFSET_M``: it has to be inside a room of ``floor_id``, clear
+    of the room boundary by at least half a wall thickness, and not over a slab
+    opening of that storey.  Contiguous samples are merged into runs; the
+    railing only spans floor that a person can actually stand on.
+    """
+    dx = float(b[0]) - float(a[0])
+    dy = float(b[1]) - float(a[1])
+    length = math.hypot(dx, dy)
+    if length < 1e-9:
+        return []
+    ux, uy = dx / length, dy / length
+    outward = (uy, -ux)
+    count = max(1, int(math.ceil(length / step)))
+    flags: List[bool] = []
+    for index in range(count + 1):
+        t = index / count
+        px = float(a[0]) + dx * t + outward[0] * RAILING_FLOOR_OFFSET_M
+        py = float(a[1]) + dy * t + outward[1] * RAILING_FLOOR_OFFSET_M
+        if spec.in_slab_opening(floor_id, (px, py)):
+            flags.append(False)
+            continue
+        ok = False
+        for room in spec.floor_rooms(floor_id):
+            if point_in_polygon((px, py), room.polygon) \
+                    and polygon_boundary_distance((px, py), room.polygon) \
+                    >= spec.wall_thickness / 2.0 + 0.01:
+                ok = True
+                break
+        flags.append(ok)
+    runs: List[Tuple[float, float]] = []
+    start: Optional[int] = None
+    for index, ok in enumerate(flags):
+        if ok and start is None:
+            start = index
+        elif not ok and start is not None:
+            runs.append((start / count, (index - 1) / count))
+            start = None
+    if start is not None:
+        runs.append((start / count, (count - 1) / count))
+    merged: List[Tuple[float, float]] = []
+    for t0, t1 in runs:
+        if t1 - t0 <= 1e-9:
+            continue
+        # extend half a sample to the void corner so neighbouring edges meet
+        lo = max(0.0, t0 - 0.5 / count)
+        hi = min(1.0, t1 + 0.5 / count)
+        if merged and lo <= merged[-1][1] + 1e-9:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def _railing_base_z(spec: "SceneSpec", floor_id: str, point: Sequence[float]) -> float:
+    """Walking surface the rail stands on: the upper room's own elevation."""
+    for room in spec.floor_rooms(floor_id):
+        if point_in_polygon(point, room.polygon):
+            return spec.room_elevation(room.id)
+    return float(spec.floor(floor_id).elevation)
+
+
+def void_railing_spans(spec: "SceneSpec") -> List[RailingSpan]:
+    """Every guard-rail span a declared void needs on the storeys above it.
+
+    One span per contiguous stretch of void edge that borders walkable floor;
+    edges against a wall, a stairwell or another opening produce none.  The rail
+    height starts on the walking surface of the upper room (its room elevation,
+    so a split-level gallery is handled too).
+    """
+    spans: List[RailingSpan] = []
+    if not spec.floors or not spec.voids:
+        return spans
+    for void_index, void in enumerate(spec.voids):
+        if not void.railing:
+            continue
+        upper_floors = _void_upper_floors(spec, void)
+        for floor in upper_floors:
+            outline = void.outline
+            for index in range(len(outline)):
+                a = outline[index]
+                b = outline[(index + 1) % len(outline)]
+                for t0, t1 in _edge_walkable_runs(spec, floor.id, a, b,
+                                                  RAILING_SAMPLE_STEP_M):
+                    p0 = (float(a[0]) + (float(b[0]) - float(a[0])) * t0,
+                          float(a[1]) + (float(b[1]) - float(a[1])) * t0)
+                    p1 = (float(a[0]) + (float(b[0]) - float(a[0])) * t1,
+                          float(a[1]) + (float(b[1]) - float(a[1])) * t1)
+                    if math.dist(p0, p1) < RAILING_MIN_SPAN_M:
+                        continue
+                    dx, dy = float(b[0]) - float(a[0]), float(b[1]) - float(a[1])
+                    length = math.hypot(dx, dy)
+                    outward = (dy / length, -dx / length)
+                    base_z = _railing_base_z(spec, floor.id,
+                                             (p0[0] + (p1[0] - p0[0]) * 0.5
+                                              + outward[0] * RAILING_FLOOR_OFFSET_M,
+                                              p0[1] + (p1[1] - p0[1]) * 0.5
+                                              + outward[1] * RAILING_FLOOR_OFFSET_M))
+                    spans.append(RailingSpan(
+                        floor=floor.id, void=void.name or f"void_{void_index}",
+                        p0=(round(p0[0], 6), round(p0[1], 6)),
+                        p1=(round(p1[0], 6), round(p1[1], 6)),
+                        z=base_z, height=RAILING_HEIGHT_M))
+    return spans
+
+
+def railing_boxes(spec: "SceneSpec") -> List[dict]:
+    """Solid boxes of every guard rail: top rail, mid rail and posts.
+
+    Each entry is ``{"name", "floor", "void", "role", "polygon", "z0", "z1"}``;
+    the shell builds them as prisms and ``checks`` measures furniture against the
+    same boxes, so the guard rail that is drawn is the one that is checked.
+    """
+    boxes: List[dict] = []
+    for span_index, span in enumerate(void_railing_spans(spec)):
+        length = span.length
+        if length < RAILING_MIN_SPAN_M:
+            continue
+        dx = span.p1[0] - span.p0[0]
+        dy = span.p1[1] - span.p0[1]
+        direction = (dx / length, dy / length)
+        center = (0.5 * (span.p0[0] + span.p1[0]), 0.5 * (span.p0[1] + span.p1[1]))
+        half = length / 2.0
+        top = span.z + span.height
+        thickness = RAILING_THICKNESS_M
+
+        def box(role: str, u0: float, u1: float, z0: float, z1: float,
+                across: float = thickness) -> dict:
+            polygon = _local_box(center, direction, u0, u1, -across / 2.0, across / 2.0)
+            return {"name": f"railing_{span.void}_{span_index:02d}_{role}",
+                    "floor": span.floor, "void": span.void, "role": role,
+                    "polygon": polygon, "z0": round(z0, 4), "z1": round(z1, 4)}
+
+        boxes.append(box("top", -half, half, top - 0.05, top))
+        boxes.append(box("mid", -half, half, span.z + RAILING_MID_HEIGHT_M - 0.02,
+                         span.z + RAILING_MID_HEIGHT_M + 0.02, across=0.03))
+        posts = max(2, int(math.ceil(length / RAILING_POST_MAX_GAP_M)) + 1)
+        for post in range(posts):
+            u = -half + length * post / (posts - 1)
+            boxes.append(box(f"post{post}", u - RAILING_POST_M / 2.0, u + RAILING_POST_M / 2.0,
+                             span.z, top, across=RAILING_POST_M))
+    return boxes
 
 
 # --------------------------------------------------------------------------- #
@@ -1506,6 +1813,13 @@ def parse_spec(data: dict, source_path: Optional[str] = None) -> SceneSpec:
         if room_height is not None:
             _require(floors, f"room '{room_id}' overrides 'height' -- only supported with 'floors'")
             room_height = float(room_height)
+        raw_level = raw_room.get("level")
+        room_level = 0.0
+        if raw_level is not None:
+            _require(floors, f"room '{room_id}' has a 'level' -- only supported with 'floors'")
+            room_level = float(raw_level)
+            _require(-1e-9 <= room_level <= ROOM_LEVEL_MAX_M + 1e-9,
+                     f"room '{room_id}' level {room_level} m must be in [0, {ROOM_LEVEL_MAX_M}]")
         raw_zones = raw_room.get("zones") or []
         _require(isinstance(raw_zones, list), f"room '{room_id}' zones must be a list")
         zones: List[RoomZoneSpec] = []
@@ -1534,7 +1848,7 @@ def parse_spec(data: dict, source_path: Optional[str] = None) -> SceneSpec:
         rooms.append(
             RoomSpec(id=room_id, type=str(raw_room.get("type", "room")), polygon=polygon,
                      floor_color=[float(c) for c in color], floor_id=room_floor_id,
-                     height=room_height, zones=zones, open_plan=open_plan)
+                     height=room_height, level=room_level, zones=zones, open_plan=open_plan)
         )
     ids = [room.id for room in rooms]
     _require(len(set(ids)) == len(ids), "room ids must be unique")
@@ -1561,6 +1875,9 @@ def parse_spec(data: dict, source_path: Optional[str] = None) -> SceneSpec:
             floors_of = {room_by_id[room_id].floor_id for room_id in between}
             _require(len(floors_of) == 1,
                      f"openings[{i}] joins rooms on different floors -- use a stair/ramp connector")
+            levels_of = {room_by_id[room_id].level for room_id in between}
+            _require(len(levels_of) == 1,
+                     f"openings[{i}] joins rooms on different split levels -- use a ramp/stair")
         headroom = max(_room_height(room_id) for room_id in between)
         width, height = float(raw["width"]), float(raw["height"])
         _require(width > 0.0 and height > 0.0, f"openings[{i}] needs positive width/height")
@@ -1672,18 +1989,25 @@ def parse_spec(data: dict, source_path: Optional[str] = None) -> SceneSpec:
             if kind in DOOR_LIKE_KINDS:
                 _require(from_floor == to_floor,
                          f"{label}: a {kind} joins rooms on different floors -- use stair/ramp")
+                _require(abs(room_by_id[to_room].level - room_by_id[from_room].level) <= 1e-6,
+                         f"{label}: '{from_room}' and '{to_room}' are on different split levels -- "
+                         f"use a ramp/stair")
             else:
-                _require(floor_by_id[to_floor].elevation > floor_by_id[from_floor].elevation,
-                         f"{label}: '{to_floor}' is not above '{from_floor}' (from = lower storey)")
+                _require(floor_by_id[to_floor].elevation + room_by_id[to_room].level
+                         > floor_by_id[from_floor].elevation + room_by_id[from_room].level + 1e-9,
+                         f"{label}: '{to_room}' is not above '{from_room}' (from = lower room)")
             width = float(raw["width"]) if raw.get("width") is not None else (
                 0.9 if kind in DOOR_LIKE_KINDS else 0.9)
             _require(width > 0.1, f"{label}.width must be > 0.1 m")
+            from_room_height = room_by_id[from_room].height
+            if from_room_height is None:
+                from_room_height = floor_by_id[from_floor].height
             height = float(raw["height"]) if raw.get("height") is not None else (
-                min(DEFAULT_DOOR_HEIGHT_M, floor_by_id[from_floor].height - 0.10)
+                min(DEFAULT_DOOR_HEIGHT_M, from_room_height - 0.10)
                 if kind in DOOR_LIKE_KINDS else None)
             if height is not None:
-                _require(height > 0.5 and height <= floor_by_id[from_floor].height + _EPS,
-                         f"{label}.height must be in (0.5, storey height]")
+                _require(height > 0.5 and height <= from_room_height + _EPS,
+                         f"{label}.height must be in (0.5, room height]")
             center = None
             if raw.get("center") is not None:
                 center = _vec2(raw["center"], f"{label}.center")
@@ -1730,6 +2054,39 @@ def parse_spec(data: dict, source_path: Optional[str] = None) -> SceneSpec:
                          f"slab_openings[{i}] references unknown floor '{floor_id}'")
             slab_openings.append(SlabOpeningSpec(outline=outline, floors=floor_list))
 
+    voids: List[VoidSpec] = []
+    raw_voids = data.get("voids", data.get("void"))
+    if raw_voids is not None:
+        _require(floors, "voids need a multi-floor spec ('floors' and schema_version 2)")
+        _require(isinstance(raw_voids, list), "'voids' must be a list")
+        for i, raw in enumerate(raw_voids):
+            label = f"voids[{i}]"
+            floor_id = str(raw["floor"])
+            _require(floor_id in floor_id_set, f"{label}.floor '{floor_id}' is unknown")
+            outline = [_vec2(p, f"{label}.outline vertex") for p in raw["outline"]]
+            _require(len(outline) >= 3, f"{label}.outline needs at least 3 vertices")
+            _require(polygon_area(outline) > 0.0,
+                     f"{label}.outline must be counter-clockwise with positive area")
+            area = abs(polygon_area(outline))
+            lower = floor_by_id[floor_id]
+            _require(any(floor.elevation > lower.elevation + 1e-9 for floor in floors),
+                     f"{label} on floor '{floor_id}' has no storey above it -- a void needs one")
+            containing = [
+                room for room in rooms
+                if room.floor_id == floor_id
+                and polygon_overlap_area(room.polygon, outline) >= area - 1e-6
+            ]
+            _require(len(containing) == 1,
+                     f"{label}.outline must lie inside exactly one room of floor '{floor_id}' "
+                     f"(found {len(containing)})")
+            voids.append(VoidSpec(floor=floor_id, outline=outline,
+                                  railing=bool(raw.get("railing", True)),
+                                  name=(str(raw["name"]) if raw.get("name") else None)))
+        for i in range(len(voids)):
+            for j in range(i + 1, len(voids)):
+                _require(polygon_overlap_area(voids[i].outline, voids[j].outline) <= 1e-6,
+                         f"voids {i} and {j} overlap")
+
     raw_front3d = data.get("front3d") or {}
     _require(isinstance(raw_front3d, dict), "the 'front3d' block must be an object")
     if raw_front3d:
@@ -1743,7 +2100,7 @@ def parse_spec(data: dict, source_path: Optional[str] = None) -> SceneSpec:
                      style=style, furniture=furniture, materials=materials, details=details,
                      lighting=lighting, front3d=raw_front3d, source_path=source_path, raw=data,
                      schema_version=schema_version, floors=floors, connectors=connectors,
-                     slab_openings=slab_openings)
+                     slab_openings=slab_openings, voids=voids)
     validate_spec(spec)
     return spec
 
@@ -1789,28 +2146,30 @@ def validate_spec(spec: SceneSpec) -> None:
                     _require(area <= 1e-6,
                              f"rooms '{floor_rooms[i].id}' and '{floor_rooms[j].id}' overlap on floor "
                              f"'{floor.id}' ({area:.3f} m^2)")
-        # the slab rule: an upper storey slab may not reach below a lower room's
+        # the slab rule: an upper room slab may not reach below a lower room's
         # ceiling plane; when it is exactly the ceiling plane it *is* the ceiling
         for lower in spec.rooms:
             low_floor = spec.room_floor(lower.id)
+            low_elevation = spec.room_elevation(lower.id)
             for upper in spec.rooms:
                 up_floor = spec.room_floor(upper.id)
-                if up_floor.elevation <= low_floor.elevation + 1e-9:
+                up_elevation = spec.room_elevation(upper.id)
+                if up_elevation <= low_elevation + 1e-9:
                     continue
                 if not polygons_overlap(lower.polygon, upper.polygon):
                     continue
-                ceiling = low_floor.elevation + spec.room_height(lower.id)
-                slab_bottom = up_floor.elevation - up_floor.slab_thickness
+                ceiling = spec.room_top(lower.id)
+                slab_bottom = up_elevation - up_floor.slab_thickness
                 _require(slab_bottom >= ceiling - 1e-6,
-                         f"floor '{up_floor.id}' slab (bottom {slab_bottom:.3f} m) overlaps room "
+                         f"room '{upper.id}' slab (bottom {slab_bottom:.3f} m) overlaps room "
                          f"'{lower.id}' (ceiling {ceiling:.3f} m) -- upper slab and lower ceiling "
                          f"must not overlap")
                 if slab_bottom > ceiling + 1e-6:
                     # a gap: the lower room needs its own ceiling slab, which must
                     # not run into the upper floor slab either
                     _require(ceiling + low_floor.slab_thickness <= slab_bottom + 1e-6,
-                             f"room '{lower.id}' ceiling slab would overlap the slab of floor "
-                             f"'{up_floor.id}'")
+                             f"room '{lower.id}' ceiling slab would overlap the slab of room "
+                             f"'{upper.id}'")
 
     # -- doors / open passages (every connector, legacy openings included) --- #
     for i, connector in enumerate(spec.door_connections()):
@@ -1901,13 +2260,21 @@ def validate_spec(spec: SceneSpec) -> None:
     for plan in spec.stair_plans():
         connector = plan.connector
         label = f"connector[{connector.index}] (stair {connector.from_room}->{connector.to_room})"
-        _require(all(point_in_polygon(corner, spec.room(connector.from_room).polygon)
-                     for corner in plan.footprint),
-                 f"{label}: the stair footprint leaves room '{connector.from_room}' -- give a "
-                 f"'center' that keeps it inside the lower room")
-        _require(all(point_in_polygon(corner, spec.room(connector.to_room).polygon)
-                     for corner in plan.footprint),
-                 f"{label}: the stair footprint leaves room '{connector.to_room}' on the upper floor")
+        if connector.from_floor == connector.to_floor:
+            _require(all(any(point_in_polygon(corner, spec.room(room_id).polygon)
+                             for room_id in (connector.from_room, connector.to_room))
+                         for corner in plan.footprint),
+                     f"{label}: the split-level stair footprint leaves both rooms")
+            _require(plan.rise_total > 1e-6,
+                     f"{label}: a same-floor stair needs two room levels that differ")
+        else:
+            _require(all(point_in_polygon(corner, spec.room(connector.from_room).polygon)
+                         for corner in plan.footprint),
+                     f"{label}: the stair footprint leaves room '{connector.from_room}' -- give a "
+                     f"'center' that keeps it inside the lower room")
+            _require(all(point_in_polygon(corner, spec.room(connector.to_room).polygon)
+                         for corner in plan.footprint),
+                     f"{label}: the stair footprint leaves room '{connector.to_room}' on the upper floor")
         _require(plan.riser_m <= STAIR_RISER_MAX_M + 1e-9,
                  f"{label}: riser {plan.riser_m:.3f} m exceeds {STAIR_RISER_MAX_M} m")
         _require(plan.tread_m >= STAIR_TREAD_MIN_M - 1e-9,
@@ -1918,13 +2285,16 @@ def validate_spec(spec: SceneSpec) -> None:
         if plan.switchback:
             _require(plan.landing_m >= STAIR_LANDING_MIN_M - 1e-9,
                      f"{label}: landing {plan.landing_m:.3f} m below {STAIR_LANDING_MIN_M} m")
-        for opening in spec.slab_openings_for(connector.to_floor):
-            if point_in_polygon(plan.center, opening.outline):
-                break
-        else:
-            _require(False,
-                     f"{label}: no slab opening on floor '{connector.to_floor}' covers the stair "
-                     f"centre {plan.center} -- the stair would run into the slab")
+        if connector.from_floor != connector.to_floor:
+            for opening in spec.slab_openings_for(connector.to_floor):
+                if point_in_polygon(plan.center, opening.outline):
+                    break
+            else:
+                _require(False,
+                         f"{label}: no slab opening on floor '{connector.to_floor}' covers the stair "
+                         f"centre {plan.center} -- the stair would run into the slab")
+        _require(plan.rise_total > 1e-6,
+                 f"{label}: the stair has no height difference to climb")
     for plan in spec.ramp_plans():
         connector = plan.connector
         label = f"connector[{connector.index}] (ramp {connector.from_room}->{connector.to_room})"
@@ -1932,6 +2302,35 @@ def validate_spec(spec: SceneSpec) -> None:
                  f"{label}: ramp width {plan.width:.3f} m below {RAMP_WIDTH_MIN_M} m")
         _require(plan.slope <= RAMP_SLOPE_MAX + 1e-9,
                  f"{label}: slope {plan.slope * 100:.1f}% exceeds {RAMP_SLOPE_MAX * 100:.1f}%")
+        _require(plan.rise_total > 1e-6,
+                 f"{label}: the ramp has no height difference to climb")
+        if connector.from_floor == connector.to_floor:
+            # a split-level ramp stays in the lower room and steps off at the
+            # raised floor; its head point must be inside the upper room
+            _require(point_in_polygon(plan.head_point, spec.room(connector.to_room).polygon),
+                     f"{label}: the ramp head {plan.head_point} does not reach room "
+                     f"'{connector.to_room}'")
+            _require(point_in_polygon(plan.base_point, spec.room(connector.from_room).polygon),
+                     f"{label}: the ramp base {plan.base_point} is outside room "
+                     f"'{connector.from_room}'")
+
+    # -- voids: every declared void must really open a storey above it ------- #
+    for index, void in enumerate(spec.voids):
+        label = f"voids[{index}]"
+        _require(bool(spec.floors), f"{label}: voids need a multi-floor spec")
+        upper = [floor for floor in spec.floors
+                 if floor.elevation > spec.floor(void.floor).elevation + 1e-9]
+        _require(bool(upper), f"{label}: no storey above floor '{void.floor}'")
+        if void.railing:
+            spans = [span for span in void_railing_spans(spec) if span.void == (void.name or f"void_{index}")]
+            above = spec.floor(upper[0].id)
+            covered = any(
+                polygons_overlap(room.polygon, void.outline)
+                for room in spec.floor_rooms(above.id)
+            )
+            _require(bool(spans) or not covered,
+                     f"{label}: railing=true but no void edge borders walkable floor of "
+                     f"'{above.id}'")
 
 
 def dump_manifest_spec(spec: SceneSpec) -> dict:
@@ -1950,6 +2349,7 @@ def dump_manifest_spec(spec: SceneSpec) -> dict:
         "rooms": [
             {**{"id": r.id, "type": r.type, "polygon": r.polygon,
                 "floor_color": r.floor_color, "floor_id": r.floor_id, "height": r.height},
+             **({"level": r.level} if r.level else {}),
              **({"open_plan": True} if r.open_plan else {}),
              **({"zones": [{"type": z.type, "polygon": z.polygon, "name": z.name}
                            for z in r.zones]} if r.zones else {})}
@@ -1964,6 +2364,10 @@ def dump_manifest_spec(spec: SceneSpec) -> dict:
         ],
         "slab_openings": [
             {"outline": o.outline, "floors": o.floors} for o in spec.slab_openings
+        ],
+        "voids": [
+            {"floor": v.floor, "outline": v.outline, "railing": v.railing, "name": v.name}
+            for v in spec.voids
         ],
         "openings": [
             {"kind": o.kind, "between": o.between, "center": o.center, "width": o.width, "height": o.height}

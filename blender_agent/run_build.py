@@ -582,7 +582,9 @@ def main(argv) -> int:
         print(
             f"[run_build] shell: {len(shell_info['floors'])} floor slabs, {len(shell_info['ceilings'])} ceilings, "
             f"{len(shell_info['walls'])} walls, {len(shell_info.get('stairs', []))} stair steps, "
-            f"{len(shell_info.get('slab_openings', []))} slab openings, cutters applied: "
+            f"{len(shell_info.get('ramps', []))} ramps, {len(shell_info.get('railings', []))} railing pieces, "
+            f"{len(shell_info.get('slab_openings', []))} slab openings, "
+            f"{len(shell_info.get('voids', []))} void cuts, cutters applied: "
             f"{shell_info['cutters_applied']}"
         )
         if spec.floors:
@@ -746,6 +748,8 @@ def main(argv) -> int:
             "storeys": shell_info.get("storeys", []),
             "ceiling_from_upper": shell_info.get("ceiling_from_upper", []),
             "slab_openings": shell_info.get("slab_openings", []),
+            "voids": shell_info.get("voids", []),
+            "railings": [obj.name for obj in shell_info.get("railings", [])],
             "stairs": [obj.name for obj in shell_info.get("stairs", [])],
             "ramps": [obj.name for obj in shell_info.get("ramps", [])],
             "dome_radius": dome_radius,
@@ -766,6 +770,10 @@ def main(argv) -> int:
             ],
             "slab_openings": [{"outline": opening.outline, "floors": opening.floors}
                               for opening in spec.slab_openings],
+            "voids": [{"floor": void.floor, "outline": void.outline,
+                       "railing": void.railing, "name": void.name}
+                      for void in spec.voids],
+            "room_levels": {room.id: spec.room_elevation(room.id) for room in spec.rooms},
         },
         "visible_geometry": {
             "ply": os.path.basename(furnished_ply),

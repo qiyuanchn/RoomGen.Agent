@@ -1,0 +1,387 @@
+{
+  "_comment": [
+    "Hand-written double-height living room (schema_version 2).",
+    "The f0 living room (8 x 6 m) is open through the f1 slab inside a 3 x 3 m",
+    "declared void; the f1 gallery has the same outline and rings the void, the",
+    "straight stair lands on the gallery, and a guard rail runs along every void",
+    "edge that borders gallery floor.  The upper storey has a different partition",
+    "(gallery + one bedroom) from the lower floor (living + entry + kitchen), so",
+    "the two plans do not share an interior layout.",
+    "See tests/test_multifloor.py::DoubleHeightTest."
+  ],
+  "schema_version": 2,
+  "unit": "meter",
+  "wall_height": 2.7,
+  "wall_thickness": 0.12,
+  "floors": [
+    {
+      "id": "f0",
+      "elevation": 0.0,
+      "height": 2.7,
+      "slab_thickness": 0.05
+    },
+    {
+      "id": "f1",
+      "elevation": 2.85,
+      "height": 2.7,
+      "slab_thickness": 0.15
+    }
+  ],
+  "rooms": [
+    {
+      "id": "living",
+      "type": "living_room",
+      "floor_id": "f0",
+      "floor_color": [
+        0.55,
+        0.38,
+        0.22
+      ],
+      "polygon": [
+        [
+          0,
+          0
+        ],
+        [
+          8.0,
+          0
+        ],
+        [
+          8.0,
+          6.0
+        ],
+        [
+          0,
+          6.0
+        ]
+      ]
+    },
+    {
+      "id": "entry",
+      "type": "entry",
+      "floor_id": "f0",
+      "floor_color": [
+        0.66,
+        0.63,
+        0.58
+      ],
+      "polygon": [
+        [
+          8.0,
+          0
+        ],
+        [
+          10.0,
+          0
+        ],
+        [
+          10.0,
+          3.0
+        ],
+        [
+          8.0,
+          3.0
+        ]
+      ]
+    },
+    {
+      "id": "kitchen",
+      "type": "kitchen",
+      "floor_id": "f0",
+      "floor_color": [
+        0.62,
+        0.61,
+        0.58
+      ],
+      "polygon": [
+        [
+          8.0,
+          3.0
+        ],
+        [
+          10.0,
+          3.0
+        ],
+        [
+          10.0,
+          6.0
+        ],
+        [
+          8.0,
+          6.0
+        ]
+      ]
+    },
+    {
+      "id": "gallery",
+      "type": "corridor",
+      "floor_id": "f1",
+      "floor_color": [
+        0.52,
+        0.47,
+        0.4
+      ],
+      "polygon": [
+        [
+          0,
+          0
+        ],
+        [
+          8.0,
+          0
+        ],
+        [
+          8.0,
+          6.0
+        ],
+        [
+          0,
+          6.0
+        ]
+      ]
+    },
+    {
+      "id": "bedroom",
+      "type": "bedroom",
+      "floor_id": "f1",
+      "floor_color": [
+        0.6,
+        0.5,
+        0.4
+      ],
+      "polygon": [
+        [
+          8.0,
+          0
+        ],
+        [
+          10.0,
+          0
+        ],
+        [
+          10.0,
+          6.0
+        ],
+        [
+          8.0,
+          6.0
+        ]
+      ]
+    }
+  ],
+  "connectors": [
+    {
+      "kind": "stair",
+      "from_room": "living",
+      "to_room": "gallery",
+      "from_floor": "f0",
+      "to_floor": "f1",
+      "width": 0.9,
+      "run": 3.84,
+      "rise": 2.85,
+      "steps": 16,
+      "landing_m": 0.0,
+      "center": [
+        2.2,
+        4.5
+      ],
+      "direction_deg": 0.0
+    }
+  ],
+  "openings": [
+    {
+      "kind": "door",
+      "between": [
+        "living",
+        "entry"
+      ],
+      "center": [
+        8.0,
+        1.5
+      ],
+      "width": 0.9,
+      "height": 2.05
+    },
+    {
+      "kind": "door",
+      "between": [
+        "living",
+        "kitchen"
+      ],
+      "center": [
+        8.0,
+        4.5
+      ],
+      "width": 0.9,
+      "height": 2.05
+    },
+    {
+      "kind": "door",
+      "between": [
+        "gallery",
+        "bedroom"
+      ],
+      "center": [
+        8.0,
+        3.0
+      ],
+      "width": 0.9,
+      "height": 2.05
+    }
+  ],
+  "slab_openings": [
+    {
+      "outline": [
+        [
+          0.26,
+          4.03
+        ],
+        [
+          4.14,
+          4.03
+        ],
+        [
+          4.14,
+          4.97
+        ],
+        [
+          0.26,
+          4.97
+        ]
+      ],
+      "floors": [
+        "f1"
+      ]
+    }
+  ],
+  "voids": [
+    {
+      "floor": "f0",
+      "outline": [
+        [
+          3.0,
+          1.0
+        ],
+        [
+          6.0,
+          1.0
+        ],
+        [
+          6.0,
+          4.0
+        ],
+        [
+          3.0,
+          4.0
+        ]
+      ],
+      "railing": true,
+      "name": "living_void"
+    }
+  ],
+  "cameras": [
+    {
+      "name": "0000",
+      "room": "living",
+      "pos": [
+        1.0,
+        1.0,
+        1.5
+      ]
+    },
+    {
+      "name": "0001",
+      "room": "entry",
+      "pos": [
+        9.0,
+        1.5,
+        1.5
+      ]
+    },
+    {
+      "name": "0002",
+      "room": "kitchen",
+      "pos": [
+        9.0,
+        4.5,
+        1.5
+      ]
+    },
+    {
+      "name": "0100",
+      "room": "gallery",
+      "pos": [
+        7.0,
+        4.8,
+        4.35
+      ]
+    },
+    {
+      "name": "0101",
+      "room": "bedroom",
+      "pos": [
+        9.0,
+        1.5,
+        4.35
+      ]
+    }
+  ],
+  "furniture": [
+    {
+      "asset": "builtin:storage_shelf",
+      "room": "living",
+      "pos": [
+        0.3,
+        3.0
+      ],
+      "rot_z_deg": 90,
+      "name": "living_shelf"
+    },
+    {
+      "asset": "builtin:rug",
+      "room": "living",
+      "pos": [
+        6.5,
+        4.8
+      ],
+      "rot_z_deg": 0,
+      "name": "living_rug",
+      "size": [
+        2.4,
+        1.6
+      ]
+    },
+    {
+      "asset": "builtin:storage_shelf",
+      "room": "gallery",
+      "pos": [
+        7.5,
+        1.0
+      ],
+      "rot_z_deg": 0,
+      "name": "gallery_shelf"
+    },
+    {
+      "asset": "builtin:wardrobe",
+      "room": "bedroom",
+      "pos": [
+        9.3,
+        0.5
+      ],
+      "rot_z_deg": 180,
+      "name": "bedroom_wardrobe"
+    }
+  ],
+  "style": {
+    "sun_elevation_deg": 35,
+    "sun_azimuth_deg": 210,
+    "sky_strength": 1.0,
+    "sun_energy": 3.0,
+    "view_transform": "Standard",
+    "exposure": 0.0
+  },
+  "lighting": {
+    "lamp_w": 12.0,
+    "lamp_radius": 0.08
+  }
+}

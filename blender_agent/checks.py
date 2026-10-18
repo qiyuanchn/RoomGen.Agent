@@ -63,6 +63,16 @@ contract shared with the generator:
   replaces it (same plane *and* covering the area); the rest keeps its own
   ceiling slab, and ``slab_openings`` stay open as declared voids.  Every
   obstruction test (headroom, walk track) uses the same per-area rule.
+* a declared **void** (``voids``) is a ``slab_opening`` of every storey above
+  plus a lower-room ceiling cut: no floor of an upper storey may remain in it,
+  the lower floor under it is real, no camera or blocking furniture may stand in
+  it on an upper storey, and a guard rail (top rail, mid rail, posts) is built on
+  every void edge that borders walkable upper floor.  ``railing_clear`` measures
+  every rail box against the furniture of its own storey.
+* split-level rooms (``rooms[].level``) use their own walking surface for
+  support, containment, camera stands and furniture world z; a same-storey
+  ``ramp`` may join two different levels, and every rule above follows the room
+  elevation instead of the storey elevation.
 * an item has to fit under the body that is really above it -- the 3D
   containment rule (``furniture_containment``).  Its footprint is sampled and
   measured against the *lowest* slab underside / owned ceiling over those
@@ -523,7 +533,7 @@ def door_zones(spec: "spec_mod.SceneSpec", wall_thickness: float) -> List[DoorZo
                               width=float(connector.width),
                               height=float(connector.height or spec_mod.DEFAULT_DOOR_HEIGHT_M),
                               direction=(ux, uy), rects=rects,
-                              floor_id=floor.id, floor_z=float(floor.elevation)))
+                              floor_id=floor.id, floor_z=float(spec.room_elevation(connector.from_room))))
     return zones
 
 
@@ -579,16 +589,16 @@ def overhead_faces(spec: "spec_mod.SceneSpec", point: Sequence[float],
     for floor in storeys:
         rooms = spec.floor_rooms(floor.id) if spec.floors else list(spec.rooms)
         name = floor.id if spec.floors else "f0"
-        openings = spec.slab_openings_for(floor.id) if spec.floors else []
-        opened = any(point_in_polygon(point, opening.outline) for opening in openings)
         for room in rooms:
             if not point_in_polygon(point, room.polygon):
                 continue
+            elevation = spec.room_elevation(room.id)
+            opened = spec.in_slab_opening(floor.id, point) if spec.floors else False
             if not opened:
-                out.append(OverheadFace(bottom=floor.elevation - floor.slab_thickness, kind="slab",
+                out.append(OverheadFace(bottom=elevation - floor.slab_thickness, kind="slab",
                                         floor=name, room=room.id,
                                         label=f"slab of floor '{name}'"))
-            ceiling = floor.elevation + spec.room_height(room.id)
+            ceiling = spec.room_top(room.id)
             if any(point_in_polygon(point, part) for part in parts.get(room.id, ())):
                 out.append(OverheadFace(bottom=ceiling, kind="ceiling", floor=name, room=room.id,
                                         label=f"ceiling of room '{room.id}'"))
@@ -642,6 +652,7 @@ def containment_report(spec: "spec_mod.SceneSpec", boxes: Sequence[ItemBox],
         base, top = float(box.z[0]), float(box.z[1])
         floor = spec.room_floor(box.room)
         floor_name = floor.id if spec.floors else "f0"
+        floor_elev = spec.room_elevation(box.room)
         samples = footprint_samples(box.aabb)
         lowest: Optional[OverheadFace] = None
         opened = 0
@@ -655,7 +666,7 @@ def containment_report(spec: "spec_mod.SceneSpec", boxes: Sequence[ItemBox],
             for face in overhead_faces(spec, point, parts):
                 # a face at or below the item's own floor plane belongs to the sink
                 # rule below, not to "pokes through the ceiling above"
-                if face.bottom < max(base, floor.elevation) - CEILING_TOUCH_TOL_M:
+                if face.bottom < max(base, floor_elev) - CEILING_TOUCH_TOL_M:
                     continue
                 if lowest is None or face.bottom < lowest.bottom - 1e-9:
                     lowest = face
@@ -673,13 +684,13 @@ def containment_report(spec: "spec_mod.SceneSpec", boxes: Sequence[ItemBox],
         }
         items.append(entry)
 
-        if base < floor.elevation - SLAB_SINK_TOL_M and \
+        if base < floor_elev - SLAB_SINK_TOL_M and \
                 box.placement != FLOOR_FLAT and top - base > FLAT_FINISH_MAX_M:
             # a floor finish (a rug, a sheet) lies *on* the slab and settle pushes
             # it into the floor plane by design; a body may not sink into it
             violations.append(
                 f"{box.name} ({box.room}): base at {base:.3f} m sinks "
-                f"{floor.elevation - base:.3f} m into the slab of floor '{floor_name}'"
+                f"{floor_elev - base:.3f} m into the slab of floor '{floor_name}'"
             )
         if lowest is None:
             if box.ceiling_mounted:
@@ -706,7 +717,7 @@ def containment_report(spec: "spec_mod.SceneSpec", boxes: Sequence[ItemBox],
                     f"(max {CEILING_HUG_MAX_M} m below it)"
                 )
         elif entry["over_opening_share"] >= CONTAINMENT_VOID_SHARE \
-                and abs(base - floor.elevation) <= SLAB_SINK_TOL_M + 1e-9:
+                and abs(base - floor_elev) <= SLAB_SINK_TOL_M + 1e-9:
             violations.append(
                 f"{box.name} ({box.room}): stands on the floor but "
                 f"{entry['over_opening_share'] * 100:.0f}% of its footprint is over a slab opening "
@@ -745,7 +756,7 @@ def _item_box(entry: dict, spec: Optional["spec_mod.SceneSpec"] = None,
     floor_id = ""
     if spec is not None and room in {item.id for item in spec.rooms}:
         floor = spec.room_floor(room)
-        floor_z, floor_id = float(floor.elevation), floor.id
+        floor_z, floor_id = float(spec.room_elevation(room)), floor.id
     asset = str(entry.get("asset") or "")
     scale = float(entry.get("scale") or 1.0)
     scheme, _, asset_id = asset.partition(":")
@@ -1417,6 +1428,131 @@ def check_spec(spec: "spec_mod.SceneSpec", assets_index: Optional[Dict[str, dict
            slab_sink_tol_m=SLAB_SINK_TOL_M)
     violations.extend(containment["violations"])
 
+    # -- declared voids: open through every storey above, never a floor ------ #
+    void_problems: List[str] = []
+    void_reports: List[dict] = []
+    for index, void in enumerate(spec.voids):
+        label = f"voids[{index}]" + (f" ('{void.name}')" if void.name else "")
+        lower_floor = spec.floor(void.floor)
+        xs = [float(p[0]) for p in void.outline]
+        ys = [float(p[1]) for p in void.outline]
+        x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+        probes = [(x0 + (x1 - x0) * i / 4.0, y0 + (y1 - y0) * j / 4.0)
+                  for i in range(5) for j in range(5)
+                  if spec_mod.point_in_polygon((x0 + (x1 - x0) * i / 4.0,
+                                                y0 + (y1 - y0) * j / 4.0), void.outline)]
+        if not probes:
+            probes = [(0.5 * (x0 + x1), 0.5 * (y0 + y1))]
+        upper_floors = [floor for floor in spec.floors
+                        if floor.elevation > lower_floor.elevation + 1e-9]
+        upper_floor_surfaces = 0
+        lower_floor_surfaces = 0
+        for floor in spec.floors:
+            for point in probes:
+                kinds = {surface.kind for surface in spec.support_surfaces(point, floor.id)}
+                if floor.id == lower_floor.id:
+                    if "floor" in kinds:
+                        lower_floor_surfaces += 1
+                    for room in spec.floor_rooms(floor.id):
+                        if spec_mod.point_in_polygon(point, room.polygon) \
+                                and spec.ceiling_above(room.id, point):
+                            void_problems.append(
+                                f"{label}: room '{room.id}' still has a ceiling over the void "
+                                f"at ({point[0]:.2f}, {point[1]:.2f})")
+                elif "floor" in kinds:
+                    upper_floor_surfaces += 1
+                    void_problems.append(
+                        f"{label}: floor of '{floor.id}' is still there at "
+                        f"({point[0]:.2f}, {point[1]:.2f})")
+                elif kinds & {"step", "landing", "ramp"}:
+                    upper_floor_surfaces += 1
+                    void_problems.append(
+                        f"{label}: a stair/ramp surface of '{floor.id}' stands in the void at "
+                        f"({point[0]:.2f}, {point[1]:.2f})")
+        if lower_floor_surfaces == 0:
+            void_problems.append(f"{label}: the lower floor of '{lower_floor.id}' has no floor "
+                                 f"under the void")
+        covered_upper = [floor for floor in upper_floors
+                         if any(spec_mod.point_in_polygon(point, room.polygon)
+                                for point in probes for room in spec.floor_rooms(floor.id))]
+        for floor in covered_upper:
+            for point in probes:
+                if any(spec_mod.point_in_polygon(point, room.polygon)
+                       for room in spec.floor_rooms(floor.id)) \
+                        and not spec.void_cuts(floor.id, point):
+                    void_problems.append(
+                        f"{label}: no void cut through the slab of '{floor.id}' at "
+                        f"({point[0]:.2f}, {point[1]:.2f})")
+        # cameras may not stand in a void of their own storey
+        for cam in spec.cameras:
+            cam_floor = spec.room_floor(cam.room)
+            if cam_floor.elevation <= lower_floor.elevation + 1e-9:
+                continue
+            if spec_mod.point_in_polygon(cam.pos, void.outline):
+                void_problems.append(
+                    f"{label}: camera '{cam.name}' stands inside the void "
+                    f"({cam.pos[0]:.2f}, {cam.pos[1]:.2f})")
+        # no blocking furniture may stand over the void on an upper floor
+        for box in boxes:
+            if not box.blocks_walking:
+                continue
+            box_floor = spec.room_floor(box.room)
+            if box_floor.elevation <= lower_floor.elevation + 1e-9:
+                continue
+            if box.z[0] < box_floor.elevation - 1e-9:
+                continue
+            if spec_mod.polygons_overlap(
+                    [[box.aabb[0], box.aabb[1]], [box.aabb[2], box.aabb[1]],
+                     [box.aabb[2], box.aabb[3]], [box.aabb[0], box.aabb[3]]], void.outline):
+                void_problems.append(
+                    f"{label}: furniture '{box.name}' stands over the void on floor "
+                    f"'{box_floor.id}'")
+        void_reports.append({
+            "name": void.name or f"void_{index}", "floor": void.floor,
+            "outline": [[round(float(p[0]), 3), round(float(p[1]), 3)] for p in void.outline],
+            "railing": bool(void.railing), "probes": len(probes),
+            "lower_floor_probes": lower_floor_surfaces,
+            "upper_floor_probes": upper_floor_surfaces,
+        })
+    record("voids_open", not void_problems, voids=void_reports, violations=void_problems)
+    violations.extend(void_problems)
+
+    # -- guard rails: present where built, and never through a piece --------- #
+    rail_boxes = spec.railing_boxes()
+    rail_spans = spec.railing_spans()
+    rail_problems: List[str] = []
+    for span in rail_spans:
+        if span.length < spec_mod.RAILING_MIN_SPAN_M - 1e-9:
+            rail_problems.append(f"railing of '{span.void}' has a degenerate span on '{span.floor}'")
+        for room in spec.floor_rooms(span.floor):
+            if spec_mod.point_in_polygon(span.p0, room.polygon) and \
+                    spec_mod.point_in_polygon(span.p1, room.polygon):
+                break
+        else:
+            rail_problems.append(
+                f"railing of '{span.void}' at ({span.p0[0]:.2f}, {span.p0[1]:.2f}) "
+                f"is outside the rooms of floor '{span.floor}'")
+    rail_aabbs = []
+    for entry in rail_boxes:
+        xs = [float(p[0]) for p in entry["polygon"]]
+        ys = [float(p[1]) for p in entry["polygon"]]
+        rail_aabbs.append((entry, (min(xs), min(ys), float(entry["z0"]),
+                                   max(xs), max(ys), float(entry["z1"]))))
+    for entry, aabb in rail_aabbs:
+        for box in boxes:
+            if box.floor_id != entry["floor"]:
+                continue
+            if aabb[3] <= box.aabb[0] + 1e-9 or aabb[0] >= box.aabb[2] - 1e-9 \
+                    or aabb[4] <= box.aabb[1] + 1e-9 or aabb[1] >= box.aabb[3] - 1e-9 \
+                    or aabb[5] <= box.z[0] + 1e-9 or aabb[2] >= box.z[1] - 1e-9:
+                continue
+            rail_problems.append(
+                f"railing '{entry['name']}' ({entry['role']}) cuts through furniture "
+                f"'{box.name}' ({box.room})")
+    record("railing_clear", not rail_problems, spans=len(rail_spans), boxes=len(rail_boxes),
+           violations=rail_problems)
+    violations.extend(rail_problems)
+
     # -- doors ------------------------------------------------------------- #
     zones = door_zones(spec, spec.wall_thickness)
     door_blocks: List[str] = []
@@ -1759,6 +1895,8 @@ def circulation_report(spec: "spec_mod.SceneSpec", boxes: Sequence[ItemBox], zon
         # a stand above the stairwell is no longer read as a cell of this storey
         if spec.floors:
             holes = [opening.outline for opening in spec.slab_openings_for(floor.id)]
+            holes += [void.outline for void in spec.voids
+                      if spec.floor(void.floor).elevation < floor.elevation - 1e-9]
             holes += [plan.footprint for plan in spec.stair_plans() + spec.ramp_plans()
                       if floor.id in (plan.connector.from_floor, plan.connector.to_floor)]
             for polygon in holes:
@@ -1994,13 +2132,13 @@ def _obstruction_bottoms(spec: "spec_mod.SceneSpec", point: Sequence[float],
         for room in spec.floor_rooms(floor.id):
             if not point_in_polygon(point, room.polygon):
                 continue
-            ceiling = floor.elevation + spec.room_height(room.id)
-            slab_bottom = floor.elevation - floor.slab_thickness
+            elevation = spec.room_elevation(room.id)
+            ceiling = spec.room_top(room.id)
+            slab_bottom = elevation - floor.slab_thickness
             # the storey's slab is in the way as soon as its top surface is at or
             # above the point (a point *inside* the slab reports a negative clearance)
-            if floor.elevation >= z - 1e-9:
-                if not any(point_in_polygon(point, opening.outline)
-                           for opening in spec.slab_openings_for(floor.id)):
+            if elevation >= z - 1e-9:
+                if not spec.in_slab_opening(floor.id, point):
                     out.append((slab_bottom, f"slab of floor '{floor.id}'"))
             if ceiling >= z - 1e-9 and spec.ceiling_above(room.id, point):
                 out.append((ceiling, f"ceiling of room '{room.id}'"))
