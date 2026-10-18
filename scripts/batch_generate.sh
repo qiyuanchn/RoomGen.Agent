@@ -22,7 +22,9 @@
 # Resume is request-bound, not summary-bound.  Every scene the batch runs gets
 # a <scene_dir>/resume_manifest.json recording the *request* (seed, resolution,
 # samples, floors, shape, rooms, review mode), the fingerprints of the code and
-# of the asset registry that produced it, the effective render profile (which
+# of the asset registry that produced it, the content digest of the model and
+# texture files behind that registry (so replacing a file in place invalidates
+# the bundle while a touch does not), the effective render profile (which
 # differs from the requested one when the memory retry reduced it), and the
 # normalized spec hash.  PANOWORLD_BATCH_RESUME=1 reuses a scene only when that
 # manifest parses, the current request hashes to the recorded one, spec.json
@@ -163,10 +165,12 @@ RESUMED_SEEDS=()
 # samples, floors, shape, rooms, review mode), the sha256 of every
 # generation/render/validation source file, the git commit for provenance (it
 # is not compared: the content hashes already are), and the asset registry the
-# generator reads.  The gate digests the block without the git record, so
-# committing the same tree keeps caches valid while a real edit invalidates
-# them.  The manifest records the *effective* render profile as well, which is
-# the reduced one after a memory retry succeeded.
+# generator reads -- both its index bytes and the content digest of the actual
+# model/texture files behind it (assets.py caches per-file hashes by stat, so an
+# unchanged cache is not re-read).  The gate digests the block without the git
+# record, so committing the same tree keeps caches valid while a real edit
+# invalidates them.  The manifest records the *effective* render profile as
+# well, which is the reduced one after a memory retry succeeded.
 # --------------------------------------------------------------------------- #
 batch_tool() { # <mode> [args...]
   "${HOSTPY}" - "$@" <<'PY'
@@ -301,10 +305,32 @@ def git_provenance() -> dict:
 
 
 def assets_block() -> dict:
+    """Registry bytes plus the content digest of the files they point at.
+
+    The index hash alone misses a model or texture replaced in place under the
+    same path.  ``blender_agent.assets`` keeps a per-cache manifest keyed by
+    ``(size, mtime, ctime)``, so this costs stats for an unchanged tree and
+    re-reads only files that changed; ``content_sha256`` is the aggregate the
+    resume gate compares.  A cache that cannot be digested (unreadable index,
+    missing module) records ``content_error`` instead of pretending the assets
+    are unchanged.
+    """
     index = next((os.path.join(REPO, name) for name in ASSET_INDEX_CANDIDATES
                   if os.path.isfile(os.path.join(REPO, name))), None)
-    return {"index": repo_path(index) if index else None,
-            "sha256": sha256_file(index) if index else None}
+    block = {"index": repo_path(index) if index else None,
+             "sha256": sha256_file(index) if index else None}
+    if index:
+        try:
+            if REPO not in sys.path:
+                sys.path.insert(0, REPO)
+            from blender_agent import assets as assets_mod
+            content = assets_mod.content_digest_for_index(index)
+            block["content_sha256"] = content["content_sha256"]
+            block["content"] = content["content"]
+        except Exception as error:
+            block["content_sha256"] = None
+            block["content_error"] = "%s: %s" % (type(error).__name__, error)
+    return block
 
 
 def request_block() -> dict:
@@ -555,9 +581,10 @@ def mode_template(path: str) -> int:
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(request, handle, indent=2, sort_keys=True)
         handle.write("\n")
-    print("request template: code %s, assets %s, %s/%s"
+    print("request template: code %s, assets %s/%s, %s/%s"
           % (request["code"]["sha256"][:16],
              (request["assets"]["sha256"] or "none")[:16],
+             (request["assets"].get("content_sha256") or "none")[:16],
              request["render"]["resolution"], request["render"]["samples"]))
     return 0
 

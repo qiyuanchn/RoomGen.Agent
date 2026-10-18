@@ -24,6 +24,7 @@ expectation into a re-run while the test runs.
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import os
 import shutil
@@ -37,6 +38,8 @@ from PIL import Image
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(TESTS_DIR)
 HOSTPY = sys.executable
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 # The pipeline seam is bash, so the fake is a small bash script around this
 # python program.  Its behaviour comes from <outdir>/fake_mode:
@@ -620,6 +623,28 @@ class ResumeFingerprintTest(ScriptCase):
     def scene(self, root, seed=0):
         return os.path.join(root, "scene_%04d" % seed)
 
+    def asset_file(self, relative, content):
+        """Create one file in the frozen Poly Haven cache; restore it afterwards."""
+        path = os.path.join(self.repo, "third_party", "assets", "polyhaven", relative)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        existed = os.path.isfile(path)
+        previous = None
+        if existed:
+            with open(path, "rb") as handle:
+                previous = handle.read()
+        with open(path, "wb") as handle:
+            handle.write(content)
+
+        def restore():
+            if existed:
+                with open(path, "wb") as handle:
+                    handle.write(previous)
+            elif os.path.isfile(path):
+                os.remove(path)
+
+        self.addCleanup(restore)
+        return path
+
     def test_resume_keeps_completed_seeds_and_their_run_ids(self):
         root = os.path.join(self.tmp, "resume_batch")
         first = self.run_batch(0, 2, root)
@@ -870,6 +895,71 @@ class ResumeFingerprintTest(ScriptCase):
                                      "panoImage_2048.png")) as pano:
             self.assertEqual(pano.size, (1024, 512))
 
+    def test_replaced_asset_content_is_rerun(self):
+        """The same model path with different bytes invalidates the bundle.
+
+        The index hash is unchanged here, so only the content digest can catch
+        the replacement."""
+        root = os.path.join(self.tmp, "asset_content_change")
+        relative = os.path.join("models", "sofa_02", "sofa_02_1k.gltf")
+        path = self.asset_file(relative, b'{"asset": {"version": "2.0"}, "v": 1}\n')
+        env = base_env(PANOWORLD_ROOMS=4)
+        first = self.run_batch(0, 1, root, env=env)
+        self.assertEqual(first.returncode, 0, first.stderr[-2000:])
+        before = self.manifest_of(root)["request"]["assets"]["content_sha256"]
+        self.assertEqual(len(before), 64)
+
+        old = os.stat(path)
+        with open(path, "wb") as handle:
+            handle.write(b'{"asset": {"version": "2.0"}, "v": 2}\n')
+        # restore the mtime: only the changed bytes (and ctime) can signal this
+        os.utime(path, ns=(old.st_atime_ns, old.st_mtime_ns))
+        self.assertEqual(os.stat(path).st_mtime_ns, old.st_mtime_ns)
+        second = self.run_batch(0, 1, root, env=dict(env, PANOWORLD_BATCH_RESUME="1"))
+        self.assertEqual(second.returncode, 0, second.stderr[-2000:])
+        row = self.batch_summary_of(root)["scenes"][0]
+        self.assertFalse(row["resumed"], second.stdout[-2000:])
+        self.assertIn("assets.content_sha256", second.stdout)
+        self.assertNotEqual(self.manifest_of(root)["request"]["assets"]["content_sha256"],
+                            before)
+
+        manifest = load_json(os.path.join(self.repo, "third_party", "assets", "polyhaven",
+                                          ".content_manifest.json"))
+        record = manifest["files"][relative.replace(os.sep, "/")]
+        self.assertEqual(record["sha256"], hashlib.sha256(
+            b'{"asset": {"version": "2.0"}, "v": 2}\n').hexdigest())
+
+    def test_touching_asset_files_keeps_the_content_digest(self):
+        """A new mtime with the same bytes is not a content change: resume."""
+        root = os.path.join(self.tmp, "asset_mtime_only")
+        relative = os.path.join("textures", "oak_wood_planks",
+                                "oak_wood_planks_diff_2k.jpg")
+        content = b"placeholder texture bytes"
+        path = self.asset_file(relative, content)
+        env = base_env(PANOWORLD_ROOMS=4)
+        first = self.run_batch(0, 1, root, env=env)
+        self.assertEqual(first.returncode, 0, first.stderr[-2000:])
+        before = self.manifest_of(root)["request"]["assets"]["content_sha256"]
+
+        old = os.stat(path)
+        os.utime(path, ns=(old.st_atime_ns, old.st_mtime_ns + 2_000_000_000))
+        touched = os.stat(path)
+        self.assertNotEqual(touched.st_mtime_ns, old.st_mtime_ns)
+
+        second = self.run_batch(0, 1, root, env=dict(env, PANOWORLD_BATCH_RESUME="1"))
+        self.assertEqual(second.returncode, 0, second.stderr[-2000:])
+        row = self.batch_summary_of(root)["scenes"][0]
+        self.assertTrue(row["resumed"], second.stdout[-2000:])
+        self.assertIn("resumed: run", second.stdout)
+        self.assertEqual(self.manifest_of(root)["request"]["assets"]["content_sha256"],
+                         before)
+        manifest = load_json(os.path.join(self.repo, "third_party", "assets", "polyhaven",
+                                          ".content_manifest.json"))
+        record = manifest["files"][relative.replace(os.sep, "/")]
+        self.assertEqual(record["mtime_ns"], touched.st_mtime_ns,
+                         "the touched file must have been re-stat'ed")
+        self.assertEqual(record["sha256"], hashlib.sha256(content).hexdigest())
+
     def test_a_changed_asset_registry_is_rerun(self):
         root = os.path.join(self.tmp, "asset_change")
         env = base_env(PANOWORLD_ROOMS=4)
@@ -916,6 +1006,97 @@ class ResumeFingerprintTest(ScriptCase):
     def _restore(path, content):
         with open(path, "wb") as handle:
             handle.write(content)
+
+
+class AssetContentDigestTest(unittest.TestCase):
+    """The cache manifest re-reads only files whose stat signature changed.
+
+    This is what keeps the batch fingerprint from rescanning every large model
+    and texture on each resume while still noticing same-path replacement."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="asset_digest_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.cache = os.path.join(self.tmp, "polyhaven")
+        os.makedirs(os.path.join(self.cache, "models", "chair_01"))
+        os.makedirs(os.path.join(self.cache, "textures"))
+        self.model = os.path.join(self.cache, "models", "chair_01", "chair_01_1k.gltf")
+        self.texture = os.path.join(self.cache, "textures", "chair_01_diff_2k.jpg")
+        self._write(self.model, b"model-v1")
+        self._write(self.texture, b"texture-v1")
+        index = {
+            "version": 2,
+            "models": {"chair_01": {
+                "id": "chair_01",
+                "source": "generated",
+                "gltf": "models/chair_01/chair_01_1k.gltf",
+                "gltf_variants": {"1k": "models/chair_01/chair_01_1k.gltf"},
+                "files": ["models/chair_01/chair_01_1k.gltf"],
+            }},
+            "textures": {"chair_01": {
+                "id": "chair_01",
+                "maps": {"Diffuse": "textures/chair_01_diff_2k.jpg"},
+            }},
+        }
+        with open(os.path.join(self.cache, "index.json"), "w", encoding="utf-8") as handle:
+            json.dump(index, handle)
+
+    @staticmethod
+    def _write(path, content):
+        with open(path, "wb") as handle:
+            handle.write(content)
+
+    def test_unchanged_files_are_not_rehashed(self):
+        from blender_agent import assets as assets_mod
+
+        calls = []
+        original = assets_mod._file_sha256
+
+        def counting(path):
+            calls.append(path)
+            return original(path)
+
+        assets_mod._file_sha256 = counting
+        self.addCleanup(setattr, assets_mod, "_file_sha256", original)
+
+        first = assets_mod.content_digest_block(self.cache)
+        self.assertEqual(len(calls), 2)
+        calls.clear()
+        second = assets_mod.content_digest_block(self.cache)
+        self.assertEqual(calls, [], "an unchanged cache must not be re-read")
+        self.assertEqual(second["content_sha256"], first["content_sha256"])
+
+        stat = os.stat(self.model)
+        os.utime(self.model, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+        third = assets_mod.content_digest_block(self.cache)
+        self.assertEqual(len(calls), 1, "only the touched file is re-read")
+        self.assertEqual(third["content_sha256"], first["content_sha256"])
+        calls.clear()
+
+        self._write(self.model, b"model-v2")
+        fourth = assets_mod.content_digest_block(self.cache)
+        self.assertEqual(len(calls), 1)
+        self.assertNotEqual(fourth["content_sha256"], first["content_sha256"])
+
+    def test_library_metadata_gates_reuse_on_the_content_digest(self):
+        """A cached .blend is reused only for the digest it was built from."""
+        from blender_agent import assets as assets_mod
+
+        lib = os.path.join(self.tmp, "library", "chair_01.1k.blend")
+        os.makedirs(os.path.dirname(lib))
+        self._write(lib, b"blend")
+        self.assertFalse(assets_mod.library_is_current(lib, "a" * 64),
+                         "no sidecar means the library predates fingerprinting")
+        with open(assets_mod._library_metadata_path(lib), "w", encoding="utf-8") as handle:
+            json.dump({"kind": assets_mod.LIBRARY_METADATA_KIND,
+                       "content_sha256": "a" * 64}, handle)
+        self.assertTrue(assets_mod.library_is_current(lib, "a" * 64))
+        self.assertFalse(assets_mod.library_is_current(lib, "b" * 64),
+                         "replaced content must rebuild the library")
+        self.assertFalse(assets_mod.library_is_current(lib, ""))
+        os.remove(lib)
+        self.assertFalse(assets_mod.library_is_current(lib, "a" * 64),
+                         "a missing .blend is never current")
 
 
 if __name__ == "__main__":

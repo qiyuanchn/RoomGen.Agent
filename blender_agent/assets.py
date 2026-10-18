@@ -3,6 +3,12 @@
 Cache layout (gitignored, under ``REPO/third_party/assets/polyhaven``)::
 
     index.json                       what is cached, with metadata
+    .content_manifest.json           sha256 of every model/texture file, keyed by
+                                     (size, mtime, ctime) so only changed files are
+                                     re-read; the stable digest the batch resume
+                                     fingerprints (see content_digest_block)
+    library/<id>.<res>.blend         imported + normalised asset
+    library/<id>.<res>.json          content digest the library was built from
     models/<id>/<id>_2k.gltf         + .bin + textures/*.jpg (as referenced)
     textures/<id>/<id>_diff_2k.jpg   Diffuse / nor_gl / Rough
 
@@ -77,6 +83,17 @@ DEFAULT_RESOLUTION = "2k"
 # every library a scene spec may name in a furniture ref
 ASSET_SCHEMES = ("ph", "midi3d", "gen")
 
+#: Per-cache metadata recording the content digest of every indexed asset.
+#: The digest covers the bytes of the model and its key texture files, not
+#: only their paths, so replacing a file in place invalidates the libraries
+#: and resume fingerprints derived from it.  File hashes are cached by
+#: (size, mtime, ctime): an unchanged tree costs stats only, while a touched
+#: or replaced file is re-read.
+CONTENT_MANIFEST_NAME = ".content_manifest.json"
+CONTENT_MANIFEST_KIND = "asset_content_manifest"
+CONTENT_MANIFEST_SCHEMA = 1
+LIBRARY_METADATA_KIND = "asset_library_content"
+
 
 # --------------------------------------------------------------------------- #
 # shared helpers
@@ -145,6 +162,288 @@ def asset_entry(index: dict, ref: str) -> tuple:
         f"asset '{asset_id}' is not in the cache index; run "
         f"'python blender_agent/assets.py fetch --assets ph:{asset_id}' first"
     )
+
+
+# --------------------------------------------------------------------------- #
+# content digests (cache/library provenance)
+# --------------------------------------------------------------------------- #
+def _canonical_json(node) -> str:
+    return json.dumps(node, sort_keys=True, separators=(",", ":"))
+
+
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _safe_cache_relative(rel_path) -> str:
+    """A cache-relative path with ``/`` separators; ``None`` for escapes."""
+    rel = os.path.normpath(str(rel_path).replace("\\", "/"))
+    if os.path.isabs(rel) or rel == ".." or rel.startswith("../"):
+        return None
+    return rel.replace(os.sep, "/")
+
+
+def _model_content_paths(cache_dir: str, asset_id: str, entry: dict) -> list:
+    """Every cached file that contributes to a model, cache-relative and sorted.
+
+    ``gltf``/``gltf_variants`` are cache-relative in every index.  Poly Haven's
+    ``files`` list is relative to ``models/<id>/`` while the generated and
+    MIDI-3D indexes store cache-relative paths; resolve on disk first and fall
+    back to the source convention when a file is absent.
+    """
+    paths = set()
+    variants = entry.get("gltf_variants") or {}
+    if not variants and entry.get("gltf"):
+        variants = {str(entry.get("resolution") or "default"): entry["gltf"]}
+    for rel in list(variants.values()) + ([entry["gltf"]] if entry.get("gltf") else []):
+        rel = _safe_cache_relative(rel)
+        if rel:
+            paths.add(rel)
+    source = str(entry.get("source") or "")
+    for rel in entry.get("files") or []:
+        rel = _safe_cache_relative(rel)
+        if rel is None:
+            continue
+        direct = rel
+        nested = _safe_cache_relative(os.path.join("models", asset_id, rel))
+        if os.path.isfile(os.path.join(cache_dir, direct)):
+            paths.add(direct)
+        elif nested is not None and os.path.isfile(os.path.join(cache_dir, nested)):
+            paths.add(nested)
+        elif source in ("generated", "midi3d"):
+            paths.add(direct)
+        elif nested is not None:
+            paths.add(nested)
+        else:
+            paths.add(direct)
+    return sorted(paths)
+
+
+def _texture_content_paths(entry: dict) -> list:
+    paths = set()
+    for rel in (entry.get("maps") or {}).values():
+        rel = _safe_cache_relative(rel)
+        if rel:
+            paths.add(rel)
+    for rel in entry.get("files") or []:
+        rel = _safe_cache_relative(rel)
+        if rel:
+            paths.add(rel)
+    return sorted(paths)
+
+
+def _content_file_record(cache_dir: str, rel_path: str, previous: dict = None) -> dict:
+    """Hash one file unless its ``(size, mtime, ctime)`` matches the cache.
+
+    ``ctime`` catches an in-place replacement that restores the mtime, while a
+    pure ``touch`` re-hashes the same bytes and therefore keeps the digest.
+    """
+    path = os.path.join(cache_dir, rel_path)
+    if not os.path.isfile(path):
+        return {"present": False}
+    stat = os.stat(path)
+    if (
+        previous
+        and previous.get("present")
+        and previous.get("sha256")
+        and previous.get("size") == stat.st_size
+        and previous.get("mtime_ns") == stat.st_mtime_ns
+        and previous.get("ctime_ns") == stat.st_ctime_ns
+    ):
+        return previous
+    return {
+        "present": True,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "ctime_ns": stat.st_ctime_ns,
+        "sha256": _file_sha256(path),
+    }
+
+
+def _content_entry_digest(kind: str, asset_id: str, records: dict) -> str:
+    payload = {
+        "schema_version": CONTENT_MANIFEST_SCHEMA,
+        "kind": kind,
+        "id": asset_id,
+        "files": [
+            {"path": rel, "present": record["present"], "sha256": record.get("sha256")}
+            for rel, record in sorted(records.items())
+        ],
+    }
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _load_content_manifest(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        data = None
+    if (
+        not isinstance(data, dict)
+        or data.get("kind") != CONTENT_MANIFEST_KIND
+        or data.get("schema_version") != CONTENT_MANIFEST_SCHEMA
+    ):
+        return {"kind": CONTENT_MANIFEST_KIND,
+                "schema_version": CONTENT_MANIFEST_SCHEMA,
+                "entries": {}, "files": {}}
+    if not isinstance(data.get("entries"), dict):
+        data["entries"] = {}
+    if not isinstance(data.get("files"), dict):
+        data["files"] = {}
+    return data
+
+
+def _write_json_atomic(path: str, data: dict) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    temporary = f"{path}.{os.getpid()}.tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=1, sort_keys=True)
+        handle.write("\n")
+    os.replace(temporary, path)
+
+
+def content_digest_block(cache_dir: str = DEFAULT_CACHE, index: dict = None,
+                         asset_ids=None, write: bool = True) -> dict:
+    """Digest the actual bytes behind every asset of one cache index.
+
+    Returns ``content_sha256`` (aggregate), ``content`` (the stable, compact
+    block the batch resume gate records) and ``entries`` (per-asset digest and
+    file hashes).  Unchanged files are reused from ``.content_manifest.json``
+    keyed by stat metadata; only new or touched files are read again.
+    """
+    cache_dir = os.path.abspath(cache_dir)
+    index = load_index(cache_dir) if index is None else index
+    manifest_path = os.path.join(cache_dir, CONTENT_MANIFEST_NAME)
+    previous = _load_content_manifest(manifest_path)
+    previous_files = previous.get("files") or {}
+    wanted = None if asset_ids is None else {str(value) for value in asset_ids}
+    entries = {}
+    file_records = {}
+    missing = 0
+    for index_kind, kind in (("models", "model"), ("textures", "texture")):
+        for asset_id, entry in sorted((index.get(index_kind) or {}).items()):
+            if wanted is not None and asset_id not in wanted:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            rel_paths = (_model_content_paths(cache_dir, asset_id, entry)
+                         if kind == "model" else _texture_content_paths(entry))
+            records = {}
+            for rel in rel_paths:
+                record = _content_file_record(cache_dir, rel, previous_files.get(rel))
+                records[rel] = record
+                file_records[rel] = record
+                if not record["present"]:
+                    missing += 1
+            key = "%s/%s" % (kind, asset_id)
+            entries[key] = {
+                "kind": kind,
+                "id": asset_id,
+                "digest": _content_entry_digest(kind, asset_id, records),
+                "files": [
+                    {"path": rel, "present": record["present"],
+                     "sha256": record.get("sha256")}
+                    for rel, record in sorted(records.items())
+                ],
+            }
+    # a symlinked cache belongs to another checkout: read it, do not write there
+    if write and not os.path.islink(cache_dir):
+        manifest = {
+            "kind": CONTENT_MANIFEST_KIND,
+            "schema_version": CONTENT_MANIFEST_SCHEMA,
+            "entries": {key: {"kind": value["kind"], "id": value["id"],
+                              "digest": value["digest"], "files": value["files"]}
+                        for key, value in sorted(entries.items())},
+            "files": {rel: file_records[rel] for rel in sorted(file_records)},
+        }
+        try:
+            if manifest != previous:
+                _write_json_atomic(manifest_path, manifest)
+        except OSError:
+            pass
+    content = {
+        "models": {value["id"]: value["digest"] for value in entries.values()
+                   if value["kind"] == "model"},
+        "textures": {value["id"]: value["digest"] for value in entries.values()
+                     if value["kind"] == "texture"},
+        "files": len(file_records),
+        "missing": missing,
+    }
+    aggregate = hashlib.sha256(_canonical_json({
+        "schema_version": CONTENT_MANIFEST_SCHEMA,
+        "entries": {key: value["digest"] for key, value in sorted(entries.items())},
+    }).encode("utf-8")).hexdigest()
+    return {"content_sha256": aggregate, "content": content, "entries": entries}
+
+
+def content_digest_for_index(index_path: str, write: bool = True) -> dict:
+    """Content digest block for a cache index or a merged assets registry."""
+    index_path = os.path.abspath(index_path)
+    cache_dir = os.path.dirname(index_path)
+    try:
+        with open(index_path, "r", encoding="utf-8") as handle:
+            index = json.load(handle)
+    except Exception as error:
+        raise RuntimeError(f"cannot read asset index {index_path}: {error}")
+    if not isinstance(index, dict):
+        raise RuntimeError(f"asset index {index_path} is not an object")
+    models = index.get("models") or {}
+    merged = any(isinstance(entry, dict) and entry.get("ref") for entry in models.values())
+    if not merged:
+        return content_digest_block(cache_dir, index=index, write=write)
+
+    groups = {}
+    for asset_id, entry in models.items():
+        ref = str((entry or {}).get("ref") or "")
+        scheme = ref.partition(":")[0] if ":" in ref else None
+        if scheme not in ASSET_SCHEMES:
+            scheme = {"polyhaven": "ph", "midi3d": "midi3d",
+                      "generated": "gen"}.get((entry or {}).get("source"))
+        groups.setdefault(scheme or "ph", set()).add(asset_id)
+    # make_merged_assets.py writes textures: {}, but the spec still names
+    # ``ph:<texture>`` for floors and walls: fingerprint the whole Poly Haven
+    # texture set alongside the merged models.
+    if isinstance(index.get("textures"), dict):
+        groups.setdefault("ph", set()).update(index["textures"])
+    cache_names = {"ph": "polyhaven", "midi3d": "midi3d", "gen": "generated"}
+    blocks = {}
+    for scheme in sorted(groups):
+        cache = os.path.join(cache_dir, cache_names.get(scheme, scheme))
+        cache_index = os.path.join(cache, "index.json")
+        if scheme == "midi3d" and os.path.islink(cache):
+            # the MIDI-3D mirror is a 28 GiB read-only checkout outside the
+            # repo; fingerprint its registry rather than every glb
+            blocks[scheme] = {
+                "content_sha256": _file_sha256(cache_index) if os.path.isfile(cache_index) else None,
+                "content": {"index_only": True},
+            }
+            continue
+        if not os.path.isfile(cache_index):
+            blocks[scheme] = {"content_sha256": None, "content": {"missing_index": True}}
+            continue
+        ids = set(groups[scheme])
+        if scheme == "ph":
+            try:
+                with open(cache_index, "r", encoding="utf-8") as handle:
+                    cache_index_data = json.load(handle)
+            except Exception:
+                cache_index_data = {}
+            ids.update((cache_index_data.get("textures") or {}).keys())
+        block = content_digest_block(cache, asset_ids=ids, write=write)
+        blocks[scheme] = {"content_sha256": block["content_sha256"],
+                          "content": block["content"]}
+    aggregate = hashlib.sha256(_canonical_json({
+        "schema_version": CONTENT_MANIFEST_SCHEMA,
+        "caches": {scheme: block["content_sha256"] for scheme, block in sorted(blocks.items())},
+    }).encode("utf-8")).hexdigest()
+    return {"content_sha256": aggregate, "content": {"caches": blocks}, "entries": {}}
 
 
 # --------------------------------------------------------------------------- #
@@ -546,6 +845,34 @@ def import_gltf_asset(gltf_path: str, collection_name: str):
     return collection, meshes, imported
 
 
+def _library_metadata_path(lib_path: str) -> str:
+    return os.path.splitext(lib_path)[0] + ".json"
+
+
+def _load_library_metadata(lib_path: str) -> dict:
+    try:
+        with open(_library_metadata_path(lib_path), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def library_is_current(lib_path: str, content_sha256: str) -> bool:
+    """Whether a cached .blend was built from the cache's current content.
+
+    A library without the sidecar (built before content fingerprinting, or
+    copied without it) is never trusted: the cost of one rebuild is a missing
+    texture, while the cost of a wrong reuse is a scene that does not match the
+    spec.
+    """
+    if not (os.path.isfile(lib_path) and content_sha256):
+        return False
+    recorded = _load_library_metadata(lib_path)
+    return (recorded.get("kind") == LIBRARY_METADATA_KIND
+            and recorded.get("content_sha256") == content_sha256)
+
+
 def ensure_library(cache_dir: str, asset_id: str, meta: dict = None, force: bool = False,
                    resolution: str = None) -> str:
     """Build ``library/<id>.<res>.blend`` (import + normalise + join) if not cached.
@@ -554,6 +881,11 @@ def ensure_library(cache_dir: str, asset_id: str, meta: dict = None, force: bool
     asset; returns the library path.  ``resolution`` picks a glTF/texture variant
     (``1k`` by default at build time: it quarters the texture memory Cycles needs
     for a furnished scene).
+
+    The library carries a ``<id>.<res>.json`` sidecar with the content digest of
+    the model and its textures.  A cached ``.blend`` is reused only when that
+    digest still matches the cache; replacing a file in place rebuilds the
+    library instead of silently reusing the old geometry.
     """
     bpy = _bpy()
     index = load_index(cache_dir)
@@ -568,9 +900,11 @@ def ensure_library(cache_dir: str, asset_id: str, meta: dict = None, force: bool
             f"asset '{asset_id}' has no {resolution} variant (have {sorted(variants)}); "
             f"run: python blender_agent/assets.py fetch --assets ph:{asset_id} --resolution {resolution}"
         )
+    content = content_digest_block(cache_dir)
+    content_sha = (content["content"].get("models") or {}).get(asset_id)
     lib_dir = os.path.join(cache_dir, "library")
     lib_path = os.path.join(lib_dir, f"{asset_id}.{resolution}.blend")
-    if os.path.isfile(lib_path) and not force:
+    if not force and library_is_current(lib_path, content_sha):
         return lib_path
 
     gltf_path = os.path.join(cache_dir, variants[resolution])
@@ -605,7 +939,18 @@ def ensure_library(cache_dir: str, asset_id: str, meta: dict = None, force: bool
             except RuntimeError:
                 pass
     bpy.ops.wm.save_as_mainfile(filepath=lib_path, compress=True, copy=True)
+    entry_record = content["entries"].get(f"model/{asset_id}") or {}
+    _write_json_atomic(_library_metadata_path(lib_path), {
+        "kind": LIBRARY_METADATA_KIND,
+        "schema_version": CONTENT_MANIFEST_SCHEMA,
+        "asset": asset_id,
+        "resolution": resolution,
+        "content_sha256": content_sha,
+        "files": entry_record.get("files") or [],
+    })
     facts["library"] = lib_path
+    facts["content_sha256"] = content_sha
+    facts["library_metadata"] = _library_metadata_path(lib_path)
     facts["polycount"] = len(joined.data.polygons)
     facts["materials"] = [slot.material.name for slot in joined.material_slots if slot.material]
     print(
