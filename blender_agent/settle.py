@@ -734,14 +734,14 @@ def _separate(hulls: List[dict], config: dict, notes: List[str]) -> List[dict]:
     for hull in hulls:
         hull["points"] = proxy_world_points(hull["proxy"])
         hull["center"] = hull["points"].mean(axis=0)
-    trees = {hull["name"]: _hull_tree(hull) for hull in hulls}
+    trees = {hull["index"]: _hull_tree(hull) for hull in hulls}
     for _pass in range(3):
         moved_any = False
         for index, hull_a in enumerate(hulls):
             for hull_b in hulls[index + 1:]:
                 if not _masks_interact(hull_a["groups"], hull_b["groups"]):
                     continue  # e.g. a floor covering does not collide with furniture
-                if not _hulls_overlap(hull_a, hull_b, trees[hull_a["name"]], trees[hull_b["name"]]):
+                if not _hulls_overlap(hull_a, hull_b, trees[hull_a["index"]], trees[hull_b["index"]]):
                     continue
                 # the lighter body moves, the heavier one is the anchor
                 anchor, mobile = (hull_a, hull_b) if hull_a["mass"] >= hull_b["mass"] else (hull_b, hull_a)
@@ -768,9 +768,10 @@ def _separate(hulls: List[dict], config: dict, notes: List[str]) -> List[dict]:
                 mobile["points"] = proxy_world_points(mobile["proxy"])
                 mobile["center"] = mobile["points"].mean(axis=0)
                 mobile["separation_m"] += float(distance)
-                trees[mobile["name"]] = _hull_tree(mobile)
+                trees[mobile["index"]] = _hull_tree(mobile)
                 separations.append({
                     "a": anchor["name"], "b": mobile["name"], "moved": mobile["name"],
+                    "a_index": anchor["index"], "b_index": mobile["index"],
                     "distance_m": round(float(distance), 4),
                     "direction": [round(float(v), 4) for v in direction],
                 })
@@ -791,7 +792,7 @@ def _simulate(scene, hulls: List[dict], config: dict) -> dict:
     interval = max(1, int(config["check_interval"]))
     tolerance = float(config["rest_tolerance_m"])
     tracked = [hull for hull in hulls if not hull["kinematic"]]
-    window: Dict[str, Tuple[float, float, float]] = {}
+    window: Dict[int, Tuple[float, float, float]] = {}
     used = 0
     settled = None
     peak_motion = None
@@ -802,13 +803,13 @@ def _simulate(scene, hulls: List[dict], config: dict) -> dict:
             continue
         depsgraph = _bpy().context.evaluated_depsgraph_get()
         positions = {
-            hull["name"]: tuple(hull["proxy"].evaluated_get(depsgraph).matrix_world.translation)
+            hull["index"]: tuple(hull["proxy"].evaluated_get(depsgraph).matrix_world.translation)
             for hull in tracked
         }
         if window:
             motion = max(
-                max(abs(positions[name][axis] - window[name][axis]) for axis in range(3))
-                for name in positions
+                max(abs(positions[index][axis] - window[index][axis]) for axis in range(3))
+                for index in positions
             )
             peak_motion = motion if peak_motion is None else max(peak_motion, motion)
             if motion <= tolerance:
@@ -830,14 +831,14 @@ def _bake(hulls: List[dict], notes: List[str]) -> None:
     """Write every body's final pose into its object, then drop the bodies."""
     bpy = _bpy()
     depsgraph = bpy.context.evaluated_depsgraph_get()
-    finals = {hull["name"]: hull["proxy"].evaluated_get(depsgraph).matrix_world.copy() for hull in hulls}
+    finals = {hull["index"]: hull["proxy"].evaluated_get(depsgraph).matrix_world.copy() for hull in hulls}
     # read the final pose first: removing the bodies rewinds the objects to their
     # pre-simulation transforms, and the pose is composed onto those
     _select_only([hull["proxy"] for hull in hulls])
     bpy.ops.rigidbody.objects_remove()
     moved = 0
     for hull in hulls:
-        final = finals[hull["name"]]
+        final = finals[hull["index"]]
         # the proxy's frame is offset by its centre, so the net rigid motion of the
         # furniture geometry is ``final @ start^-1``
         rigid = final @ hull["proxy_start_inverse"]
@@ -879,16 +880,79 @@ def _teardown(bpy, proxies: List, collection) -> None:
 # --------------------------------------------------------------------------- #
 # entry point used by run_build.py
 # --------------------------------------------------------------------------- #
+def _duplicate_suffix(name: str) -> Tuple[str, str]:
+    """Split Blender's duplicate-name suffix: ``rug_x.001`` -> ``("rug_x", ".001")``."""
+    base, dot, suffix = name.rpartition(".")
+    if dot and len(suffix) == 3 and suffix.isdigit():
+        return base, "." + suffix
+    return name, ""
+
+
+def _strip_duplicate_suffix(name: str) -> str:
+    return _duplicate_suffix(name)[0]
+
+
+def _prop_root(name: str) -> str:
+    """Grouping key of a generated builtin prop object.
+
+    ``details.make_rug`` names the slab ``rug_<name>`` and ``make_table_lamp``
+    names its three parts ``lamp_<name>_{base,stem,shade}``.  The duplicate-name
+    suffix stays part of the key, so two placements with the same authored name
+    (``rug_x`` and its Blender ``rug_x.001``) are two groups, while the three
+    parts of one lamp remain one group.
+    """
+    base, suffix = _duplicate_suffix(name)
+    for part in ("_base", "_stem", "_shade"):
+        if base.endswith(part):
+            base = base[: -len(part)]
+            break
+    return base + suffix
+
+
+def _generated_prop_groups(objects) -> List[List]:
+    """Consecutive generated prop objects, grouped in creation order.
+
+    ``place_furniture`` creates one rug object or one three-part table lamp per
+    ``builtin:`` placement, in placement order, and links the objects to the
+    furniture collection in that same order.  Grouping therefore recovers the
+    placement -> object mapping without matching names (which may repeat) or a
+    generic prefix (which would attach every rug to every rug placement).
+    """
+    groups: List[List] = []
+    current: Optional[List] = None
+    current_root: Optional[str] = None
+    for obj in objects:
+        if obj.type != "MESH":
+            current, current_root = None, None
+            continue
+        root = _prop_root(obj.name)
+        if not (root.startswith("rug_") or root.startswith("lamp_")):
+            current, current_root = None, None
+            continue
+        if current is None or root != current_root:
+            current = []
+            current_root = root
+            groups.append(current)
+        current.append(obj)
+    return groups
+
+
 def resolve_targets(placements: Sequence[dict]) -> List[dict]:
     """Map placements to the scene objects that carry their geometry.
 
-    ``place_furniture`` records the instance empty of a model as ``instance``; the
-    generated ``builtin:`` props (rug, table lamp) are plain meshes named
-    ``rug_<name>`` / ``lamp_<name>_*`` in the furniture collection.
+    ``place_furniture`` records the instance empty of a model as ``instance`` and
+    the fixture parts as ``objects``.  The generated ``builtin:`` props (rug,
+    table lamp) record neither, so they are matched by **creation order**: the
+    n-th such placement owns the n-th generated prop group, in the order the
+    builder created them.  Names and generic prefixes are never used -- two
+    placements may share a name (two ``rug`` items) and ``rug_*`` would
+    otherwise attach every rug to every rug placement.
     """
     bpy = _bpy()
     furniture = bpy.data.collections.get(FURNITURE_COLLECTION)
-    names = sorted(obj.name for obj in collection_meshes(furniture))
+    collection_objects = collection_meshes(furniture)
+    names = sorted(obj.name for obj in collection_objects)
+    generated: List[int] = []
     targets = []
     for index, placement in enumerate(placements):
         label = placement.get("name") or f"item_{index}"
@@ -901,9 +965,33 @@ def resolve_targets(placements: Sequence[dict]) -> List[dict]:
             objects = [bpy.data.objects.get(instance)]
         elif placement.get("kind") == "builtin" and str(placement.get("asset", "")).startswith("builtin:"):
             prop = str(placement["asset"]).split(":", 1)[1]
-            prefix = "rug_" if prop == "rug" else f"lamp_{label}"
-            objects = [bpy.data.objects[name] for name in names if name.startswith(prefix)]
-        targets.append({"index": index, "name": label, "objects": [obj for obj in objects if obj is not None]})
+            if prop in ("rug", "table_lamp"):
+                generated.append(index)
+            else:
+                objects = [bpy.data.objects[name] for name in names
+                           if _strip_duplicate_suffix(_prop_root(name)) == f"{prop}_{label}"]
+        targets.append({"index": index, "name": label,
+                        "objects": [obj for obj in objects if obj is not None]})
+
+    groups = _generated_prop_groups(collection_objects)
+    if len(groups) == len(generated):
+        for index, group in zip(generated, groups):
+            targets[index]["objects"] = list(group)
+        return targets
+
+    # A count mismatch means the collection carries generated props this run did
+    # not create (or one failed to create).  Fall back to the exact per-placement
+    # root, consuming occurrences in creation order; never to a generic prefix.
+    by_root: Dict[str, List[List]] = {}
+    for group in groups:
+        by_root.setdefault(_strip_duplicate_suffix(_prop_root(group[0].name)), []).append(group)
+    for index in generated:
+        label = placements[index].get("name") or f"item_{index}"
+        prop = str(placements[index].get("asset", "")).split(":", 1)[1]
+        root = f"{'rug' if prop == 'rug' else 'lamp'}_{label}"
+        candidates = by_root.get(root) or []
+        if candidates:
+            targets[index]["objects"] = list(candidates.pop(0))
     return targets
 
 
@@ -957,8 +1045,9 @@ def ground_furniture(spec, furniture_info: dict, build_dir: Optional[str] = None
     missing: List[str] = []
 
     for decision, target in zip(decisions, targets):
+        index = int(target["index"])
         if not target["objects"]:
-            missing.append(decision["name"])
+            missing.append(f"{decision['name']} (#{index})")
             continue
         points = None
         for obj in target["objects"]:
@@ -966,18 +1055,22 @@ def ground_furniture(spec, furniture_info: dict, build_dir: Optional[str] = None
             if len(chunk):
                 points = chunk if points is None else np.vstack([points, chunk])
         if points is None or len(points) < 4:
-            missing.append(decision["name"])
+            missing.append(f"{decision['name']} (#{index})")
             continue
-        proxy, volume = _build_hull(f"settle_{decision['name']}",
+        # the index makes the proxy name unique even when two placements share
+        # an authored name (Blender would otherwise suffix and the report keys
+        # would still collide)
+        proxy, volume = _build_hull(f"settle_{index:03d}_{decision['name']}",
                                     flatten_base(points, float(config["base_band_m"])),
                                     collection, bpy, bmesh)
         if proxy is None:
-            missing.append(decision["name"])
+            missing.append(f"{decision['name']} (#{index})")
             continue
         proxies.append(proxy)
         height = float(points[:, 2].max() - points[:, 2].min())
         flat = bool(decision["mode"] == "rest" and height <= float(config["flat_height_m"]))
         hulls.append({
+            "index": index,
             "name": decision["name"],
             "asset": decision["asset"],
             "mode": decision["mode"],
@@ -1080,11 +1173,14 @@ def ground_furniture(spec, furniture_info: dict, build_dir: Optional[str] = None
     scene.gravity = previous_gravity
 
     # --- measurements, report, placement bookkeeping ----------------------- #
-    geometry = {hull["name"]: _placement_points(hull["object_list"], np) for hull in hulls}
+    # keyed by placement index, never by name: two placements may share one
+    geometry = {hull["index"]: _placement_points(hull["object_list"], np) for hull in hulls}
+    names = {hull["index"]: hull["name"] for hull in hulls}
     contents = []
     for hull in hulls:
-        after = bbox_z(geometry[hull["name"]])
+        after = bbox_z(geometry[hull["index"]])
         entry = {
+            "index": hull["index"],
             "name": hull["name"],
             "asset": hull["asset"],
             "mode": hull["mode"],
@@ -1105,8 +1201,10 @@ def ground_furniture(spec, furniture_info: dict, build_dir: Optional[str] = None
             # a placement that came to rest *on top of another one* (a stack) is
             # not supposed to touch the floor -- the same exemption the acceptance
             # check makes for the mounted / shelved items
-            entry["support"] = _support_of(hull["name"], geometry, config)
-            if entry["support"]:
+            support_index = _support_of(hull["index"], geometry, config)
+            entry["support_index"] = support_index
+            entry["support"] = names.get(support_index) if support_index is not None else None
+            if support_index is not None:
                 entry["grounded"] = True
         contents.append(entry)
     report["objects"] = contents
@@ -1128,18 +1226,18 @@ def ground_furniture(spec, furniture_info: dict, build_dir: Optional[str] = None
     return _finish(report, build_dir, started)
 
 
-def _support_of(name: str, geometry: dict, config: dict) -> Optional[str]:
-    """Name of the placement ``name`` rests on, if any (a stack, not the floor)."""
+def _support_of(index: int, geometry: dict, config: dict) -> Optional[int]:
+    """Index of the placement ``index`` rests on, if any (a stack, not the floor)."""
     import numpy as np
 
-    points = geometry.get(name)
+    points = geometry.get(index)
     if points is None or len(points) == 0:
         return None
     tolerance = float(config["ground_tolerance_m"])
     penetration = float(config["penetration_tolerance_m"])
     low = points.min(axis=0)
     for other, other_points in geometry.items():
-        if other == name or other_points is None or len(other_points) == 0:
+        if other == index or other_points is None or len(other_points) == 0:
             continue
         other_high = other_points.max(axis=0)
         # rests *on top of* the other placement: within the tolerance above its
@@ -1179,7 +1277,8 @@ def _checks(contents: List[dict], config: dict) -> dict:
     return {
         "resting": len(resting),
         "on_floor": len(resting) - len(stacked),
-        "stacked": [{"name": entry["name"], "support": entry["support"],
+        "stacked": [{"name": entry["name"], "index": entry.get("index"),
+                     "support": entry["support"], "support_index": entry.get("support_index"),
                      "bottom_m": entry["bottom_m"]} for entry in stacked],
         "held": len(held),
         "max_bottom_gap_m": round(max(bottoms), 5) if bottoms else None,
@@ -1192,11 +1291,15 @@ def _checks(contents: List[dict], config: dict) -> dict:
 
 
 def _update_placements(placements: Sequence[dict], contents: List[dict], config: dict) -> None:
-    """Write the settled numbers back into ``furniture_info["placements"]``."""
-    by_name = {entry["name"]: entry for entry in contents}
+    """Write the settled numbers back into ``furniture_info["placements"]``.
+
+    Entries are matched by their placement index: two placements may share an
+    authored name (two kitchen cabinets, two rugs), and a name-keyed map would
+    write the last one's pose into both.
+    """
+    by_index = {entry["index"]: entry for entry in contents if "index" in entry}
     for index, placement in enumerate(placements):
-        name = placement.get("name") or f"item_{index}"
-        entry = by_name.get(name)
+        entry = by_index.get(index)
         if entry is None or entry["bbox_z_after"] is None:
             continue
         before, after = entry["bbox_z_before"], entry["bbox_z_after"]
@@ -1225,8 +1328,9 @@ def _update_placements(placements: Sequence[dict], contents: List[dict], config:
                 "grounded": entry["grounded"],
                 "penetrating": entry["penetrating"],
             })
-        if entry.get("support"):
+        if entry.get("support") is not None:
             placement["settle"]["support"] = entry["support"]
+            placement["settle"]["support_index"] = entry.get("support_index")
 
 
 def _close(a, b, tolerance: float) -> bool:
@@ -1245,7 +1349,7 @@ def _sync_lamp_lights(spec, placements: Sequence[dict], lamp_lights: List, hulls
     if not lamp_lights:
         return
     items = list(getattr(spec, "furniture", None) or [])
-    by_name = {hull["name"]: hull for hull in hulls}
+    by_index = {hull["index"]: hull for hull in hulls}
     lamp_index = 0
     for index, placement in enumerate(placements):
         if lamp_index >= len(lamp_lights):
@@ -1254,7 +1358,7 @@ def _sync_lamp_lights(spec, placements: Sequence[dict], lamp_lights: List, hulls
         mount = getattr(item, "mount", None) or placement.get("mount") or "floor"
         if mount != "ceiling" and placement.get("asset") != "builtin:table_lamp":
             continue
-        hull = by_name.get(placement.get("name") or f"item_{index}")
+        hull = by_index.get(index)
         light = lamp_lights[lamp_index]
         lamp_index += 1
         if hull is None or hull["mode"] != "rest":
@@ -1288,9 +1392,11 @@ def selfcheck(build_dir: Optional[str] = None, **overrides) -> dict:
     without being launched), a stack (the upper box rests on the lower one), a
     thin rug-like pad with a box standing on it, a wall-flush box (must be pushed
     out of the wall), wall-mounted boxes (must not move at all), a collection
-    instance (the instancing path) and a second storey: a box floating over the
-    upper slab must settle onto the storey floor at z = 2.9 (never onto the
-    ground floor) and a box sunk into that slab must be lifted out of it.
+    instance (the instancing path), two placements that share the authored name
+    (both settle independently) and same-room plus cross-storey rugs (each rug
+    keeps its own footprint), and a second storey: a box floating over the upper
+    slab must settle onto the storey floor at z = 2.9 (never onto the ground
+    floor) and a box sunk into that slab must be lifted out of it.
     Returns a report with a ``pass`` flag.
     """
     bpy = _bpy()
@@ -1304,7 +1410,8 @@ def selfcheck(build_dir: Optional[str] = None, **overrides) -> dict:
 
     shell_collection = shell_mod.ensure_collection(shell_mod.SHELL_COLLECTION)
     furniture = shell_mod.ensure_collection(FURNITURE_COLLECTION)
-    shell_mod.add_prism("floor_selfcheck", [(0, 0), (5, 0), (5, 4), (0, 4)], -0.05, 0.0, shell_collection)
+    shell_mod.add_prism("floor_selfcheck", [(0, 0), (5, 0), (5, 5.2), (0, 5.2)], -0.05, 0.0,
+                        shell_collection)
     shell_mod.add_prism("wall_east", [(4.94, 0), (5.06, 0), (5.06, 4), (4.94, 4)], 0.0, 2.7, shell_collection)
     # second storey slab: the upper storey of a two-floor spec, so the settle
     # target of an upper box must be z = 2.9, never the ground floor
@@ -1332,6 +1439,13 @@ def selfcheck(build_dir: Optional[str] = None, **overrides) -> dict:
     box("flush_box", 4.60, 2.00, 5.00, 2.40, 0.020, 0.420)    # 6 cm into the east wall
     box("upper_drop", 4.00, 3.00, 4.40, 3.40, 2.980, 3.380)   # 8 cm above the upper floor (2.9 m)
     box("upper_sunk", 4.50, 3.20, 4.80, 3.60, 2.875, 3.075)   # 2.5 cm into the upper slab
+    # duplicate placement names and several rugs: these objects are far apart,
+    # so a name-keyed settle would give both cabinets the last pose and attach
+    # every rug to every rug placement (one bbox spanning the whole floor)
+    box("cabinet_a", 0.50, 4.45, 1.10, 4.95, 0.020, 0.820)
+    box("cabinet_b", 1.70, 4.45, 2.30, 4.95, 0.020, 0.820)
+    box("rug_north", 3.00, 4.30, 4.00, 5.00, 0.000, 0.012)   # same room as rug_pad
+    box("rug_upper", 3.40, 3.50, 3.90, 3.90, 2.900, 2.912)   # upper storey
 
     library = bpy.data.collections.new("selfcheck_library")   # not linked: instance source only
     shell_mod.add_prism("selfcheck_src",
@@ -1348,7 +1462,7 @@ def selfcheck(build_dir: Optional[str] = None, **overrides) -> dict:
         "floors": [{"id": "f0", "elevation": 0.0, "height": 2.7, "slab_thickness": 0.05},
                    {"id": "f1", "elevation": 2.9, "height": 2.7, "slab_thickness": 0.2}],
         "rooms": [{"id": "room", "type": "living_room", "floor_id": "f0",
-                   "polygon": [[0, 0], [5, 0], [5, 4], [0, 4]]},
+                   "polygon": [[0, 0], [5, 0], [5, 5.2], [0, 5.2]]},
                   {"id": "upper_room", "type": "living_room", "floor_id": "f1",
                    "polygon": [[3.4, 2.6], [5.0, 2.6], [5.0, 4.0], [3.4, 4.0]]}],
         "cameras": [{"name": "0000", "room": "room", "pos": [2.5, 2.0, 1.5]},
@@ -1369,6 +1483,14 @@ def selfcheck(build_dir: Optional[str] = None, **overrides) -> dict:
             {"asset": "ph:selfcheck", "room": "room", "pos": [4.30, 3.50], "name": "inst_box"},
             {"asset": "ph:selfcheck", "room": "upper_room", "pos": [4.20, 3.20], "name": "upper_drop"},
             {"asset": "ph:selfcheck", "room": "upper_room", "pos": [4.65, 3.40], "name": "upper_sunk"},
+            {"asset": "builtin:kitchen_cabinet", "room": "room", "pos": [0.80, 4.70],
+             "name": "kitchen_cabinet"},
+            {"asset": "builtin:kitchen_cabinet", "room": "room", "pos": [2.00, 4.70],
+             "name": "kitchen_cabinet"},
+            {"asset": "builtin:rug", "room": "room", "pos": [3.50, 4.65], "size": [1.0, 0.7],
+             "name": "rug_pad"},
+            {"asset": "builtin:rug", "room": "upper_room", "pos": [3.65, 3.70], "size": [0.5, 0.4],
+             "name": "rug_upper"},
         ],
     }
     # the placements mirror what place_furniture records: ``z`` is the *authored*
@@ -1404,11 +1526,26 @@ def selfcheck(build_dir: Optional[str] = None, **overrides) -> dict:
          "pos": [4.20, 3.20], "rot_z_deg": 0.0, "z": 2.9, "mount": "floor", "bbox_z": [2.9, 3.3]},
         {"name": "upper_sunk", "asset": "ph:selfcheck", "kind": "model", "instance": "upper_sunk",
          "pos": [4.65, 3.40], "rot_z_deg": 0.0, "z": 2.9, "mount": "floor", "bbox_z": [2.9, 3.1]},
+        # both cabinets carry the same authored name; the explicit object lists
+        # mirror the fixture placements ``place_furniture`` records
+        {"name": "kitchen_cabinet", "asset": "builtin:kitchen_cabinet", "kind": "builtin",
+         "pos": [0.80, 4.70], "rot_z_deg": 0.0, "z": 0.0, "mount": "floor",
+         "objects": ["cabinet_a"]},
+        {"name": "kitchen_cabinet", "asset": "builtin:kitchen_cabinet", "kind": "builtin",
+         "pos": [2.00, 4.70], "rot_z_deg": 0.0, "z": 0.0, "mount": "floor",
+         "objects": ["cabinet_b"]},
+        # the placement name repeats too: the second rug is still a distinct
+        # placement and must own only ``rug_north``
+        {"name": "rug_pad", "asset": "builtin:rug", "kind": "builtin",
+         "pos": [3.50, 4.65], "rot_z_deg": 0.0, "z": 0.0, "size_m": [1.0, 0.7, 0.012]},
+        {"name": "rug_upper", "asset": "builtin:rug", "kind": "builtin",
+         "pos": [3.65, 3.70], "rot_z_deg": 0.0, "z": 2.9, "size_m": [0.5, 0.4, 0.012]},
     ]
     report = ground_furniture(spec, {"placements": placements, "lamp_lights": []}, build_dir,
                               shell_info=None, **overrides)
 
     entries = {entry["name"]: entry for entry in report["objects"]}
+    entries_by_index = {entry["index"]: entry for entry in report["objects"]}
     checks: List[dict] = []
 
     def check(name, passed, detail):
@@ -1477,6 +1614,48 @@ def selfcheck(build_dir: Optional[str] = None, **overrides) -> dict:
     check("upper_sunk lifted out of the upper slab",
           sunk_upper["bbox_z_before"][0] < 2.9 - 0.001 and after("upper_sunk")[0] >= 2.9 - 0.001,
           f"started {sunk_upper['bbox_z_before'][0]:.3f} m, now {after('upper_sunk')[0]:.3f} m")
+    # -- duplicate names / multiple rugs: stable placement index ------------- #
+    cab_a, cab_b = entries_by_index[14], entries_by_index[15]
+    cab_a_x, cab_b_x = extent("cabinet_a", 0), extent("cabinet_b", 0)
+    cabinet_gap = cab_b_x[0] - cab_a_x[1]
+    check("same-named cabinets keep their own objects",
+          cab_a["objects"] == ["cabinet_a"] and cab_b["objects"] == ["cabinet_b"],
+          f"objects {cab_a['objects']} / {cab_b['objects']}")
+    check("same-named cabinets settle independently",
+          -0.001 <= cab_a["bbox_z_after"][0] <= ground
+          and -0.001 <= cab_b["bbox_z_after"][0] <= ground
+          and cabinet_gap > 0.0,
+          f"bottom {cab_a['bbox_z_after'][0] * 1000:.1f} / "
+          f"{cab_b['bbox_z_after'][0] * 1000:.1f} mm, x extents "
+          f"{tuple(round(v, 2) for v in cab_a_x)} / {tuple(round(v, 2) for v in cab_b_x)}")
+    rug_expected = {
+        6: ("rug_pad", (2.0, 3.4), (1.8, 3.2), 0.0),
+        16: ("rug_north", (3.0, 4.0), (4.3, 5.0), 0.0),
+        17: ("rug_upper", (3.4, 3.9), (3.5, 3.9), 2.9),
+    }
+    for index, (object_name, x_range, y_range, floor_z) in rug_expected.items():
+        entry = entries_by_index[index]
+        x0, x1 = extent(object_name, 0)
+        y0, y1 = extent(object_name, 1)
+        bottom = entry["bbox_z_after"][0]
+        check(f"rug #{index} keeps its own footprint",
+              entry["objects"] == [object_name]
+              and abs(x0 - x_range[0]) < 0.01 and abs(x1 - x_range[1]) < 0.01
+              and abs(y0 - y_range[0]) < 0.01 and abs(y1 - y_range[1]) < 0.01
+              and -0.001 <= bottom - floor_z <= ground,
+              f"{entry['name']} -> {entry['objects']}, x {x0:.2f}..{x1:.2f}, "
+              f"y {y0:.2f}..{y1:.2f}, bottom {bottom:.3f} m")
+    check("placement records follow the placement index",
+          placements[14]["settle"]["objects"] == ["cabinet_a"]
+          and placements[15]["settle"]["objects"] == ["cabinet_b"]
+          and placements[6]["settle"]["objects"] == ["rug_pad"]
+          and placements[16]["settle"]["objects"] == ["rug_north"]
+          and placements[17]["settle"]["objects"] == ["rug_upper"]
+          and abs(placements[17]["z"] - 2.9) <= ground,
+          f"cabinet rugs: {placements[14]['settle']['objects']} / "
+          f"{placements[15]['settle']['objects']}; rugs: "
+          f"{placements[6]['settle']['objects']} / {placements[16]['settle']['objects']} / "
+          f"{placements[17]['settle']['objects']} at z={placements[17]['z']:.3f} m")
     check("everything came to rest", bool(report["simulation"]["at_rest"]),
           f"{report['simulation']['frames_used']} frames, peak motion "
           f"{report['simulation']['peak_motion_m']} m")

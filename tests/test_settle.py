@@ -231,6 +231,70 @@ class GeometryHelperTest(unittest.TestCase):
         self.assertEqual(distance, 0.0)
 
 
+class _FakeObject:
+    def __init__(self, name, type="MESH"):
+        self.name = name
+        self.type = type
+
+
+class TargetMatchingTest(unittest.TestCase):
+    """Generated builtin props are grouped by creation order, not by name."""
+
+    def test_duplicate_names_get_distinct_roots(self):
+        self.assertEqual(settle._prop_root("rug_living"), "rug_living")
+        self.assertEqual(settle._prop_root("rug_living.001"), "rug_living.001")
+        self.assertEqual(settle._prop_root("lamp_bed_base.001"), "lamp_bed.001")
+        self.assertEqual(settle._prop_root("lamp_bed_stem.001"), "lamp_bed.001")
+        self.assertEqual(settle._prop_root("lamp_bed_shade.001"), "lamp_bed.001")
+        self.assertEqual(settle._strip_duplicate_suffix("rug_living.001"), "rug_living")
+
+    def test_generated_groups_follow_creation_order(self):
+        objects = [
+            _FakeObject("rug_living"),
+            _FakeObject("lamp_bed_base"), _FakeObject("lamp_bed_stem"), _FakeObject("lamp_bed_shade"),
+            _FakeObject("cabinet_carcass"),          # a non-prop mesh breaks the run
+            _FakeObject("rug_living.001"),
+            _FakeObject("lamp_bed_base.001"), _FakeObject("lamp_bed_stem.001"),
+            _FakeObject("lamp_bed_shade.001"),
+        ]
+        groups = settle._generated_prop_groups(objects)
+        self.assertEqual(
+            [[obj.name for obj in group] for group in groups],
+            [["rug_living"],
+             ["lamp_bed_base", "lamp_bed_stem", "lamp_bed_shade"],
+             ["rug_living.001"],
+             ["lamp_bed_base.001", "lamp_bed_stem.001", "lamp_bed_shade.001"]],
+        )
+
+
+class PlacementBookkeepingTest(unittest.TestCase):
+    """Settle writes its results back by placement index, not by name."""
+
+    def _entry(self, index, name, objects, bottom=0.002):
+        return {
+            "index": index, "name": name, "mode": "rest", "reason": "rests on the floor",
+            "objects": objects, "bbox_z_before": [0.02, 0.82],
+            "bbox_z_after": [bottom, 0.80], "moved_m": 0.018, "rotation_deg": 0.0,
+            "lift_m": 0.021, "separation_m": 0.0, "flat": False,
+            "gap_m": 0.002, "grounded": True, "penetrating": False,
+        }
+
+    def test_duplicate_names_are_written_to_their_own_placement(self):
+        placements = [
+            {"name": "kitchen_cabinet", "z": 0.0, "bbox_z": [0.02, 0.82]},
+            {"name": "kitchen_cabinet", "z": 0.0, "bbox_z": [0.02, 0.82]},
+        ]
+        # deliberately out of order: only the index may pair them
+        contents = [self._entry(1, "kitchen_cabinet", ["cabinet_b"], bottom=0.003),
+                    self._entry(0, "kitchen_cabinet", ["cabinet_a"], bottom=0.002)]
+        settle._update_placements(placements, contents, settle.resolve_config(None))
+        self.assertEqual(placements[0]["settle"]["objects"], ["cabinet_a"])
+        self.assertEqual(placements[1]["settle"]["objects"], ["cabinet_b"])
+        self.assertEqual(placements[0]["z"], 0.002)
+        self.assertEqual(placements[1]["z"], 0.003)
+        self.assertEqual(placements[0]["settle"]["bbox_z_after"], [0.002, 0.80])
+
+
 class HeadlessSelfCheckTest(unittest.TestCase):
     """Drive the CLI self-check: placed boxes must end up on the floor, unsunk."""
 
