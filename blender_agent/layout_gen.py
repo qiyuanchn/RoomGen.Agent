@@ -94,7 +94,8 @@ import os
 import random
 import sys
 import time
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -289,7 +290,9 @@ ASSET_SLOTS: Dict[str, dict] = {
 RUG_ASSET = "builtin:rug"
 LAMP_ASSET = "builtin:table_lamp"
 # fixture geometry lives in blender_agent/fixtures.py as ``builtin:`` parts
-FIXTURE_GAP_M = 0.005          # gap between the modules of a counter run
+#: gap between counter modules; settle moves each fixture a few millimetres, so a
+#: hairline seam would let two built bodies overlap in the final-geometry check
+FIXTURE_GAP_M = 0.02
 USAGE_GAP_M = 0.02             # tolerance of a keep-clear zone in front of a fixture
 USAGE_NEIGHBOUR_M = 0.10       # an item this close to a fixture is beside it, not in front
 UPPER_CABINET_Z_M = 1.62       # wall cupboards start above checks.WALK_BAND_M[1]
@@ -426,6 +429,193 @@ def room_walls(rect: Rect) -> Dict[str, Wall]:
     }
 
 
+def _rect_contains(rect: Rect, x: float, y: float) -> bool:
+    return rect.x0 - 1e-9 <= x <= rect.x1 + 1e-9 and rect.y0 - 1e-9 <= y <= rect.y1 + 1e-9
+
+
+def rects_outline(parts: Sequence[Rect]) -> List[List[float]]:
+    """Outer outline of a union of axis-aligned rectangles (CCW, simplified).
+
+    The generator builds an L-shaped room as several grid cells of one room
+    instance.  This traces the *union* boundary on the cells' coordinate
+    lattice, so shared internal edges disappear and the result is a single
+    simple polygon (no duplicated internal walls).  A plain rectangle returns
+    its four corners unchanged.
+    """
+    rects = [rect for rect in parts if rect.w > 1e-9 and rect.h > 1e-9]
+    if not rects:
+        raise ValueError("a room needs at least one rectangle")
+    if len(rects) == 1:
+        return rects[0].polygon()
+
+    xs = sorted({round(float(value), 9) for rect in rects for value in (rect.x0, rect.x1)})
+    ys = sorted({round(float(value), 9) for rect in rects for value in (rect.y0, rect.y1)})
+    nx, ny = len(xs) - 1, len(ys) - 1
+    filled = [[False] * nx for _ in range(ny)]
+    for j in range(ny):
+        cy = 0.5 * (ys[j] + ys[j + 1])
+        for i in range(nx):
+            cx = 0.5 * (xs[i] + xs[i + 1])
+            filled[j][i] = any(_rect_contains(rect, cx, cy) for rect in rects)
+
+    edges: Dict[Tuple[float, float], List[Tuple[float, float]]] = {}
+
+    def add_edge(start, end) -> None:
+        edges.setdefault(start, []).append(end)
+
+    for j in range(ny):
+        for i in range(nx):
+            if not filled[j][i]:
+                continue
+            x0, x1 = xs[i], xs[i + 1]
+            y0, y1 = ys[j], ys[j + 1]
+            # walk the occupied cell counter-clockwise: each boundary edge keeps
+            # the room on its left
+            if j == 0 or not filled[j - 1][i]:
+                add_edge((x0, y0), (x1, y0))
+            if i == nx - 1 or not filled[j][i + 1]:
+                add_edge((x1, y0), (x1, y1))
+            if j == ny - 1 or not filled[j + 1][i]:
+                add_edge((x1, y1), (x0, y1))
+            if i == 0 or not filled[j][i - 1]:
+                add_edge((x0, y1), (x0, y0))
+
+    loops: List[List[Tuple[float, float]]] = []
+    while edges:
+        start = next(iter(edges))
+        loop = [start]
+        current = start
+        guard = 0
+        while True:
+            guard += 1
+            if guard > 4 * (nx + 1) * (ny + 1) + 16:
+                raise ValueError("room parts do not form a simple outline")
+            outgoing = edges.get(current)
+            if not outgoing:
+                raise ValueError("room parts do not form a closed outline")
+            nxt = outgoing.pop(0)
+            if not outgoing:
+                del edges[current]
+            if nxt == start:
+                break
+            loop.append(nxt)
+            current = nxt
+        loops.append(loop)
+    if len(loops) != 1:
+        raise ValueError("room parts must form one edge-connected outline")
+    loop = loops[0]
+    if spec_mod.polygon_area(loop) < 0.0:
+        loop.reverse()
+
+    simplified: List[Tuple[float, float]] = []
+    for point in loop:
+        if len(simplified) >= 2:
+            ax, ay = simplified[-2]
+            bx, by = simplified[-1]
+            if abs((bx - ax) * (point[1] - by) - (by - ay) * (point[0] - bx)) < 1e-9:
+                simplified[-1] = point
+                continue
+        simplified.append(point)
+    if len(simplified) >= 3:
+        ax, ay = simplified[-2]
+        bx, by = simplified[-1]
+        if abs((bx - ax) * (simplified[0][1] - by) - (by - ay) * (simplified[0][0] - bx)) < 1e-9:
+            simplified.pop()
+    expected = sum(rect.w * rect.h for rect in rects)
+    if abs(abs(spec_mod.polygon_area(simplified)) - expected) > 1e-6 * max(1.0, expected):
+        raise ValueError("room parts overlap or are only point-connected")
+    return [[float(x), float(y)] for x, y in simplified]
+
+
+def polygon_walls(polygon: Sequence[Sequence[float]]) -> Dict[str, Wall]:
+    """Every axis-aligned boundary edge as a :class:`Wall`.
+
+    A rectangle keeps the plain ``S``/``N``/``W``/``E`` keys; extra edges of an
+    L-shaped room get ``"N#2"`` etc. so ``dict.values()`` still iterates all of
+    them and ``.side`` stays the compass side furniture code expects.
+    """
+    walls: Dict[str, Wall] = {}
+    counts: Dict[str, int] = {}
+    count = len(polygon)
+    for index in range(count):
+        ax, ay = float(polygon[index][0]), float(polygon[index][1])
+        bx, by = float(polygon[(index + 1) % count][0]), float(polygon[(index + 1) % count][1])
+        dx, dy = bx - ax, by - ay
+        if abs(dy) <= 1e-9:
+            side = "S" if dx > 0.0 else "N"
+            wall = Wall(side, ay, min(ax, bx), max(ax, bx))
+        elif abs(dx) <= 1e-9:
+            side = "E" if dy > 0.0 else "W"
+            wall = Wall(side, ax, min(ay, by), max(ay, by))
+        else:
+            raise ValueError("polygon_walls needs axis-aligned room edges")
+        counts[side] = counts.get(side, 0) + 1
+        key = side if counts[side] == 1 else f"{side}#{counts[side]}"
+        walls[key] = wall
+    return walls
+
+
+def polygon_centroid(polygon: Sequence[Sequence[float]]) -> Tuple[float, float]:
+    """Area centroid of a polygon (falls back to the vertex mean when degenerate)."""
+    area = spec_mod.polygon_area(polygon)
+    if abs(area) < 1e-12:
+        points = [(float(p[0]), float(p[1])) for p in polygon]
+        return (sum(p[0] for p in points) / len(points), sum(p[1] for p in points) / len(points))
+    cx = cy = 0.0
+    count = len(polygon)
+    for index in range(count):
+        x0, y0 = float(polygon[index][0]), float(polygon[index][1])
+        x1, y1 = float(polygon[(index + 1) % count][0]), float(polygon[(index + 1) % count][1])
+        cross = x0 * y1 - x1 * y0
+        cx += (x0 + x1) * cross
+        cy += (y0 + y1) * cross
+    return (cx / (6.0 * area), cy / (6.0 * area))
+
+
+def _wall_side_of_polygon(polygon: Sequence[Sequence[float]], start: Sequence[float],
+                          end: Sequence[float]) -> Optional[str]:
+    """Which side of a rectilinear room polygon an axis-aligned span sits on."""
+    if abs(start[1] - end[1]) < 1e-9:
+        line, low, high = float(start[1]), min(start[0], end[0]), max(start[0], end[0])
+    elif abs(start[0] - end[0]) < 1e-9:
+        line, low, high = float(start[0]), min(start[1], end[1]), max(start[1], end[1])
+    else:
+        return None
+    count = len(polygon)
+    for index in range(count):
+        ax, ay = float(polygon[index][0]), float(polygon[index][1])
+        bx, by = float(polygon[(index + 1) % count][0]), float(polygon[(index + 1) % count][1])
+        if abs(start[1] - end[1]) < 1e-9 and abs(ay - by) < 1e-9 and abs(ay - line) < 1e-6:
+            if min(ax, bx) < high - 1e-6 and max(ax, bx) > low + 1e-6:
+                return "S" if bx > ax else "N"
+        if abs(start[0] - end[0]) < 1e-9 and abs(ax - bx) < 1e-9 and abs(ax - line) < 1e-6:
+            if min(ay, by) < high - 1e-6 and max(ay, by) > low + 1e-6:
+                return "E" if by > ay else "W"
+    return None
+
+
+@dataclass
+class ZonePlan:
+    """One semantic area of an open-plan room (a functional zone, not a room).
+
+    ``rect`` is the zone's own rectangle; zones of the generator are grid cells
+    of the open space, so they never add a wall.  Furniture may be confined to a
+    zone while collisions and circulation are still measured over the whole
+    physical room.
+    """
+
+    zone_type: str
+    rect: Rect
+
+    @property
+    def polygon(self) -> List[List[float]]:
+        return self.rect.polygon()
+
+    @property
+    def area(self) -> float:
+        return self.rect.area
+
+
 @dataclass
 class RoomPlan:
     room_id: str
@@ -434,10 +624,48 @@ class RoomPlan:
     target_area: float
     width: float
     depth: float
+    #: grid cells of one non-rectangular room (empty = the single ``rect``)
+    parts: List[Rect] = field(default_factory=list)
+    #: semantic zones of an open-plan physical room
+    zones: List[ZonePlan] = field(default_factory=list)
+    open_plan: bool = False
+    _polygon_cache: Optional[List[List[float]]] = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not self.parts:
+            self.parts = [self.rect]
+        if self.zones and not self.open_plan:
+            self.open_plan = True
+
+    def set_rect(self, rect: Rect) -> None:
+        """Move a plain rectangular plan; the outline follows the new rect."""
+        self.rect = rect
+        self.parts = [rect]
+        self._polygon_cache = None
+
+    @property
+    def polygon(self) -> List[List[float]]:
+        """Physical outline of the room (union of :attr:`parts`)."""
+        if self._polygon_cache is None:
+            self._polygon_cache = rects_outline(self.parts)
+        return self._polygon_cache
+
+    @property
+    def area(self) -> float:
+        """Real floor area of the outline (not the bounding box)."""
+        return abs(spec_mod.polygon_area(self.polygon))
 
     @property
     def walls(self) -> Dict[str, Wall]:
-        return room_walls(self.rect)
+        if len(self.parts) == 1:
+            return room_walls(self.rect)
+        return polygon_walls(self.polygon)
+
+    def zone(self, zone_type: str) -> Optional[ZonePlan]:
+        for zone in self.zones:
+            if zone.zone_type == zone_type:
+                return zone
+        return None
 
 
 @dataclass
@@ -448,6 +676,9 @@ class DoorPlan:
     span: Tuple[float, float]
     wall: Wall
     direction: Tuple[float, float]
+    kind: str = "door"
+    width: float = DOOR_W
+    height: float = DOOR_H
 
     def key(self) -> str:
         return f"{self.a}|{self.b}"
@@ -584,7 +815,7 @@ def plan_rooms(rng: random.Random, types: Sequence[str]) -> List[RoomPlan]:
     x = 0.0
     for plan in plans:
         x1 = _round(x + plan.width)
-        plan.rect = Rect(x, 0.0, x1, _round(plan.depth, 0.01))
+        plan.set_rect(Rect(x, 0.0, x1, _round(plan.depth, 0.01)))
         x = x1
     if x < 6.0:
         raise _AttemptFailed("row too short")
@@ -684,7 +915,7 @@ def plan_rooms_block(rng: random.Random, types: Sequence[str]) -> List[RoomPlan]
         x -= width
 
     for plan, rect in placements:
-        plan.rect = rect
+        plan.set_rect(rect)
         low, high = ROOM_AREA_M2[plan.room_type]
         if plan.rect.w < ROOM_MIN_DIM_M[plan.room_type] - 1e-9 or \
                 plan.rect.h < ROOM_MIN_DIM_M[plan.room_type] - 1e-9:
@@ -906,6 +1137,22 @@ AUTO_FAMILY_WEIGHT: Dict[str, float] = {
     "corridor_single": 1.6,
     "corridor_double": 1.6,
     "loop": 1.5,
+    # one physical open living/dining/kitchen space with an L outline plus an
+    # L-shaped bedroom: the non-rectangular / open-plan arrangement
+    "open_plan": 2.0,
+}
+#: ``--shape open_plan`` room programme: one open LDK room, one L bedroom, one
+#: bathroom, one circulation hall.  See :func:`plan_open_plan`.
+OPEN_PLAN_ROOMS = 4
+#: the LDK meets the hall through a wide cased opening, not a door leaf
+OPEN_PLAN_PASSAGE_WIDTH = 1.4
+OPEN_PLAN_PASSAGE_HEIGHT = 2.3
+OPEN_PLAN_DEFAULT_SIZE = {
+    # the bedroom's long arm (w1 x d1+d2) is wide enough that a bed can keep a
+    # 1.2 m passage on one side -- a 2.4 m arm leaves only 0.45 m beside a
+    # 1.5 m-wide bed, which the final-geometry usage check rejects
+    "w0": (2.8, 3.2), "w1": (2.8, 3.05), "w2": (1.9, 2.05),
+    "d0": (2.9, 3.2), "d1": (2.5, 2.75), "d2": (1.9, 2.15),
 }
 #: The room counts ``row``/``block`` draw when ``--rooms`` is not given.
 AUTO_COUNT_DRAW = (2, 3, 3, 4, 4, 4, 5, 5, 6)
@@ -923,14 +1170,19 @@ AUTO_PICK_SALT = 7919
 
 
 def _check_room_bands(plan: RoomPlan, where: str) -> None:
-    """The shared contract: a room rectangle must land in its type's band."""
+    """The shared contract: a room outline must land in its type's band.
+
+    The area is the real polygon area (an L-shaped room is smaller than its
+    bounding box); the minimum side is measured on the bounding box, because a
+    room's usable width has to hold its function somewhere.
+    """
     low, high = ROOM_AREA_M2[plan.room_type]
     if plan.rect.w < ROOM_MIN_DIM_M[plan.room_type] - 1e-9 or \
             plan.rect.h < ROOM_MIN_DIM_M[plan.room_type] - 1e-9:
         raise _AttemptFailed(f"room {plan.room_type} too small "
                              f"({plan.rect.w:.2f}x{plan.rect.h:.2f} m{where})")
-    if not (low - 1e-9 <= plan.rect.area <= high + 1e-9):
-        raise _AttemptFailed(f"room {plan.room_type} area {plan.rect.area:.1f} m2 outside "
+    if not (low - 1e-9 <= plan.area <= high + 1e-9):
+        raise _AttemptFailed(f"room {plan.room_type} area {plan.area:.1f} m2 outside "
                              f"[{low}, {high}]{where}")
 
 
@@ -1159,12 +1411,82 @@ def _draw_family(rng: random.Random, family: _Family) -> List[RoomPlan]:
     return plans
 
 
+def plan_open_plan(rng: random.Random) -> List[RoomPlan]:
+    """The open-plan / non-rectangular programme of ``--shape open_plan``.
+
+    A 3x3 cell grid hosts one continuous open living-dining-kitchen space (an L
+    of three cells, with ``kitchen`` / ``dining`` / ``living_room`` semantic
+    zones), one L-shaped bedroom (three cells around the courtyard notch), a
+    bathroom and a circulation hall.  Two physical rooms are non-rectangular
+    outlines, and the LDK's three functions share *one* room: no wall, door or
+    circulation edge separates them.  Cell sizes are drawn inside bands that
+    keep every room's real polygon area in its type band (see
+    ``ROOM_AREA_M2``), so the draw needs no rejection loop.
+    """
+    sizes = {key: round(_round(rng.uniform(low, high), 0.05), 2)
+             for key, (low, high) in OPEN_PLAN_DEFAULT_SIZE.items()}
+    xs = [0.0, sizes["w0"], round(sizes["w0"] + sizes["w1"], 4),
+          round(sizes["w0"] + sizes["w1"] + sizes["w2"], 4)]
+    ys = [0.0, sizes["d0"], round(sizes["d0"] + sizes["d1"], 4),
+          round(sizes["d0"] + sizes["d1"] + sizes["d2"], 4)]
+    total_w, total_h = xs[-1], ys[-1]
+
+    def cell(col: int, row: int) -> Rect:
+        return Rect(xs[col], ys[row], xs[col + 1], ys[row + 1])
+
+    mirror_x = rng.random() < 0.5
+    mirror_y = rng.random() < 0.5
+
+    def mirrored(rect: Rect) -> Rect:
+        if mirror_x:
+            rect = Rect(total_w - rect.x1, rect.y0, total_w - rect.x0, rect.y1)
+        if mirror_y:
+            rect = Rect(rect.x0, total_h - rect.y1, rect.x1, total_h - rect.y0)
+        return rect
+
+    open_parts = [mirrored(cell(0, 0)), mirrored(cell(1, 0)), mirrored(cell(0, 1))]
+    bedroom_parts = [mirrored(cell(1, 1)), mirrored(cell(1, 2)), mirrored(cell(2, 2))]
+    bath = mirrored(cell(2, 0))
+    hall = mirrored(cell(0, 2))
+
+    def bbox(parts: Sequence[Rect]) -> Rect:
+        return Rect(min(rect.x0 for rect in parts), min(rect.y0 for rect in parts),
+                    max(rect.x1 for rect in parts), max(rect.y1 for rect in parts))
+
+    def build(room_type: str, parts: Sequence[Rect], zones: Sequence[ZonePlan] = (),
+              open_plan: bool = False) -> RoomPlan:
+        box = bbox(parts)
+        plan = RoomPlan(room_id="", room_type=room_type, rect=box,
+                        target_area=sum(rect.area for rect in parts),
+                        width=box.w, depth=box.h, parts=list(parts), zones=list(zones),
+                        open_plan=open_plan)
+        _check_room_bands(plan, " in open_plan")
+        return plan
+
+    zones = [
+        ZonePlan("kitchen", mirrored(cell(0, 0))),
+        ZonePlan("dining", mirrored(cell(1, 0))),
+        ZonePlan("living_room", mirrored(cell(0, 1))),
+    ]
+    plans = [
+        build("living_room", open_parts, zones=zones, open_plan=True),
+        build("bedroom", bedroom_parts),
+        build("bathroom", [bath]),
+        build("corridor", [hall]),
+    ]
+    for room_type, plan in zip(("living_room", "bedroom", "bathroom", "corridor"), plans):
+        plan.room_id = ROOM_ID_BASE[room_type]
+    return plans
+
+
 def _shapes_for_count(count: int) -> Tuple[str, ...]:
     """Every arrangement that can host a flat of ``count`` rooms."""
     names = ["row"]
     if count >= 3:
         names.append("block")
     names += sorted(name for name, family in ROOM_FAMILIES.items() if family.count == count)
+    if count == OPEN_PLAN_ROOMS:
+        names.append("open_plan")
     return tuple(names)
 
 
@@ -1197,6 +1519,8 @@ def _pick_auto_shape(rng: random.Random, room_count: Optional[int]) -> Tuple[int
         family = ROOM_FAMILIES.get(shape)
         if family is not None:
             return family.count, shape
+        if shape == "open_plan":
+            return OPEN_PLAN_ROOMS, shape
         return int(rng.choice(AUTO_COUNT_DRAW)), shape
     count = int(_clamp(room_count, 2, 7))
     names = _shapes_for_count(count)
@@ -1316,23 +1640,45 @@ def _plans_by_id(plans: Sequence[RoomPlan]) -> Dict[str, RoomPlan]:
 
 
 def _wall_segments_for(plans: Sequence[RoomPlan]):
-    room_specs = [spec_mod.RoomSpec(id=plan.room_id, type=plan.room_type, polygon=plan.rect.polygon())
+    room_specs = [spec_mod.RoomSpec(id=plan.room_id, type=plan.room_type, polygon=plan.polygon)
                   for plan in plans]
     return spec_mod.build_wall_segments(room_specs)
 
 
-def _segment_offset(segments, a_id: str, b_id: str, point):
-    """``(segment, offset of ``point`` from its start)`` on a wall owning both rooms."""
+def _shared_segments_by_pair(segments) -> Dict[Tuple[str, str], List[object]]:
+    """``(room_a, room_b) -> shared wall spans`` for every touching pair."""
+    pairs: Dict[Tuple[str, str], List[object]] = {}
     for segment in segments:
-        if a_id in segment.owners and b_id in segment.owners and segment.contains_point(point):
-            base = spec_mod.line_parameter(segment.p0, segment.direction)
-            return segment, spec_mod.line_parameter(point, segment.direction) - base
-    return None, None
+        owners = sorted(segment.owners)
+        for index, a in enumerate(owners):
+            for b in owners[index + 1:]:
+                pairs.setdefault((a, b), []).append(segment)
+    return pairs
+
+
+def _wall_of_segment(segment, room: RoomPlan) -> Wall:
+    """The wall span as ``room`` sees it (its own compass side, not the canonical axis)."""
+    (ax, ay), (bx, by) = segment.p0, segment.p1
+    if abs(ay - by) < 1e-9:
+        line = ay
+        probe = 0.05
+        above = spec_mod.point_in_polygon(((ax + bx) / 2.0, line + probe), room.polygon)
+        side = "S" if above else "N"
+        lo, hi = min(ax, bx), max(ax, bx)
+    else:
+        line = ax
+        probe = 0.05
+        right = spec_mod.point_in_polygon((line + probe, (ay + by) / 2.0), room.polygon)
+        side = "W" if right else "E"
+        lo, hi = min(ay, by), max(ay, by)
+    return Wall(side, line, lo, hi)
 
 
 def plan_doors_graph(rng: random.Random, plans: Sequence[RoomPlan],
-                     extra_doors: int = 0) -> List[DoorPlan]:
-    """Doors of an arbitrary rectangle plan: a semantic spanning tree + a loop.
+                     extra_doors: int = 0, passage_room: Optional[str] = None,
+                     passage_width: float = 1.4,
+                     passage_height: float = 2.3) -> List[DoorPlan]:
+    """Doors of an arbitrary plan: a semantic spanning tree + a loop.
 
     Every pair of rooms that shares a wall long enough is a candidate; Kruskal
     over the doorway preference (:data:`DOOR_CLASS_SCORE`) builds the spanning
@@ -1342,22 +1688,34 @@ def plan_doors_graph(rng: random.Random, plans: Sequence[RoomPlan],
     (:func:`door_semantics` re-checks it).  ``extra_doors`` adds the
     best-scoring remaining connection between two non-private rooms, which is
     how the loop families get their second way round.
+
+    Shared walls are taken from the merged room outlines, so a pair of
+    L-shaped rooms may touch along several spans (the door goes on one of
+    them).  ``passage_room`` widens every connection from that physical room
+    to another public room into an ``open_passage`` -- the open LDK meeting the
+    circulation hall without a door leaf.
     """
     by_id = _plans_by_id(plans)
+    segments = _wall_segments_for(plans)
+    shared = _shared_segments_by_pair(segments)
+
+    def door_width(a: str, b: str) -> float:
+        if passage_room in (a, b):
+            other = b if a == passage_room else a
+            if by_id[other].room_type not in PRIVATE_ROOM_TYPES:
+                return passage_width
+        return DOOR_W
+
     candidates: List[Tuple[float, float, str, str]] = []
-    for index, first in enumerate(plans):
-        for second in plans[index + 1:]:
-            shared = shared_wall_span(first.rect, second.rect)
-            if shared is None:
-                continue
-            _wall, (lo, hi) = shared
-            if hi - lo < DOOR_W + 2 * DOOR_JAMB_M:
-                continue
-            score = _door_score(first.room_type, second.room_type)
-            if score < 0.0:
-                continue
-            jitter = rng.random() * 0.5
-            candidates.append((score, jitter, first.room_id, second.room_id))
+    for (a, b) in sorted(shared):
+        width = door_width(a, b)
+        if max(segment.length for segment in shared[(a, b)]) < width + 2 * DOOR_JAMB_M:
+            continue
+        score = _door_score(by_id[a].room_type, by_id[b].room_type)
+        if score < 0.0:
+            continue
+        jitter = rng.random() * 0.5
+        candidates.append((score, jitter, a, b))
     candidates.sort(key=lambda entry: (-entry[0], -entry[1], entry[2], entry[3]))
     if len(plans) == 1:
         return []
@@ -1421,47 +1779,81 @@ def plan_doors_graph(rng: random.Random, plans: Sequence[RoomPlan],
         edges.append((a, b))
 
     # place every door on its shared wall, keeping jambs and other doors clear
-    segments = _wall_segments_for(plans)
     used_spans: Dict[Tuple[Tuple[float, float], Tuple[float, float]], List[Tuple[float, float]]] = {}
     doors: List[DoorPlan] = []
     for a, b in edges:
-        first, second = by_id[a], by_id[b]
-        shared = shared_wall_span(first.rect, second.rect)
-        if shared is None:
-            raise _AttemptFailed(f"edge {a}|{b} no longer shares a wall")
-        wall, (lo, hi) = shared
-        door = _place_graph_door(rng, first, second, wall, lo, hi, segments, used_spans)
+        pair = tuple(sorted((a, b)))
+        width = door_width(a, b)
+        height = passage_height if width == passage_width else DOOR_H
+        kind = "open_passage" if width == passage_width else "door"
+        door = _place_graph_door(rng, by_id[a], by_id[b], shared.get(pair, []), used_spans,
+                                 width=width, height=height, kind=kind)
         if door is None:
             raise _AttemptFailed(f"no free place for the door between {a} and {b}")
         doors.append(door)
     return doors
 
 
-def _place_graph_door(rng: random.Random, first: RoomPlan, second: RoomPlan, wall: Wall,
-                      lo: float, hi: float, segments, used_spans) -> Optional[DoorPlan]:
-    """Sample one door position on the shared wall that fits the wall segment."""
-    low, high = lo + DOOR_W / 2.0 + DOOR_JAMB_M, hi - DOOR_W / 2.0 - DOOR_JAMB_M
-    if low > high:
+def _place_graph_door(rng: random.Random, first: RoomPlan, second: RoomPlan, segments,
+                      used_spans, width: float = DOOR_W, height: float = DOOR_H,
+                      kind: str = "door") -> Optional[DoorPlan]:
+    """Sample one opening position on one shared wall span."""
+    usable = [segment for segment in segments
+              if segment.length >= width + 2 * DOOR_JAMB_M - 1e-9]
+    if not usable:
         return None
-    for _attempt in range(24):
-        along = _round(rng.uniform(low, high), 0.01)
-        center = (along, wall.line) if wall.side in ("N", "S") else (wall.line, along)
-        segment, offset = _segment_offset(segments, first.room_id, second.room_id, center)
-        if segment is None or offset is None:
+    usable.sort(key=lambda segment: (-segment.length, segment.p0, segment.p1))
+    half = width / 2.0
+    for segment in usable:
+        low, high = DOOR_JAMB_M + half, segment.length - DOOR_JAMB_M - half
+        if low > high:
             continue
-        if offset - DOOR_W / 2.0 < DOOR_JAMB_M - 1e-9 or offset + DOOR_W / 2.0 > segment.length - DOOR_JAMB_M + 1e-9:
-            continue
-        span = (offset - DOOR_W / 2.0, offset + DOOR_W / 2.0)
-        key = (segment.p0, segment.p1)
-        taken = used_spans.setdefault(key, [])
-        if any(span[0] < other[1] - 1e-6 and other[0] < span[1] - 1e-6 for other in taken):
-            continue
-        taken.append(span)
-        return DoorPlan(a=first.room_id, b=second.room_id, center=center,
-                        span=(along - DOOR_W / 2.0, along + DOOR_W / 2.0),
-                        wall=wall,
-                        direction=(1.0, 0.0) if wall.side in ("N", "S") else (0.0, 1.0))
+        wall = _wall_of_segment(segment, first)
+        for _attempt in range(24):
+            offset = rng.uniform(low, high)
+            if abs(segment.direction[0]) > 0.5:
+                along = _round(segment.p0[0] + offset, 0.01)
+                center = (along, segment.p0[1])
+            else:
+                along = _round(segment.p0[1] + offset, 0.01)
+                center = (segment.p0[0], along)
+            span = (along - half, along + half)
+            key = (segment.p0, segment.p1)
+            taken = used_spans.setdefault(key, [])
+            if any(span[0] < other[1] - 1e-6 and other[0] < span[1] - 1e-6 for other in taken):
+                continue
+            taken.append(span)
+            return DoorPlan(a=first.room_id, b=second.room_id, center=center, span=span,
+                            wall=wall,
+                            direction=(1.0, 0.0) if wall.side in ("N", "S") else (0.0, 1.0),
+                            kind=kind, width=width, height=height)
     return None
+
+
+def _polygon_axis_edges(polygon: Sequence[Sequence[float]]):
+    """``(axis, line, lo, hi)`` of every axis-aligned edge of a polygon."""
+    out = []
+    count = len(polygon)
+    for index in range(count):
+        ax, ay = float(polygon[index][0]), float(polygon[index][1])
+        bx, by = float(polygon[(index + 1) % count][0]), float(polygon[(index + 1) % count][1])
+        if abs(ay - by) < 1e-9:
+            out.append(("h", ay, min(ax, bx), max(ax, bx)))
+        elif abs(ax - bx) < 1e-9:
+            out.append(("v", ax, min(ay, by), max(ay, by)))
+    return out
+
+
+def _polygons_share_edge(a: Sequence[Sequence[float]], b: Sequence[Sequence[float]],
+                         min_length: float = 0.5) -> bool:
+    """True when two rectilinear polygons share a boundary span of some length."""
+    for axis_a, line_a, lo_a, hi_a in _polygon_axis_edges(a):
+        for axis_b, line_b, lo_b, hi_b in _polygon_axis_edges(b):
+            if axis_a != axis_b or abs(line_a - line_b) > 1e-6:
+                continue
+            if min(hi_a, hi_b) - max(lo_a, lo_b) >= min_length - 1e-9:
+                return True
+    return False
 
 
 def door_semantics(plans: Sequence[RoomPlan], doors: Sequence[DoorPlan]) -> dict:
@@ -1510,16 +1902,37 @@ def door_semantics(plans: Sequence[RoomPlan], doors: Sequence[DoorPlan]) -> dict
     kitchen = [plan.room_id for plan in plans if plan.room_type == "kitchen"]
     kitchen_next_to: Optional[str] = None
     kitchen_door_to: Optional[str] = None
+    shared_pairs = set(_shared_segments_by_pair(_wall_segments_for(plans)))
     target = dining[0] if dining else (next((plan.room_id for plan in plans
                                              if plan.room_type == "living_room"), None))
     if kitchen and target:
-        shared = shared_wall_span(by_id[kitchen[0]].rect, by_id[target].rect)
-        if shared is not None:
+        if tuple(sorted((kitchen[0], target))) in shared_pairs:
             kitchen_next_to = by_id[target].room_type
         if by_id[target].room_id in adjacency[kitchen[0]]:
             kitchen_door_to = by_id[target].room_type
         if dining and kitchen_next_to is None:
             violations.append(f"kitchen '{kitchen[0]}' does not share a wall with dining '{target}'")
+    # an open-plan LDK has no separate kitchen/dining rooms: the two functions
+    # are zones of one continuous space and must meet inside it (no wall, no door)
+    open_plan_zones: List[dict] = []
+    for plan in plans:
+        if not plan.open_plan:
+            continue
+        kitchen_zone = plan.zone("kitchen")
+        dining_zone = plan.zone("dining")
+        open_plan_zones.append({
+            "room": plan.room_id,
+            "zones": [zone.zone_type for zone in plan.zones],
+            "kitchen_dining_shared_edge": bool(
+                kitchen_zone and dining_zone
+                and _polygons_share_edge(kitchen_zone.polygon, dining_zone.polygon)),
+        })
+        if kitchen_zone and dining_zone:
+            if not _polygons_share_edge(kitchen_zone.polygon, dining_zone.polygon):
+                violations.append(f"open-plan room '{plan.room_id}': kitchen and dining zones do not meet")
+            else:
+                kitchen_next_to = kitchen_next_to or "dining"
+                kitchen_door_to = kitchen_door_to or "dining (open plan)"
     for plan in plans:
         if plan.room_type == "bedroom":
             for peer in adjacency[plan.room_id]:
@@ -1535,6 +1948,7 @@ def door_semantics(plans: Sequence[RoomPlan], doors: Sequence[DoorPlan]) -> dict
         "public_rooms_connected": not any("only reachable through" in entry for entry in violations),
         "kitchen_next_to": kitchen_next_to,
         "kitchen_door_to": kitchen_door_to,
+        "open_plan_zones": open_plan_zones,
     }
 
 
@@ -1543,7 +1957,7 @@ def door_semantics(plans: Sequence[RoomPlan], doors: Sequence[DoorPlan]) -> dict
 # --------------------------------------------------------------------------- #
 def exterior_spans(plans: Sequence[RoomPlan]):
     """Exterior wall spans per room id: a span is exterior when a single room owns it."""
-    room_specs = [spec_mod.RoomSpec(id=plan.room_id, type=plan.room_type, polygon=plan.rect.polygon())
+    room_specs = [spec_mod.RoomSpec(id=plan.room_id, type=plan.room_type, polygon=plan.polygon)
                   for plan in plans]
     segments = spec_mod.build_wall_segments(room_specs)
     spans = {plan.room_id: [] for plan in plans}
@@ -1646,7 +2060,7 @@ def plan_windows(rng: random.Random, plans: Sequence[RoomPlan],
             low = WINDOW_MARGIN_M + width / 2.0
             high = length - WINDOW_MARGIN_M - width / 2.0
             bands = [band for band in (avoid or {}).get(plan.room_id, [])
-                     if band[0] == _wall_side_of(plan.rect, start, end)]
+                     if band[0] == _wall_side_of_polygon(plan.polygon, start, end)]
             if not bands:
                 offset = _round(rng.uniform(low, high), 0.05)
             else:
@@ -1684,28 +2098,46 @@ def plan_windows(rng: random.Random, plans: Sequence[RoomPlan],
 # --------------------------------------------------------------------------- #
 # step 4: furniture
 # --------------------------------------------------------------------------- #
-def door_rects_for(rect: Rect, doors: Sequence[DoorPlan]) -> List[Tuple[float, float, float, float]]:
+def door_rects_for(rect: Rect, doors: Sequence[DoorPlan],
+                   polygon: Optional[Sequence[Sequence[float]]] = None
+                   ) -> List[Tuple[float, float, float, float]]:
     """Door approach rectangles on this room's side of every door it owns.
 
     Same numbers as ``checks.DOOR_ZONE_DEPTH_M`` / ``DOOR_ZONE_EXTRA_W_M`` so
-    the generator and the checker cannot drift apart.
+    the generator and the checker cannot drift apart.  With ``polygon`` given
+    (an L-shaped room) the room side of the wall is decided by an inside probe
+    instead of the bounding-box centre, so the approach zone never lands in the
+    courtyard notch.
     """
     rects: List[Tuple[float, float, float, float]] = []
     for door in doors:
-        half_w = DOOR_W / 2.0 + checks_mod.DOOR_ZONE_EXTRA_W_M / 2.0
+        half_w = door.width / 2.0 + checks_mod.DOOR_ZONE_EXTRA_W_M / 2.0
         depth = checks_mod.DOOR_ZONE_DEPTH_M + WALL_THICKNESS / 2.0
+        line = door.wall.line
         if door.wall.side in ("N", "S"):
             x_c = door.center[0]
-            if door.wall.line >= rect.center[1]:
-                rects.append((x_c - half_w, door.wall.line - depth, x_c + half_w, door.wall.line + 0.2))
+            if polygon is None:
+                sign = 1.0 if line >= rect.center[1] else -1.0
+            elif spec_mod.point_in_polygon((x_c, line + 0.05), polygon):
+                sign = 1.0
+            elif spec_mod.point_in_polygon((x_c, line - 0.05), polygon):
+                sign = -1.0
             else:
-                rects.append((x_c - half_w, door.wall.line - 0.2, x_c + half_w, door.wall.line + depth))
+                sign = 1.0 if line >= rect.center[1] else -1.0
+            near, far = line - sign * 0.2, line + sign * depth
+            rects.append((x_c - half_w, min(near, far), x_c + half_w, max(near, far)))
         else:
             y_c = door.center[1]
-            if door.wall.line >= rect.center[0]:
-                rects.append((door.wall.line - depth, y_c - half_w, door.wall.line + 0.2, y_c + half_w))
+            if polygon is None:
+                sign = 1.0 if line >= rect.center[0] else -1.0
+            elif spec_mod.point_in_polygon((line + 0.05, y_c), polygon):
+                sign = 1.0
+            elif spec_mod.point_in_polygon((line - 0.05, y_c), polygon):
+                sign = -1.0
             else:
-                rects.append((door.wall.line - 0.2, y_c - half_w, door.wall.line + depth, y_c + half_w))
+                sign = 1.0 if line >= rect.center[0] else -1.0
+            near, far = line - sign * 0.2, line + sign * depth
+            rects.append((min(near, far), y_c - half_w, max(near, far), y_c + half_w))
     return rects
 
 
@@ -1754,6 +2186,7 @@ class Placer:
                  shafts: Sequence[Tuple[float, float, float, float]] = ()):
         self.room = room
         self.rect = room.rect
+        self.polygon = room.polygon
         self.doors = [door for door in doors if room.room_id in (door.a, door.b)]
         self.windows = list(windows)
         self.index = index
@@ -1761,6 +2194,9 @@ class Placer:
         self.placed = placed
         self.report = report
         self.walls = room.walls
+        #: active semantic zone (open-plan rooms): furniture stays inside it,
+        #: but collisions and circulation are still measured on the whole room
+        self.zone: Optional[ZonePlan] = None
         self.rejections: Dict[str, int] = {}
         #: keep-clear zones in front of fixtures (fridge door, pulled-out chair)
         self.usages: List[dict] = []
@@ -1775,6 +2211,53 @@ class Placer:
         self.shafts = [tuple(float(v) for v in rect) for rect in (shafts or ())]
 
     # -- helpers --------------------------------------------------------- #
+    @property
+    def area_rect(self) -> Rect:
+        """Bounding rectangle furniture candidates are drawn in (zone or room)."""
+        return self.zone.rect if self.zone is not None else self.rect
+
+    @property
+    def area_polygon(self) -> List[List[float]]:
+        return self.zone.polygon if self.zone is not None else self.polygon
+
+    @property
+    def area(self) -> float:
+        """Real floor area of the active area (zone area or room polygon area)."""
+        return self.zone.area if self.zone is not None else self.room.area
+
+    def _walls_for_zone(self, zone: ZonePlan) -> Dict[str, Wall]:
+        """Physical walls the zone touches, clipped to the zone's span.
+
+        Internal zone boundaries are not room walls, so they are not returned:
+        a counter stands against a real wall, never against an invisible line
+        between the kitchen and the dining area.
+        """
+        out: Dict[str, Wall] = {}
+        box = zone.rect
+        for key, wall in self.room.walls.items():
+            if wall.side in ("N", "S"):
+                if abs(wall.line - box.y0) > 1e-6 and abs(wall.line - box.y1) > 1e-6:
+                    continue
+                lo, hi = max(wall.lo, box.x0), min(wall.hi, box.x1)
+            else:
+                if abs(wall.line - box.x0) > 1e-6 and abs(wall.line - box.x1) > 1e-6:
+                    continue
+                lo, hi = max(wall.lo, box.y0), min(wall.hi, box.y1)
+            if hi - lo > 0.30:
+                out[key] = Wall(wall.side, wall.line, lo, hi)
+        return out
+
+    @contextmanager
+    def use_zone(self, zone: ZonePlan):
+        """Furnish one semantic zone: candidates and walls stay inside it."""
+        previous_zone, previous_walls = self.zone, self.walls
+        self.zone = zone
+        self.walls = self._walls_for_zone(zone) or self.room.walls
+        try:
+            yield self
+        finally:
+            self.zone, self.walls = previous_zone, previous_walls
+
     def pick_asset(self, slot: str) -> Optional[str]:
         spec_slot = ASSET_SLOTS[slot]
 
@@ -1809,7 +2292,7 @@ class Placer:
 
     def door_rects(self) -> List[Tuple[float, float, float, float]]:
         """Door approach rectangles of this room, using the shared contract."""
-        return door_rects_for(self.rect, self.doors)
+        return door_rects_for(self.rect, self.doors, self.polygon)
 
     def wall_has_window(self, wall: Wall) -> bool:
         for window in self.windows:
@@ -1823,8 +2306,12 @@ class Placer:
         return False
 
     def inside(self, aabb, gap: float) -> bool:
-        return (aabb[0] >= self.rect.x0 + gap - 1e-9 and aabb[2] <= self.rect.x1 - gap + 1e-9
-                and aabb[1] >= self.rect.y0 + gap - 1e-9 and aabb[3] <= self.rect.y1 - gap + 1e-9)
+        if self.zone is None and len(self.room.parts) == 1:
+            return (aabb[0] >= self.rect.x0 + gap - 1e-9 and aabb[2] <= self.rect.x1 - gap + 1e-9
+                    and aabb[1] >= self.rect.y0 + gap - 1e-9 and aabb[3] <= self.rect.y1 - gap + 1e-9)
+        # concave outline (L room) or a zone inside one: the footprint has to
+        # stay off every boundary edge, not just inside the bounding box
+        return checks_mod.wall_gap(aabb, self.area_polygon) >= gap - 1e-9
 
     def fits(self, item: Item, gap: float, keep_doors: bool = True) -> bool:
         aabb = item.aabb
@@ -1835,7 +2322,7 @@ class Placer:
         # free standing (>= 0.60 m), nothing in between -- a fixture placed by
         # hand (the desk chair, a dining chair) has to land on one side of it
         if item.placement not in (checks_mod.FLOOR_FLAT, checks_mod.CEILING, checks_mod.MOUNTED):
-            wall_gap = checks_mod.wall_gap(aabb, self.rect.polygon())
+            wall_gap = checks_mod.wall_gap(aabb, self.polygon)
             if wall_gap < checks_mod.WALL_GAP_MIN_M - 1e-9:
                 self.reject("wall_gap")
                 return False
@@ -1862,11 +2349,11 @@ class Placer:
             for usage in self.usages:
                 if item.slot and item.slot in usage["allow"]:
                     continue
-                if checks_mod.rect_distance(aabb, usage["aabb"]) < USAGE_NEIGHBOUR_M:
-                    continue      # this item is beside the fixture, not in its zone
                 if checks_mod.rect_distance(aabb, usage["rect"]) < USAGE_GAP_M:
                     self.reject(f"usage:{usage['slot']}")
                     return False
+                if checks_mod.rect_distance(aabb, usage["aabb"]) < USAGE_NEIGHBOUR_M:
+                    continue      # touching the fixture's side, clear of its use zone
         z_range = item.z_range
         for other in self.placed:
             if z_range[0] > other.z_range[1] - 1e-3 or other.z_range[0] > z_range[1] - 1e-3:
@@ -1909,8 +2396,8 @@ class Placer:
                                     placement=checks_mod.WALL_HUG, rot_z_deg=0.0,
                                     rotation_on_grid=True)
                  for index, rect in enumerate(self.reserved)]
-        starts = [door.center for door in self.doors] or [(self.rect.center[0], self.rect.center[1])]
-        stats = checks_mod.room_connectivity(self.rect.polygon(), boxes, starts,
+        starts = [door.center for door in self.doors] or [polygon_centroid(self.polygon)]
+        stats = checks_mod.room_connectivity(self.polygon, boxes, starts,
                                             wall_thickness=WALL_THICKNESS, grid_m=0.20)
         if stats["fraction"] < ROOM_OPEN_FRACTION:
             self.reject("seals_room")
@@ -1956,14 +2443,22 @@ class Placer:
         """
         if usage > 0.0 and _blocks_walking(item):
             rect = usage_rect(item, usage, behind=behind)
+            corners = ((rect[0], rect[1]), (rect[2], rect[1]),
+                       (rect[2], rect[3]), (rect[0], rect[3]))
+            if not all(spec_mod.point_in_polygon_or_boundary(corner, self.polygon)
+                       for corner in corners):
+                # the pulled-out chair / opening door would stand in a wall or
+                # outside the outline: the final sanity check measures this
+                self.reject(f"usage_wall:{item.slot}")
+                return None
             for other in self.placed:
                 if not _blocks_walking(other) or (other.slot and other.slot in allow):
                     continue
-                if checks_mod.rect_distance(other.aabb, item.aabb) < USAGE_NEIGHBOUR_M:
-                    continue      # standing beside the fixture, not in front of it
                 if checks_mod.rect_distance(other.aabb, rect) < USAGE_GAP_M:
                     self.reject(f"usage_occupied:{item.slot}")
                     return None
+                if checks_mod.rect_distance(other.aabb, item.aabb) < USAGE_NEIGHBOUR_M:
+                    continue      # touching the fixture's side, clear of its use zone
         self.placed.append(item)
         if usage > 0.0 and _blocks_walking(item):
             self.usages.append({"rect": usage_rect(item, usage, behind=behind), "slot": item.slot,
@@ -2114,23 +2609,28 @@ def _place_free(placer: Placer, slot: str, name: str, asset: str, candidates,
     return None
 
 
-def _free_candidates(placer: Placer, dims, inset: float = checks_mod.WALL_GAP_FREE_MIN_M,
+def _free_candidates(placer: Placer,
+                     dims, inset: float = checks_mod.WALL_GAP_FREE_MIN_M + 0.01,
                      step: float = 0.25) -> List[Tuple[float, float]]:
     half_x, half_y = dims[0] / 2.0, dims[1] / 2.0
+    area = placer.area_rect
     out = []
-    x = placer.rect.x0 + inset + half_x
-    while x <= placer.rect.x1 - inset - half_x + 1e-9:
-        y = placer.rect.y0 + inset + half_y
-        while y <= placer.rect.y1 - inset - half_y + 1e-9:
+    x = area.x0 + inset + half_x
+    while x <= area.x1 - inset - half_x + 1e-9:
+        y = area.y0 + inset + half_y
+        while y <= area.y1 - inset - half_y + 1e-9:
             out.append((x, y))
             y += step
         x += step
+    if placer.zone is not None or len(placer.room.parts) > 1:
+        polygon = placer.area_polygon
+        out = [point for point in out if checks_mod.point_in_polygon(point, polygon)]
     return out
 
 
 def furnish_living(placer: Placer, want_armchair: bool) -> None:
     rng = placer.rng
-    rect = placer.rect
+    rect = placer.area_rect
     sofa_asset = placer.pick_asset("sofa")
     if sofa_asset is None:
         raise _AttemptFailed("no sofa asset available")
@@ -2274,26 +2774,38 @@ def _same_wall(wall: Wall, item: Item) -> bool:
 
 def _facing_wall(placer: Placer, item: Item) -> Wall:
     back = {0.0: "N", 90.0: "W", 180.0: "S", 270.0: "E"}[item.rot_z_deg % 360.0]
-    return placer.walls[back]
+    candidates = [wall for wall in placer.walls.values() if wall.side == back]
+    if not candidates:                       # a zone without that physical wall
+        candidates = [wall for wall in placer.room.walls.values() if wall.side == back]
+    if len(candidates) == 1:
+        return candidates[0]
+    coord = item.pos[1] if back in ("N", "S") else item.pos[0]
+    return min(candidates, key=lambda wall: abs(wall.line - coord))
+
+
+def _door_side_for_room(room: RoomPlan, door: DoorPlan) -> Optional[str]:
+    """Compass side of ``room`` the door sits on (None when it is not on it)."""
+    for wall in room.walls.values():
+        if wall.side in ("N", "S"):
+            if abs(door.center[1] - wall.line) < 1e-6 \
+                    and wall.lo - 1e-6 <= door.center[0] <= wall.hi + 1e-6:
+                return wall.side
+        else:
+            if abs(door.center[0] - wall.line) < 1e-6 \
+                    and wall.lo - 1e-6 <= door.center[1] <= wall.hi + 1e-6:
+                return wall.side
+    return None
 
 
 def furnish_bedroom(placer: Placer, want_extras: bool) -> None:
     rng = placer.rng
-    rect = placer.rect
+    rect = placer.area_rect
     bed_asset = placer.pick_asset("bed")
     if bed_asset is None:
         raise _AttemptFailed("no bed asset available")
     bed_dims = placer.dims_of(bed_asset)
-    door_sides = []
-    for door in placer.doors:
-        if door.wall.side in ("N", "S") and abs(door.wall.line - rect.y1) < 1e-6:
-            door_sides.append("N")
-        elif door.wall.side in ("N", "S") and abs(door.wall.line - rect.y0) < 1e-6:
-            door_sides.append("S")
-        elif door.wall.side in ("W", "E") and abs(door.wall.line - rect.x1) < 1e-6:
-            door_sides.append("E")
-        elif door.wall.side in ("W", "E") and abs(door.wall.line - rect.x0) < 1e-6:
-            door_sides.append("W")
+    door_sides = [side for side in (_door_side_for_room(placer.room, door) for door in placer.doors)
+                  if side is not None]
     bed = None
     free_walls = [wall for wall in placer.walls.values() if wall.side not in door_sides]
     free_walls.sort(key=lambda wall: (placer.wall_has_window(wall), -wall.length, rng.random()))
@@ -2344,7 +2856,7 @@ def furnish_bedroom(placer: Placer, want_extras: bool) -> None:
                                    placement=checks_mod.MOUNTED, z=1.62, gap=ART_GAP_M)
         if item is not None and placer.fits(item, checks_mod.WALL_GAP_MIN_M, keep_doors=False):
             placer.add(item)
-    if rect.area >= 11.5 and rng.random() < 0.7:
+    if placer.area >= 11.5 and rng.random() < 0.7:
         walls = [wall for wall in placer.walls.values() if not _same_wall(wall, bed)]
         walls.sort(key=lambda wall: (placer.wall_has_window(wall), -wall.length, rng.random()))
         _place_on_wall(placer, "wardrobe", "wardrobe", _fixture("wardrobe"), walls,
@@ -2384,7 +2896,8 @@ def _fixture(part: str) -> str:
 
 def _fixture_walls(placer: Placer, prefer_window: bool = False) -> List[Wall]:
     """Walls ordered for fixture placement: without a door first, longest first."""
-    door_sides = {door.wall.side for door in placer.doors}
+    door_sides = {side for side in (_door_side_for_room(placer.room, door) for door in placer.doors)
+                  if side is not None}
     return sorted(placer.walls.values(),
                   key=lambda wall: (wall.side in door_sides,
                                     0 if placer.wall_has_window(wall) == prefer_window else 1,
@@ -2433,7 +2946,7 @@ def _add_ceiling_lamp(placer: Placer, name: str) -> Optional[Item]:
     single-floor rooms keep their exact random stream).
     """
     rng = placer.rng
-    rect = placer.rect
+    rect = placer.area_rect
     lamp_asset = placer.pick_asset("ceiling_lamp")
     if lamp_asset is None:
         return None
@@ -2444,7 +2957,10 @@ def _add_ceiling_lamp(placer: Placer, name: str) -> Optional[Item]:
         item = placer.make("ceiling_lamp", name, lamp_asset, center, 0.0, checks_mod.CEILING)
         if item is not None and placer.fits(item, checks_mod.WALL_GAP_MIN_M, keep_doors=False):
             return placer.add(item)
-    if placer.shafts:
+    # an L-shaped room or a zone whose centre is over the courtyard notch: sweep
+    # the rest of the area instead of giving up (rectangles that succeeded above
+    # never reach this loop, so their random stream is unchanged)
+    if placer.shafts or placer.zone is not None or len(placer.room.parts) > 1:
         for fx in (1.0 / 6.0, 0.5, 5.0 / 6.0):
             for fy in (0.5, 5.0 / 6.0, 1.0 / 6.0):
                 center = (rect.x0 + rect.w * fx + rng.uniform(-0.10, 0.10),
@@ -2458,17 +2974,20 @@ def _add_ceiling_lamp(placer: Placer, name: str) -> Optional[Item]:
 
 
 def _corner_candidates(placer: Placer, dims, inset: Optional[float] = None):
-    rect = placer.rect
+    rect = placer.area_rect
     inset = checks_mod.WALL_GAP_FREE_MIN_M + 0.10 if inset is None else inset
     out = []
     for sx in (1, -1):
         for sy in (1, -1):
             out.append((rect.x0 + inset + dims[0] / 2.0 if sx > 0 else rect.x1 - inset - dims[0] / 2.0,
                         rect.y0 + inset + dims[1] / 2.0 if sy > 0 else rect.y1 - inset - dims[1] / 2.0))
+    if placer.zone is not None or len(placer.room.parts) > 1:
+        polygon = placer.area_polygon
+        out = [point for point in out if checks_mod.point_in_polygon(point, polygon)]
     return out
 
 
-def furnish_kitchen(placer: Placer) -> None:
+def furnish_kitchen(placer: Placer, max_cabinets: Optional[int] = None) -> None:
     """A counter run (cabinets + stove + sink) and a fridge, with standing space.
 
     The run is tiled module by module along the longest door-free wall so the
@@ -2477,13 +2996,19 @@ def furnish_kitchen(placer: Placer) -> None:
     its use needs (a fridge door swing, a cook's standing spot) -- the generator
     refuses to put anything there, so the fixture stays usable (the render
     validator cannot see intent, which is why the report carries ``usage_m``).
+
+    ``max_cabinets`` caps the plain cabinet modules.  The open-plan kitchen
+    uses one: two identical ``builtin:`` fixtures share their generated object
+    names, and the settled manifest then reports both at one position.
     """
     rng = placer.rng
     widths = {part: fixtures_mod.dims(part)[0] for part in
               ("kitchen_cabinet", "kitchen_stove", "kitchen_sink", "kitchen_fridge")}
+    module_counts = [count for count in (4, 3, 2, 1, 0)
+                     if max_cabinets is None or count <= max_cabinets]
     for wall in _fixture_walls(placer, prefer_window=False):
         usable = wall.length - 2.0 * 0.10
-        for modules in (4, 3, 2, 1, 0):
+        for modules in module_counts:
             run = ["kitchen_cabinet"] * modules + ["kitchen_stove", "kitchen_sink"]
             run_length = sum(widths[part] for part in run) + FIXTURE_GAP_M * (len(run) - 1)
             fridge_length = widths["kitchen_fridge"] + FIXTURE_GAP_M
@@ -2520,12 +3045,11 @@ def _place_upper_cabinets(placer: Placer, wall: Wall, start: float, length: floa
 
 def furnish_bathroom(placer: Placer) -> None:
     """Toilet, washbasin and (when the room allows it) a shower cabin."""
-    rect = placer.rect
     walls = _fixture_walls(placer, prefer_window=False)
-    shower_first = rect.area >= 5.5
+    shower_first = placer.area >= 5.5
     order = ["bath_shower"] if shower_first else []
     order += ["bath_toilet", "bath_basin"]
-    if not shower_first and rect.area >= 4.2:
+    if not shower_first and placer.area >= 4.2:
         order += ["bath_shower"]
     for part in order:
         placed = _place_on_wall(placer, part, part, _fixture(part), walls,
@@ -2590,7 +3114,7 @@ def furnish_entry(placer: Placer) -> None:
     """Shoe cabinet (and a rug) in the entrance hall."""
     _place_on_wall(placer, "entry_shoe_cabinet", "shoe_cabinet", _fixture("entry_shoe_cabinet"),
                    _fixture_walls(placer), usage=fixtures_mod.usage_m("entry_shoe_cabinet"))
-    rect = placer.rect
+    rect = placer.area_rect
     rug_size = [min(1.6, rect.w - 0.8), min(0.9, rect.h - 0.8)]
     if min(rug_size) > 0.4 and placer.rng.random() < 0.5:
         item = placer.make("rug", "entry_rug", RUG_ASSET, rect.center, 0.0,
@@ -2605,7 +3129,7 @@ def furnish_storage(placer: Placer) -> None:
     walls = _fixture_walls(placer)
     _place_on_wall(placer, "storage_shelf", "storage_shelf", _fixture("storage_shelf"),
                    walls, usage=fixtures_mod.usage_m("storage_shelf"))
-    if placer.rect.area >= 4.0:
+    if placer.area >= 4.0:
         _place_on_wall(placer, "storage_shelf", "storage_shelf_2", _fixture("storage_shelf"),
                        list(reversed(walls)), usage=fixtures_mod.usage_m("storage_shelf"))
     _add_ceiling_lamp(placer, "ceiling_lamp_storage")
@@ -2616,7 +3140,7 @@ def furnish_laundry(placer: Placer) -> None:
     walls = _fixture_walls(placer)
     washer = _place_on_wall(placer, "laundry_washer", "washer", _fixture("laundry_washer"),
                             walls, usage=fixtures_mod.usage_m("laundry_washer"))
-    if washer is not None and placer.rect.area >= 3.6:
+    if washer is not None and placer.area >= 3.6:
         wall = _facing_wall(placer, washer)
         along = washer.pos[0] if wall.side in ("N", "S") else washer.pos[1]
         offset = along + (washer.dims[0] + fixtures_mod.dims("laundry_washer")[0]) / 2.0 + 0.10
@@ -2649,7 +3173,7 @@ def furnish_balcony(placer: Placer) -> None:
 def furnish_corridor(placer: Placer) -> None:
     """A runner rug and a plant at the end: a corridor is circulation, not a room."""
     rng = placer.rng
-    rect = placer.rect
+    rect = placer.area_rect
     if rng.random() < 0.5:
         size = [max(0.5, rect.w - 0.5), max(0.4, rect.h - 0.35)] if rect.w >= rect.h else \
                [max(0.4, rect.w - 0.35), max(0.5, rect.h - 0.5)]
@@ -2692,7 +3216,6 @@ def furnish_plain(placer: Placer) -> None:
 def furnish_study(placer: Placer) -> None:
     """Desk (with its chair and its pull-out space), bookshelf and a lamp."""
     rng = placer.rng
-    rect = placer.rect
     walls = _fixture_walls(placer, prefer_window=True)
     desk = _place_on_wall(placer, "study_desk", "desk", _fixture("study_desk"), walls,
                           usage=fixtures_mod.usage_m("study_desk"), allow=("study_chair",),
@@ -2724,6 +3247,30 @@ def furnish_study(placer: Placer) -> None:
     _add_ceiling_lamp(placer, "ceiling_lamp_study")
 
 
+def furnish_open_plan(placer: Placer) -> None:
+    """Furnish the semantic zones of one continuous open space.
+
+    The kitchen, dining and living programmes run against the *same* Placer:
+    each zone confines its own candidate stands and wall run, while collisions,
+    door clearances and the room-wide circulation check still see the whole
+    physical room.  There is no wall or door between the zones -- only the
+    furniture layout marks the functional areas.
+    """
+    zones = {zone.zone_type: zone for zone in placer.room.zones}
+    living = zones.get("living_room")
+    if living is not None:
+        with placer.use_zone(living):
+            furnish_living(placer, want_armchair=living.area >= 14.0)
+    kitchen = zones.get("kitchen")
+    if kitchen is not None:
+        with placer.use_zone(kitchen):
+            furnish_kitchen(placer, max_cabinets=1)
+    dining = zones.get("dining")
+    if dining is not None:
+        with placer.use_zone(dining):
+            furnish_dining(placer)
+
+
 def furnish_rooms(rng: random.Random, plans: Sequence[RoomPlan], doors: Sequence[DoorPlan],
                   windows: Dict[str, List[dict]], index: Dict[str, dict],
                   reserved_by_room: Optional[Dict[str, List[Tuple[float, float, float, float]]]] = None,
@@ -2738,10 +3285,12 @@ def furnish_rooms(rng: random.Random, plans: Sequence[RoomPlan], doors: Sequence
         shafts = (shafts_by_room or {}).get(plan.room_id) or ()
         placer = Placer(plan, doors, windows.get(plan.room_id, []), index, rng, placed, report,
                         reserved=reserved, mouths=mouths, shafts=shafts)
-        if plan.room_type == "living_room":
-            furnish_living(placer, want_armchair=plan.rect.area >= 19.0)
+        if plan.open_plan:
+            furnish_open_plan(placer)
+        elif plan.room_type == "living_room":
+            furnish_living(placer, want_armchair=plan.area >= 19.0)
         elif plan.room_type == "bedroom":
-            furnish_bedroom(placer, want_extras=plan.rect.area >= 13.0)
+            furnish_bedroom(placer, want_extras=plan.area >= 13.0)
         else:
             furnish_plain(placer)
         for reason, count in placer.rejections.items():
@@ -2803,18 +3352,29 @@ def _door_hole(door_span_xy, door_height):
     return predicate
 
 
+def _as_polygon(value) -> List[List[float]]:
+    """Accept a :class:`Rect`, a :class:`RoomPlan`, or an outline as a polygon."""
+    if isinstance(value, Rect):
+        return value.polygon()
+    if hasattr(value, "polygon"):
+        polygon = value.polygon
+        return polygon() if callable(polygon) else list(polygon)
+    return [[float(point[0]), float(point[1])] for point in value]
+
+
 class ShellModel:
     """Analytic stand-in for the built shell (walls with door tunnels, floors,
     ceilings) plus the furniture boxes, used to pre-compute the validator's
     door depth spot check."""
 
-    def __init__(self, rooms: Dict[str, Rect], doors: Sequence[DoorPlan], items: Sequence[Item],
+    def __init__(self, rooms, doors: Sequence[DoorPlan], items: Sequence[Item],
                  wall_height: float = WALL_HEIGHT, wall_thickness: float = WALL_THICKNESS):
-        self.room_list = list(rooms.values())
+        self.room_polygons = {room_id: _as_polygon(value) for room_id, value in rooms.items()}
+        self.room_list = list(self.room_polygons.values())
         self.boxes: List[_Box] = []
         self.wall_height = wall_height
-        room_specs = [spec_mod.RoomSpec(id=room_id, type="room", polygon=rect.polygon())
-                      for room_id, rect in rooms.items()]
+        room_specs = [spec_mod.RoomSpec(id=room_id, type="room", polygon=polygon)
+                      for room_id, polygon in self.room_polygons.items()]
         self.segments = [(segment.p0, segment.p1, segment.direction, segment.owners)
                          for segment in spec_mod.build_wall_segments(room_specs)]
         self.door_segments: Dict[str, Tuple[Tuple[float, float], Tuple[float, float]]] = {}
@@ -2832,7 +3392,7 @@ class ShellModel:
                     span = (low, high, min(ay, by) - half - 1e-3, max(ay, by) + half + 1e-3)
                 else:
                     span = (min(ax, bx) - half - 1e-3, max(ax, bx) + half + 1e-3, low, high)
-                holes.append(_door_hole(span, DOOR_H))
+                holes.append(_door_hole(span, door.height))
                 self.door_segments[door.key()] = (p0, p1)
             self.boxes.append(_Box(tuple(bmin), tuple(bmax), tuple(holes)))
         for item in items:
@@ -2846,7 +3406,7 @@ class ShellModel:
             hit = box.hit(origin, direction, t_min)
             if hit is not None and hit < best:
                 best = hit
-        for rect in self.room_list:
+        for polygon in self.room_list:
             for z in (0.0, self.wall_height):
                 if abs(direction[2]) < 1e-12:
                     continue
@@ -2855,7 +3415,7 @@ class ShellModel:
                     continue
                 x = origin[0] + direction[0] * t
                 y = origin[1] + direction[1] * t
-                if rect.x0 - 1e-9 <= x <= rect.x1 + 1e-9 and rect.y0 - 1e-9 <= y <= rect.y1 + 1e-9:
+                if spec_mod.point_in_polygon((x, y), polygon):
                     best = t
         return best
 
@@ -3011,7 +3571,7 @@ def _walkable_grid(plan: RoomPlan, items: Sequence[Item], step: float = checks_m
     all** (its slab openings: the stairwell and any declared void), so a camera
     stand is never placed over one -- there would be no surface to stand on.
     """
-    poly = checks_mod.inset_polygon(plan.rect.polygon(), WALL_THICKNESS / 2.0)
+    poly = checks_mod.inset_polygon(plan.polygon, WALL_THICKNESS / 2.0)
     xs = [float(point[0]) for point in poly]
     ys = [float(point[1]) for point in poly]
     x0, y0 = min(xs) - step, min(ys) - step
@@ -3133,7 +3693,7 @@ def _camera_stands(plan: RoomPlan, items: Sequence[Item], grid: dict,
             point = (round(x, 3), round(y, 3))
             if _walkable(grid, point[0], point[1], reachable=True):
                 box = (point[0], point[1], point[0], point[1])
-                if checks_mod.wall_gap(box, rect.polygon()) >= CAMERA_INSET_M - 1e-9 and \
+                if checks_mod.wall_gap(box, plan.polygon) >= CAMERA_INSET_M - 1e-9 and \
                         all(checks_mod.rect_distance(box, item.aabb) >= CAMERA_MIN_GAP_TO_FURNITURE_M - 1e-9
                             for item in blockers):
                     stands.append(point)
@@ -3205,7 +3765,7 @@ def _room_camera_context(plan: RoomPlan, items: Sequence[Item], doors: Sequence[
     blocking furniture (with the probe point a visibility test aims at)."""
     grid = _walkable_grid(plan, items, reserved=reserved, holes=holes)
     room_doors = [door for door in doors if plan.room_id in (door.a, door.b)]
-    _mark_reachable(grid, [door.center for door in room_doors] or [plan.rect.center])
+    _mark_reachable(grid, [door.center for door in room_doors] or [polygon_centroid(plan.polygon)])
     blockers = []
     for item in items:
         if not _blocks_camera(item):
@@ -3218,7 +3778,7 @@ def _room_camera_context(plan: RoomPlan, items: Sequence[Item], doors: Sequence[
     return {"grid": grid,
             "targets": _coverage_targets(grid, plan),
             "blockers": blockers,
-            "door_rects": door_rects_for(plan.rect, room_doors)}
+            "door_rects": door_rects_for(plan.rect, room_doors, plan.polygon)}
 
 
 def _camera_view(model: ShellModel, plan: RoomPlan, context: dict, pos: Sequence[float]) -> dict:
@@ -3240,8 +3800,7 @@ def _camera_view(model: ShellModel, plan: RoomPlan, context: dict, pos: Sequence
         if entry is not None and model.cast(origin, direction) >= entry - CAMERA_VIS_TOLERANCE_M:
             items_seen += 1
     box = (pos[0], pos[1], pos[0], pos[1])
-    rect = plan.rect
-    center = rect.center if not seen else (sum_x / seen, sum_y / seen)
+    center = polygon_centroid(plan.polygon) if not seen else (sum_x / seen, sum_y / seen)
     clearance = min((checks_mod.rect_distance(box, block["aabb"]) for block in blockers),
                     default=float("inf"))
     view = {
@@ -3251,7 +3810,7 @@ def _camera_view(model: ShellModel, plan: RoomPlan, context: dict, pos: Sequence
         "visible_items": items_seen,
         "items": len(blockers),
         "furniture_fraction": (items_seen / len(blockers)) if blockers else 1.0,
-        "wall_clearance": checks_mod.wall_gap(box, rect.polygon()),
+        "wall_clearance": checks_mod.wall_gap(box, plan.polygon),
         "furniture_clearance": clearance,
         "door_gap": min((checks_mod.rect_distance(box, rect_) for rect_ in context["door_rects"]),
                         default=CAMERA_DOOR_GAP_M),
@@ -3476,13 +4035,19 @@ def _spec_dict(seed: int, plans: Sequence[RoomPlan], doors: Sequence[DoorPlan],
                opening_order: Sequence[DoorPlan]) -> dict:
     rooms = []
     for plan in plans:
-        rooms.append({"id": plan.room_id, "type": plan.room_type, "polygon": plan.rect.polygon(),
-                      "floor_color": ROOM_FLOOR_COLOR.get(plan.room_type, ROOM_FLOOR_COLOR_DEFAULT)})
+        entry = {"id": plan.room_id, "type": plan.room_type, "polygon": plan.polygon,
+                 "floor_color": ROOM_FLOOR_COLOR.get(plan.room_type, ROOM_FLOOR_COLOR_DEFAULT)}
+        if plan.open_plan:
+            entry["open_plan"] = True
+        if plan.zones:
+            entry["zones"] = [{"type": zone.zone_type, "polygon": zone.polygon}
+                              for zone in plan.zones]
+        rooms.append(entry)
     openings = []
     for door in opening_order:
-        openings.append({"kind": "door", "between": [door.a, door.b],
+        openings.append({"kind": door.kind, "between": [door.a, door.b],
                          "center": [round(door.center[0], 4), round(door.center[1], 4)],
-                         "width": DOOR_W, "height": DOOR_H})
+                         "width": round(door.width, 4), "height": round(door.height, 4)})
     windows_out = []
     for plan in plans:
         for entry in windows.get(plan.room_id, []):
@@ -3491,12 +4056,14 @@ def _spec_dict(seed: int, plans: Sequence[RoomPlan], doors: Sequence[DoorPlan],
     return {
         "_comment": [
             f"generated by blender_agent/layout_gen.py --seed {seed}",
-            "axis-aligned rectangular rooms (one row, or a topology family: 2x2 block, L,",
-            "central living, corridors, loop), doors from a semantic spanning tree over the",
-            "shared walls, windows on exterior wall spans allocated by room function, furniture",
-            "from the asset index plus the builtin: fixtures of blender_agent/fixtures.py with",
-            "rot_z_deg on the 90 degree grid (front faces -Y at 0, see assets.py).  See the",
-            "layout report for the per-camera door visibility forecast the validator measures.",
+            "axis-aligned room polygons (one row, a topology family, or the open-plan",
+            "L-shaped LDK + L bedroom), doors from a semantic spanning tree over the shared",
+            "walls, windows on exterior wall spans allocated by room function, furniture from",
+            "the asset index plus the builtin: fixtures of blender_agent/fixtures.py with",
+            "rot_z_deg on the 90 degree grid (front faces -Y at 0, see assets.py).  An",
+            "open_plan room carries semantic zones (kitchen/dining/living) inside one",
+            "continuous space and no walls between them.  See the layout report for the",
+            "per-camera door visibility forecast the validator measures.",
         ],
         "unit": "meter",
         "wall_height": WALL_HEIGHT,
@@ -4011,7 +4578,7 @@ def _build_duplex_attempt(rng: random.Random, room_count: Optional[int], index: 
     openings_first: List[Optional[DoorPlan]] = []
     next_camera = 0
     for position, plans in enumerate(plans_floor):
-        rooms_by_id = {plan.room_id: plan.rect for plan in plans}
+        rooms_by_id = {plan.room_id: plan.polygon for plan in plans}
         model = ShellModel(rooms_by_id, doors_floor[position], items_floor[position])
         # the stair's slab opening is the only hole of the upper storey: no camera
         # stand is drawn over it (there is no floor under such a stand)
@@ -4060,7 +4627,7 @@ def _build_duplex_attempt(rng: random.Random, room_count: Optional[int], index: 
         "door_semantics": semantics_by_floor,
         "rooms": [{"id": plan.room_id, "type": plan.room_type, "floor_id": floor["id"],
                    "rect": [plan.rect.x0, plan.rect.y0, plan.rect.x1, plan.rect.y1],
-                   "area_m2": round(plan.rect.area, 2), "polygon": plan.rect.polygon()}
+                   "area_m2": round(plan.area, 2), "polygon": plan.polygon}
                   for floor, plans in zip(floors, plans_floor) for plan in plans],
         "room_graph": {"nodes": [plan.room_id for plans in plans_floor for plan in plans],
                        "edges": graph_edges},
@@ -4099,7 +4666,7 @@ def _spec_dict_duplex(seed: int, floors: Sequence[dict], plans_floor: Sequence[S
     for floor, plans in zip(floors, plans_floor):
         for plan in plans:
             rooms.append({"id": plan.room_id, "type": plan.room_type, "floor_id": floor["id"],
-                          "polygon": plan.rect.polygon(),
+                          "polygon": plan.polygon,
                           "floor_color": ROOM_FLOOR_COLOR.get(plan.room_type, ROOM_FLOOR_COLOR_DEFAULT)})
     openings = []
     for plans, doors, first in zip(plans_floor, doors_floor, openings_first):
@@ -4565,14 +5132,27 @@ def _build_attempt(rng: random.Random, room_count: Optional[int], index: Dict[st
             auto_fallback = auto_pick is not None
             room_count, shape = _pick_auto_shape(rng, room_count)
     family = ROOM_FAMILIES.get(shape)
-    if family is not None:
+    if shape == "open_plan":
+        count = OPEN_PLAN_ROOMS
+        if room_count is not None and int(room_count) != count:
+            raise _AttemptFailed(f"layout 'open_plan' needs {count} rooms, not {room_count}")
+    elif family is not None:
         count = family.count if room_count is None else int(room_count)
         if family.count != count:
             raise _AttemptFailed(f"layout '{shape}' needs {family.count} rooms, not {count}")
     else:
         count = room_count or rng.choice([2, 3, 3, 4, 4, 4, 5, 5])
         count = int(_clamp(count, 2, 5))
-    if family is not None:
+    if shape == "open_plan":
+        plans = plan_open_plan(rng)
+        open_room = next(plan for plan in plans if plan.open_plan)
+        doors = plan_doors_graph(rng, plans, passage_room=open_room.room_id,
+                                 passage_width=OPEN_PLAN_PASSAGE_WIDTH,
+                                 passage_height=OPEN_PLAN_PASSAGE_HEIGHT)
+        semantics = door_semantics(plans, doors)
+        if not semantics["pass"]:
+            raise _AttemptFailed(f"topology {shape}: " + "; ".join(semantics["violations"][:2]))
+    elif family is not None:
         plans = build_family(rng, family)
         doors = plan_doors_graph(rng, plans, extra_doors=family.extra_doors)
         semantics = door_semantics(plans, doors)
@@ -4589,25 +5169,35 @@ def _build_attempt(rng: random.Random, room_count: Optional[int], index: Dict[st
         semantics = door_semantics(plans, doors)
     windows = plan_windows(rng, plans)
     items, slot_report = furnish_rooms(rng, plans, doors, windows, index)
-    rooms_by_id = {plan.room_id: plan.rect for plan in plans}
+    rooms_by_id = {plan.room_id: plan.polygon for plan in plans}
     model = ShellModel(rooms_by_id, doors, items)
     want_second = count <= 3
     cameras, opening0, forecast = place_cameras(rng, plans, doors, items, model, want_second)
     order = ([opening0] if opening0 is not None else []) + [door for door in doors if door is not opening0]
     spec = _spec_dict(seed, plans, doors, windows, cameras, items, order)
     spec["_comment"].append(f"rooms={count} attempt={attempt} furniture={len(items)} shape={shape}")
+    report_rooms = []
+    for plan in plans:
+        entry = {"id": plan.room_id, "type": plan.room_type,
+                 "rect": [plan.rect.x0, plan.rect.y0, plan.rect.x1, plan.rect.y1],
+                 "area_m2": round(plan.area, 2),
+                 "polygon": plan.polygon,
+                 "parts": [[part.x0, part.y0, part.x1, part.y1] for part in plan.parts]}
+        if plan.open_plan:
+            entry["open_plan"] = True
+        if plan.zones:
+            entry["zones"] = [{"type": zone.zone_type, "polygon": zone.polygon} for zone in plan.zones]
+        report_rooms.append(entry)
     report = {
         "shape": shape,
-        "family": shape if family is not None else None,
+        "family": shape if (family is not None or shape == "open_plan") else None,
         "door_semantics": semantics,
-        "rooms": [{"id": plan.room_id, "type": plan.room_type,
-                   "rect": [plan.rect.x0, plan.rect.y0, plan.rect.x1, plan.rect.y1],
-                   "area_m2": round(plan.rect.area, 2),
-                   "polygon": plan.rect.polygon()} for plan in plans],
+        "rooms": report_rooms,
         "room_graph": {"nodes": [plan.room_id for plan in plans],
                        "edges": [[door.a, door.b] for door in doors]},
         "doors": [{"between": [door.a, door.b], "center": [round(door.center[0], 3), round(door.center[1], 3)],
-                   "width": DOOR_W, "height": DOOR_H, "wall_side": door.wall.side} for door in doors],
+                   "kind": door.kind, "width": door.width, "height": door.height,
+                   "wall_side": door.wall.side} for door in doors],
         "windows": [{"room": entry["room"], "wall": entry["wall"], "sill": entry["sill"],
                      "height": entry["height"]} for plan in plans for entry in windows.get(plan.room_id, [])],
         "cameras": cameras,
@@ -4633,7 +5223,9 @@ def generate(seed: int, room_count: Optional[int] = None,
     ``shape`` is ``"row"`` (the default single row), ``"block"`` (the same chain
     of rooms wrapped into two rows, with a jog at the corner, see
     :func:`plan_rooms_block`), ``"auto"`` (the seed draws the room count and one
-    of :data:`ROOM_FAMILIES`), or any family name -- ``compact_2x2``, ``l_shape``,
+    of :data:`ROOM_FAMILIES`), ``"open_plan"`` (one L-shaped open living-dining-
+    kitchen room with semantic zones plus an L-shaped bedroom, see
+    :func:`plan_open_plan`), or any family name -- ``compact_2x2``, ``l_shape``,
     ``central_living``, ``corridor_single``, ``corridor_double``, ``loop``,
     ``u_shape``, ``terraced``.
 
@@ -4652,11 +5244,15 @@ def generate(seed: int, room_count: Optional[int] = None,
     if floors >= 2 and shape not in ("row", "auto"):
         raise ValueError(f"--floors 2 builds its own duplex plan, --shape must be row or auto, "
                          f"not '{shape}'")
-    if shape not in ("row", "block", "auto") and shape not in ROOM_FAMILIES:
-        raise ValueError(f"unknown layout shape '{shape}' (row, block, auto or a topology family)")
+    if shape not in ("row", "block", "auto", "open_plan") and shape not in ROOM_FAMILIES:
+        raise ValueError(f"unknown layout shape '{shape}' (row, block, auto, open_plan or a "
+                         f"topology family)")
     if shape in ROOM_FAMILIES and room_count is not None and \
             ROOM_FAMILIES[shape].count != room_count:
         raise ValueError(f"layout '{shape}' has {ROOM_FAMILIES[shape].count} rooms, "
+                         f"--rooms {room_count} does not match")
+    if shape == "open_plan" and room_count is not None and int(room_count) != OPEN_PLAN_ROOMS:
+        raise ValueError(f"layout 'open_plan' has {OPEN_PLAN_ROOMS} rooms, "
                          f"--rooms {room_count} does not match")
     if floors >= 2 and room_count is not None and not 4 <= room_count <= 8:
         raise ValueError(f"--rooms must be 4..8 with --floors 2 (2-4 rooms per floor), "
@@ -4731,10 +5327,11 @@ def main(argv=None) -> int:
     parser.add_argument("--rooms", type=int, default=None,
                         help="2..7, default: drawn from the seed")
     parser.add_argument("--shape", default=os.environ.get("PANOWORLD_LAYOUT_SHAPE", "row"),
-                        choices=("row", "block", "auto") + tuple(sorted(ROOM_FAMILIES)),
+                        choices=("row", "block", "auto", "open_plan") + tuple(sorted(ROOM_FAMILIES)),
                         help="room arrangement: 'row' (one row along +X, default), 'block' (the same "
                              "chain of rooms wrapped into two rows), 'auto' (the seed draws the room "
-                             "count and a topology family) or a family name: "
+                             "count and a topology family), 'open_plan' (open LDK + L-shaped rooms) "
+                             "or a family name: "
                              + ", ".join(sorted(ROOM_FAMILIES))
                              + " -- also settable with PANOWORLD_LAYOUT_SHAPE, which is what "
                                "scripts/layout_gen_run.sh passes through")

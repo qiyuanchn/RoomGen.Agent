@@ -852,6 +852,268 @@ class TopologyFamilyTest(unittest.TestCase):
             layout_gen.generate(0, 3, ASSETS_INDEX, verbose=False, shape="compact_2x2")
 
 
+def _bbox_area(polygon):
+    xs = [point[0] for point in polygon]
+    ys = [point[1] for point in polygon]
+    return (max(xs) - min(xs)) * (max(ys) - min(ys))
+
+
+def _on_polygon_edge(point, polygon, tol=1e-6):
+    for axis, line, low, high in layout_gen._polygon_axis_edges(polygon):
+        x, y = point
+        if axis == "h" and abs(y - line) <= tol and low - tol <= x <= high + tol:
+            return True
+        if axis == "v" and abs(x - line) <= tol and low - tol <= y <= high + tol:
+            return True
+    return False
+
+
+class OpenPlanTest(unittest.TestCase):
+    """The non-rectangular single-room programme: L-shaped rooms + one open LDK.
+
+    ``--shape open_plan`` builds a 3x3 cell grid in which the living room is an
+    L of three cells (its kitchen / dining / living areas are *zones*, not
+    rooms) and the bedroom is an L around the courtyard notch.  The physical
+    outline -- not the bounding rectangle -- has to carry the shell, the shared
+    walls, the door/window cutters, furniture clearance and the camera stands;
+    the checks can only accept the result if all of them agree.
+    """
+
+    SEEDS = (2, 6)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.scenes = {}
+        cls.specs = {}
+        for seed in cls.SEEDS:
+            scene = layout_gen.generate(seed, None, ASSETS_INDEX, attempts=80,
+                                        verbose=False, shape="open_plan")
+            cls.scenes[seed] = scene
+            cls.specs[seed] = spec_mod.parse_spec(copy.deepcopy(scene.spec))
+
+    def test_two_physical_rooms_have_concave_outlines(self):
+        for seed, scene in self.scenes.items():
+            rooms = {room["id"]: room for room in scene.spec["rooms"]}
+            concave = [room for room in rooms.values()
+                       if len(room["polygon"]) > 4
+                       and abs(spec_mod.polygon_area(room["polygon"])) < 0.99 * _bbox_area(room["polygon"])]
+            with self.subTest(seed=seed):
+                self.assertGreaterEqual(len(concave), 2,
+                                        f"only {[room['id'] for room in concave]} are concave")
+                self.assertEqual({room["type"] for room in concave},
+                                 {"living_room", "bedroom"})
+                for room in concave:
+                    low, high = layout_gen.ROOM_AREA_M2[room["type"]]
+                    area = abs(spec_mod.polygon_area(room["polygon"]))
+                    self.assertGreaterEqual(area, low - 1e-6)
+                    self.assertLessEqual(area, high + 1e-6)
+                    xs = [point[0] for point in room["polygon"]]
+                    ys = [point[1] for point in room["polygon"]]
+                    self.assertGreaterEqual(min(max(xs) - min(xs), max(ys) - min(ys)),
+                                            layout_gen.ROOM_MIN_DIM_M[room["type"]] - 1e-6)
+                self.assertTrue(scene.report["checks"]["pass"],
+                                scene.report["checks"]["violations"][:4])
+
+    def test_ldk_is_one_physical_room_with_three_zones(self):
+        for seed, spec in self.specs.items():
+            living = spec.room("living")
+            zones = {zone.type: zone for zone in living.zones}
+            with self.subTest(seed=seed):
+                self.assertTrue(living.open_plan)
+                self.assertEqual(set(zones), {"kitchen", "dining", "living_room"})
+                room_area = abs(spec_mod.polygon_area(living.polygon))
+                # zones tile exactly the one open space: no gap, no overlap
+                self.assertAlmostEqual(sum(abs(spec_mod.polygon_area(zone.polygon))
+                                           for zone in living.zones), room_area, places=6)
+                for name, zone in zones.items():
+                    self.assertAlmostEqual(spec_mod.polygon_overlap_area(zone.polygon, living.polygon),
+                                           abs(spec_mod.polygon_area(zone.polygon)), places=6,
+                                           msg=f"{name} leaves the room outline")
+                for first, second in (("kitchen", "dining"), ("kitchen", "living_room"),
+                                      ("dining", "living_room")):
+                    self.assertLessEqual(spec_mod.polygon_overlap_area(
+                        zones[first].polygon, zones[second].polygon), 1e-6)
+                self.assertTrue(layout_gen._polygons_share_edge(
+                    zones["kitchen"].polygon, zones["dining"].polygon))
+                # no separate kitchen / dining *room* exists in the programme
+                types = [room.type for room in spec.rooms]
+                self.assertNotIn("kitchen", types)
+                self.assertNotIn("dining", types)
+
+    def test_zones_add_no_wall_window_or_door(self):
+        for seed, spec in self.specs.items():
+            living = spec.room("living")
+            segments = spec.wall_segments()
+            with self.subTest(seed=seed):
+                for segment in segments:
+                    if segment.owners != (living.id,):
+                        continue
+                    middle = (0.5 * (segment.p0[0] + segment.p1[0]),
+                              0.5 * (segment.p0[1] + segment.p1[1]))
+                    self.assertTrue(_on_polygon_edge(middle, living.polygon),
+                                    f"internal wall span {segment.p0}..{segment.p1} "
+                                    f"inside the open-plan room")
+                for opening in spec.door_connections():
+                    # a connector always links two physical rooms, never two zones
+                    self.assertNotEqual(opening.from_room, opening.to_room)
+                for window in spec.windows:
+                    middle = ((window.wall[0][0] + window.wall[1][0]) / 2.0,
+                              (window.wall[0][1] + window.wall[1][1]) / 2.0)
+                    segment = spec_mod.wall_segment_for_point(
+                        segments, middle, window.room)
+                    self.assertIsNotNone(segment, f"window not on a wall of {window.room}")
+                    self.assertEqual(segment.owners, (window.room,),
+                                     "a window must sit on an exterior span")
+
+    def test_open_passage_links_the_ldk_and_the_hall(self):
+        for seed, scene in self.scenes.items():
+            living = self.specs[seed].room("living")
+            passages = [opening for opening in scene.spec["openings"]
+                        if opening["kind"] == "open_passage"]
+            with self.subTest(seed=seed):
+                self.assertEqual(len(passages), 1, scene.spec["openings"])
+                opening = passages[0]
+                self.assertIn(living.id, opening["between"])
+                self.assertAlmostEqual(opening["width"], layout_gen.OPEN_PLAN_PASSAGE_WIDTH)
+                self.assertAlmostEqual(opening["height"], layout_gen.OPEN_PLAN_PASSAGE_HEIGHT)
+                segments = self.specs[seed].wall_segments()
+                found = spec_mod.wall_segment_for_point(
+                    segments, opening["center"], living.id)
+                self.assertIsNotNone(found)
+                self.assertEqual(set(found.owners), set(opening["between"]),
+                                 "the passage must sit on the shared wall of its two rooms")
+
+    def test_furniture_stays_in_its_zone(self):
+        for seed, scene in self.scenes.items():
+            living = self.specs[seed].room("living")
+            zones = {zone.type: zone for zone in living.zones}
+            seen = set()
+            for item in scene.report["furniture"]:
+                if item["room"] != living.id:
+                    continue
+                center = (item["pos"][0], item["pos"][1])
+                hits = [name for name, zone in zones.items()
+                        if spec_mod.point_in_polygon(center, zone.polygon)]
+                with self.subTest(seed=seed, item=item["name"]):
+                    self.assertEqual(len(hits), 1,
+                                     f"{item['name']} is not inside exactly one zone: {hits}")
+                    if "kitchen" in item["name"]:
+                        expected = "kitchen"
+                    elif "dining" in item["name"]:
+                        expected = "dining"
+                    else:
+                        expected = "living_room"
+                    self.assertEqual(hits[0], expected)
+                    seen.add(expected)
+                    half_x, half_y = layout_gen.rotated_half_extents(
+                        item["size_m"], item["rot_z_deg"])
+                    aabb = (center[0] - half_x, center[1] - half_y,
+                            center[0] + half_x, center[1] + half_y)
+                    self.assertGreaterEqual(
+                        checks_mod.wall_gap(aabb, zones[expected].polygon), -1e-6,
+                        f"{item['name']} leaves the {expected} zone")
+                    self.assertGreaterEqual(checks_mod.wall_gap(aabb, living.polygon), -1e-6)
+            with self.subTest(seed=seed):
+                self.assertEqual(seen, {"kitchen", "dining", "living_room"})
+
+    def test_cameras_stand_inside_the_real_outline(self):
+        for seed, spec in self.specs.items():
+            for camera in spec.cameras:
+                room = spec.room(camera.room)
+                with self.subTest(seed=seed, camera=camera.name):
+                    self.assertTrue(spec_mod.point_in_polygon(camera.pos, room.polygon))
+                    gap = checks_mod.wall_gap((camera.pos[0], camera.pos[1],
+                                               camera.pos[0], camera.pos[1]), room.polygon)
+                    self.assertGreaterEqual(gap, checks_mod.WALL_GAP_MIN_M - 1e-6)
+                    self.assertEqual(room.type in ("living_room", "bedroom"),
+                                     len(room.polygon) > 4)
+
+    def test_topdown_draws_the_concave_outline_not_its_bounding_box(self):
+        try:
+            from blender_agent import export_scene
+            from PIL import Image
+        except ImportError as error:  # host python without numpy/PIL (README runs the render host)
+            self.skipTest(f"top-down rendering needs numpy/PIL: {error}")
+        data = {
+            "unit": "meter", "wall_height": 2.7, "wall_thickness": 0.12,
+            "rooms": [{"id": "living", "type": "living_room",
+                       "polygon": [[0, 0], [5, 0], [5, 2], [2, 2], [2, 5], [0, 5]],
+                       "floor_color": [0.5, 0.3, 0.2]}],
+            "cameras": [{"name": "0000", "room": "living", "pos": [0.5, 0.5, 1.5]}],
+        }
+        spec = spec_mod.parse_spec(data)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "topdown.png")
+            info = export_scene.draw_topdown(spec, {}, path)
+            image = Image.open(path).convert("RGB")
+        scale = info["pixels_per_meter"]
+        min_x, min_y = -export_scene.TOPDOWN_MARGIN_M, -export_scene.TOPDOWN_MARGIN_M
+
+        def pixel(x, y):
+            return (int(round((x - min_x) * scale)),
+                    int(round(image.size[1] - (y - min_y) * scale)))
+
+        background = (250, 250, 250)
+        self.assertEqual(image.getpixel(pixel(4.0, 4.0)), background,
+                         "the courtyard notch is painted as floor")
+        self.assertNotEqual(image.getpixel(pixel(1.0, 4.0)), background,
+                            "the left arm of the L is missing")
+        self.assertNotEqual(image.getpixel(pixel(1.0, 1.0)), background,
+                            "the bottom arm of the L is missing")
+
+    def test_open_plan_is_deterministic_and_size_locked(self):
+        again = layout_gen.generate(self.SEEDS[0], None, ASSETS_INDEX, attempts=80,
+                                    verbose=False, shape="open_plan")
+        self.assertEqual(json.dumps(again.spec, sort_keys=True),
+                         json.dumps(self.scenes[self.SEEDS[0]].spec, sort_keys=True))
+        self.assertIn("open_plan", layout_gen._shapes_for_count(layout_gen.OPEN_PLAN_ROOMS))
+        self.assertIn("open_plan", layout_gen.AUTO_FAMILY_WEIGHT)
+        with self.assertRaises(ValueError):
+            layout_gen.generate(0, 3, ASSETS_INDEX, verbose=False, shape="open_plan")
+
+    def test_generated_spec_rejects_broken_zones(self):
+        base = copy.deepcopy(self.scenes[self.SEEDS[0]].spec)
+        outside = copy.deepcopy(base)
+        living = next(room for room in outside["rooms"] if room["id"] == "living")
+        living["zones"][0]["polygon"] = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]]
+        with self.assertRaises(spec_mod.SpecError):
+            spec_mod.parse_spec(outside)
+
+        overlap = copy.deepcopy(base)
+        living = next(room for room in overlap["rooms"] if room["id"] == "living")
+        living["zones"][1]["polygon"] = copy.deepcopy(living["zones"][0]["polygon"])
+        with self.assertRaises(spec_mod.SpecError):
+            spec_mod.parse_spec(overlap)
+
+        closed = copy.deepcopy(base)
+        living = next(room for room in closed["rooms"] if room["id"] == "living")
+        living["open_plan"] = False
+        with self.assertRaises(spec_mod.SpecError):
+            spec_mod.parse_spec(closed)
+
+        unknown = copy.deepcopy(base)
+        living = next(room for room in unknown["rooms"] if room["id"] == "living")
+        living["zones"][0]["type"] = "garage"
+        with self.assertRaises(spec_mod.SpecError):
+            spec_mod.parse_spec(unknown)
+
+    def test_cli_writes_the_open_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "spec.json")
+            result = subprocess.run(
+                [sys.executable, os.path.join(REPO_ROOT, "blender_agent", "layout_gen.py"),
+                 "--seed", str(self.SEEDS[0]), "--shape", "open_plan", "--out", out],
+                capture_output=True, text=True, cwd=REPO_ROOT,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+            with open(out, encoding="utf-8") as handle:
+                spec = json.load(handle)
+            parsed = spec_mod.parse_spec(spec)
+            report = checks_mod.check_spec(parsed, ASSETS_INDEX)
+            self.assertTrue(report["pass"], report["violations"][:4])
+            self.assertEqual(len(spec["rooms"]), layout_gen.OPEN_PLAN_ROOMS)
+
+
 class AutoShapeBalanceTest(unittest.TestCase):
     """``--shape auto`` draws the arrangement, not the easiest one to build.
 

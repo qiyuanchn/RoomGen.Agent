@@ -95,6 +95,28 @@ Semantics frozen with the generator:
   *is* the ceiling for exactly that area; the rest of the room keeps its own
   ceiling slab (:meth:`SceneSpec.ceiling_regions`).  A ``slab_opening`` is a
   declared void and stays open in both bodies.
+
+Non-rectangular rooms and open-plan zones
+-----------------------------------------
+A room polygon is a general, counter-clockwise, simple polygon.  The generator
+writes L-shaped rooms and alcoves as one room whose outline is the union of
+axis-aligned rectangles; the shell, walls, cutters, furniture, cameras and the
+top-down plan all consume that outline (no algorithm may fall back to the
+bounding rectangle).
+
+A physical room may additionally carry semantic **zones**::
+
+    "rooms": [{"id": "living", "type": "living_room", "open_plan": true,
+               "polygon": [...],             // the physical open space
+               "zones": [{"type": "kitchen", "polygon": [...]},
+                         {"type": "dining",  "polygon": [...]},
+                         {"type": "living_room", "polygon": [...]}]}]
+
+Zones are functional areas of one open space, not rooms: they lie inside the
+room polygon, never overlap, and create no wall, door or circulation edge of
+their own.  Door-like ``connectors`` (including ``open_passage``) still link the
+physical rooms; furniture and cameras are placed against the room outline and
+the zone polygons only partition the furniture programme.
 """
 
 from __future__ import annotations
@@ -131,6 +153,12 @@ CONNECTOR_KINDS = ("door", "open_passage", "stair", "ramp")
 DOOR_LIKE_KINDS = ("door", "open_passage")
 VERTICAL_KINDS = ("stair", "ramp")
 DEFAULT_DOOR_HEIGHT_M = 2.05
+
+#: functional areas an open-plan room may declare (``rooms[].zones[].type``).
+#: They are semantic only -- no wall, door or circulation edge is derived from a
+#: zone; the physical room polygon stays the shell.
+ROOM_ZONE_TYPES = ("living_room", "dining", "kitchen", "bedroom", "study",
+                   "bathroom", "corridor", "entry", "storage", "laundry", "balcony")
 
 #: stair / ramp acceptance bands, shared with checks.py and the generator
 STAIR_WIDTH_MIN_M = 0.80
@@ -204,6 +232,30 @@ def point_in_polygon(point: Sequence[float], polygon: Sequence[Sequence[float]])
             if x < x0 + t * (x1 - x0):
                 inside = not inside
     return inside
+
+
+def point_in_polygon_or_boundary(point: Sequence[float],
+                                 polygon: Sequence[Sequence[float]], eps: float = 1e-6) -> bool:
+    """Inside test that also accepts a point on the boundary (zones touch walls).
+
+    ``point_in_polygon`` alone is ambiguous exactly on an edge, where a zone
+    that tiles the room from wall to wall must still count as inside.
+    """
+    if point_in_polygon(point, polygon):
+        return True
+    x, y = float(point[0]), float(point[1])
+    count = len(polygon)
+    for i in range(count):
+        ax, ay = float(polygon[i][0]), float(polygon[i][1])
+        bx, by = float(polygon[(i + 1) % count][0]), float(polygon[(i + 1) % count][1])
+        dx, dy = bx - ax, by - ay
+        length_sq = dx * dx + dy * dy
+        if length_sq < 1e-18:
+            continue
+        t = max(0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / length_sq))
+        if math.hypot(x - (ax + t * dx), y - (ay + t * dy)) <= eps:
+            return True
+    return False
 
 
 def _dedup(values: Sequence[float], eps: float = 1e-6) -> List[float]:
@@ -437,8 +489,30 @@ def _edge_intersection(p, q, origin, direction) -> List[float]:
     return [float(p[0] + t * dx), float(p[1] + t * dy)]
 
 
+def _rectilinear_overlap_area(a: Sequence[Sequence[float]],
+                              b: Sequence[Sequence[float]]) -> float:
+    """Exact intersection area of two rectilinear polygons, by lattice cells."""
+    xs = _dedup([float(p[0]) for p in list(a) + list(b)])
+    ys = _dedup([float(p[1]) for p in list(a) + list(b)])
+    area = 0.0
+    for j in range(len(ys) - 1):
+        cy = 0.5 * (ys[j] + ys[j + 1])
+        for i in range(len(xs) - 1):
+            cx = 0.5 * (xs[i] + xs[i + 1])
+            if point_in_polygon((cx, cy), a) and point_in_polygon((cx, cy), b):
+                area += (xs[i + 1] - xs[i]) * (ys[j + 1] - ys[j])
+    return area
+
+
 def polygon_overlap_area(a: Sequence[Sequence[float]], b: Sequence[Sequence[float]]) -> float:
-    """Area of the intersection of two polygons (m^2, 0.0 when disjoint)."""
+    """Area of the intersection of two polygons (m^2, 0.0 when disjoint).
+
+    Exact for rectilinear polygons (the L-shaped rooms and rectangular upper
+    slabs the generator emits); a general pair falls back to the Sutherland-
+    Hodgman clip, which is exact when the clipper is convex.
+    """
+    if is_rectilinear(a) and is_rectilinear(b):
+        return _rectilinear_overlap_area(a, b)
     clipped = polygon_clip(a, b)
     if len(clipped) < 3:
         return 0.0
@@ -495,15 +569,29 @@ def _merge_rect_cells(kept: Sequence[Sequence[bool]], xs: Sequence[float],
     return out
 
 
+def is_rectilinear(polygon: Sequence[Sequence[float]], eps: float = 1e-7) -> bool:
+    """True when every edge of ``polygon`` is axis-aligned (within ``eps``)."""
+    count = len(polygon)
+    for i in range(count):
+        dx = float(polygon[(i + 1) % count][0]) - float(polygon[i][0])
+        dy = float(polygon[(i + 1) % count][1]) - float(polygon[i][1])
+        if abs(dx) > eps and abs(dy) > eps:
+            return False
+    return True
+
+
 def polygon_difference(subject: Sequence[Sequence[float]],
                        cutters: Sequence[Sequence[Sequence[float]]]) -> List[List[List[float]]]:
     """``subject`` minus the union of ``cutters``, as a list of polygons (all inside it).
 
-    Exact for axis-aligned rectangles -- what the generator and the hand-written
-    demos emit -- by cutting the subject's lattice at every cutter edge and merging
-    the surviving cells back into rectangles.  Any other outline keeps the whole
-    subject, which is the safe side for a shell part: a piece that is not needed is
-    a duplicated body, a missing one is a hole in the building.
+    Exact for axis-aligned rectangles -- what the upper-storey slabs and the
+    hand-written demos are -- by cutting the subject's lattice at every cutter
+    edge and merging the surviving cells back into rectangles.  Any other
+    outline (including an L-shaped room) keeps the whole subject: the safe side
+    for a shell part, because a piece that is not needed is a duplicated body
+    while a missing one is a hole in the building.  The whole outline is kept,
+    never its bounding rectangle, so a concave room still gets a concave
+    ceiling.
     """
     subject_rect = _axis_rect(subject)
     cutter_rects = [_axis_rect(cutter) for cutter in cutters]
@@ -560,6 +648,20 @@ class FurnitureSpec:
 
 
 @dataclass
+class RoomZoneSpec:
+    """A semantic functional area inside one physical (open-plan) room.
+
+    Zones never add geometry: the room polygon is the shell, and a zone only
+    says which part of that open space is, e.g., the kitchen.  They lie inside
+    the room polygon and do not overlap each other.
+    """
+
+    type: str
+    polygon: List[List[float]]
+    name: Optional[str] = None
+
+
+@dataclass
 class RoomSpec:
     id: str
     type: str
@@ -567,6 +669,10 @@ class RoomSpec:
     floor_color: List[float] = field(default_factory=lambda: [0.6, 0.6, 0.6])
     floor_id: Optional[str] = None
     height: Optional[float] = None
+    #: semantic zones of an open-plan room (empty for a plain room)
+    zones: List[RoomZoneSpec] = field(default_factory=list)
+    #: True when the room's areas share one continuous space (internal zones)
+    open_plan: bool = False
 
 
 @dataclass
@@ -1400,10 +1506,35 @@ def parse_spec(data: dict, source_path: Optional[str] = None) -> SceneSpec:
         if room_height is not None:
             _require(floors, f"room '{room_id}' overrides 'height' -- only supported with 'floors'")
             room_height = float(room_height)
+        raw_zones = raw_room.get("zones") or []
+        _require(isinstance(raw_zones, list), f"room '{room_id}' zones must be a list")
+        zones: List[RoomZoneSpec] = []
+        for j, raw_zone in enumerate(raw_zones):
+            label = f"room '{room_id}' zones[{j}]"
+            zone_type = str(raw_zone.get("type", ""))
+            _require(zone_type in ROOM_ZONE_TYPES,
+                     f"{label}.type '{zone_type}' is unknown ({', '.join(ROOM_ZONE_TYPES)})")
+            zone_polygon = [_vec2(p, f"{label}.polygon vertex") for p in raw_zone["polygon"]]
+            _require(len(zone_polygon) >= 3, f"{label} needs at least 3 vertices")
+            _require(polygon_area(zone_polygon) > 0.0,
+                     f"{label} polygon must be counter-clockwise with positive area")
+            _require(all(point_in_polygon_or_boundary(point, polygon) for point in zone_polygon),
+                     f"{label} polygon leaves room '{room_id}'")
+            zones.append(RoomZoneSpec(type=zone_type, polygon=zone_polygon,
+                                      name=(str(raw_zone["name"]) if raw_zone.get("name") else None)))
+        for a in range(len(zones)):
+            for b in range(a + 1, len(zones)):
+                area = polygon_overlap_area(zones[a].polygon, zones[b].polygon)
+                _require(area <= 1e-6,
+                         f"room '{room_id}' zones '{zones[a].type}' and '{zones[b].type}' "
+                         f"overlap ({area:.3f} m^2)")
+        if raw_room.get("open_plan") is False and zones:
+            raise SpecError(f"room '{room_id}' declares zones but sets open_plan false")
+        open_plan = bool(raw_room.get("open_plan", bool(zones)))
         rooms.append(
             RoomSpec(id=room_id, type=str(raw_room.get("type", "room")), polygon=polygon,
                      floor_color=[float(c) for c in color], floor_id=room_floor_id,
-                     height=room_height)
+                     height=room_height, zones=zones, open_plan=open_plan)
         )
     ids = [room.id for room in rooms]
     _require(len(set(ids)) == len(ids), "room ids must be unique")
@@ -1817,8 +1948,11 @@ def dump_manifest_spec(spec: SceneSpec) -> dict:
             for f in spec.floors
         ],
         "rooms": [
-            {"id": r.id, "type": r.type, "polygon": r.polygon, "floor_color": r.floor_color,
-             "floor_id": r.floor_id, "height": r.height}
+            {**{"id": r.id, "type": r.type, "polygon": r.polygon,
+                "floor_color": r.floor_color, "floor_id": r.floor_id, "height": r.height},
+             **({"open_plan": True} if r.open_plan else {}),
+             **({"zones": [{"type": z.type, "polygon": z.polygon, "name": z.name}
+                           for z in r.zones]} if r.zones else {})}
             for r in spec.rooms
         ],
         "connectors": [

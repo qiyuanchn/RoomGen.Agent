@@ -12,9 +12,10 @@ The shell is built from :mod:`blender_agent.spec` with plain mesh data (no
   same duplicated body and never leave a hole either
 * one wall box per merged wall span (see ``spec.build_wall_segments``), the
   polygon centre line carrying a ``wall_thickness`` box that is extended by
-  half a thickness at both ends so perpendicular walls close the corners;
-  spans merge within one storey only and every wall box lives in its storey's
-  z band
+  half a thickness at both ends so perpendicular walls close the corners, plus
+  ``WALL_END_OVERLAP_M`` so the two end faces of a concave corner are not
+  coplanar (Cycles renders that z-fighting as a black stripe); spans merge
+  within one storey only and every wall box lives in its storey's z band
 * door/window openings are boolean-differenced out of the walls only, so a
   cut below the floor surface cannot notch the floor slabs; a cutter only
   touches the wall boxes whose z band it overlaps (a second-storey door never
@@ -38,6 +39,10 @@ CUTTER_COLLECTION = "cutters"
 
 FLOOR_SLAB = spec_mod.DEFAULT_SLAB_M
 CEILING_SLAB = spec_mod.DEFAULT_SLAB_M
+#: extra wall-box length per end, past the half-thickness corner closure.  Two
+#: perpendicular walls would otherwise put two faces in the same plane and
+#: Cycles renders the coincident strip black.
+WALL_END_OVERLAP_M = 0.002
 
 STAIR_COLOR = (0.62, 0.47, 0.33)
 
@@ -335,7 +340,11 @@ def build_shell(spec: spec_mod.SceneSpec, collection_name: str = SHELL_COLLECTIO
                     name=f"wall_{index:02d}_{label}_{segment.p0[0]:.2f}_{segment.p0[1]:.2f}".replace("-", "m"),
                     center_xy=((segment.p0[0] + segment.p1[0]) / 2.0, (segment.p0[1] + segment.p1[1]) / 2.0),
                     direction=segment.direction,
-                    length=segment.length + thickness,
+                    # Half a thickness at each end closes a corner, and the
+                    # extra millimetres keep the two end faces from being
+                    # coplanar with the perpendicular wall's side face: that
+                    # z-fighting renders as a black stripe at concave corners.
+                    length=segment.length + thickness + 2.0 * WALL_END_OVERLAP_M,
                     depth=thickness,
                     z_bottom=floor.elevation,
                     z_top=floor.elevation + height,
