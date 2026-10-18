@@ -37,8 +37,18 @@ Usage space
 -----------
 ``usage`` on a part is the clear space its use needs in front of it (fridge
 door swing, pulled-out desk chair, shower entry).  ``layout_gen`` keeps that
-rectangle free of other blocking furniture -- ``checks.py`` cannot see intent,
-so the generator enforces it and reports it.
+rectangle free of other blocking furniture -- the *initial* layout constraint.
+:func:`usage_volumes` turns the same declaration into a machine-readable world
+volume (a conservative axis-aligned box in front / behind the item), and
+``checks.check_final_geometry`` measures those volumes on the post-settle
+geometry, so a door swing, a pulled-out chair, a bed side or a shower entry that
+was clear when authored but blocked after settle / repair fails the final
+check instead of passing on the authored intent.
+
+The declaration names the kind of space (``door_swing``, ``pull_out``,
+``standing``, ``entry`` or ``bed_side``), the side of the item and the clear
+depth.  Beds are not ``builtin:`` parts, so a small category/name rule adds the
+side passages a bed needs (``BED_SIDE_USAGE``).
 """
 
 from __future__ import annotations
@@ -48,6 +58,39 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 # box = (suffix, material key, (centre_x, centre_y, bottom_z), (width, depth, height))
 Box = Tuple[str, str, Tuple[float, float, float], Tuple[float, float, float]]
+
+#: usage-space kinds.  A door swing opens in front of the item, a pull-out is a
+#: straight channel behind a chair (or in front of a desk), standing / entry are
+#: the body-width passages of a toilet, basin or shower and ``bed_side`` is a
+#: walkway along one long side of a bed.
+USAGE_DOOR_SWING = "door_swing"
+USAGE_PULL_OUT = "pull_out"
+USAGE_STANDING = "standing"
+USAGE_ENTRY = "entry"
+USAGE_BED_SIDE = "bed_side"
+USAGE_KINDS = (USAGE_DOOR_SWING, USAGE_PULL_OUT, USAGE_STANDING, USAGE_ENTRY, USAGE_BED_SIDE)
+
+#: default body height of a standing / walking usage volume.  A ceiling lamp or a
+#: picture above this band is not a blocker; a piece of furniture standing on the
+#: floor is.  ``None`` on a declaration means "the item's own height" (a cabinet
+#: door only swings as high as its carcass).
+USAGE_BODY_HEIGHT_M = 1.8
+#: clear length a bed side passage keeps after subtracting nightstands, walls and
+#: other blockers; a shorter free segment is not a walkable way to the bed
+BED_SIDE_MIN_CLEAR_M = 1.2
+BED_SIDE_DEPTH_M = 0.55
+BED_SIDE_USAGE = {
+    "kind": USAGE_BED_SIDE,
+    "side": "both",
+    "depth_m": BED_SIDE_DEPTH_M,
+    "height_m": USAGE_BODY_HEIGHT_M,
+    "min_clear_m": BED_SIDE_MIN_CLEAR_M,
+}
+
+
+def _usage(kind: str, side: str = "front", height_m: Optional[float] = None) -> dict:
+    """A usage declaration (depth is filled by :func:`_part`)."""
+    return {"kind": kind, "side": side, "height_m": height_m}
 
 # material palette: key -> (name, base colour, roughness, metallic)
 MATERIALS: Dict[str, Tuple[str, Tuple[float, float, float], float, float]] = {
@@ -62,7 +105,9 @@ MATERIALS: Dict[str, Tuple[str, Tuple[float, float, float], float, float]] = {
 }
 
 
-def _part(boxes: Sequence[Box], usage: float = 0.0, category: str = "") -> dict:
+def _part(boxes: Sequence[Box], usage: float = 0.0, category: str = "",
+          usage_kind: str = USAGE_STANDING, usage_side: str = "front",
+          usage_height_m: Optional[float] = USAGE_BODY_HEIGHT_M) -> dict:
     """Normalise a box assembly and derive its measured footprint.
 
     The boxes are shifted so the union is centred on the local origin in X/Y and
@@ -85,7 +130,12 @@ def _part(boxes: Sequence[Box], usage: float = 0.0, category: str = "") -> dict:
               (cx + shift[0], cy + shift[1], cz + shift[2]), (width, depth, height))
              for suffix, material, (cx, cy, cz), (width, depth, height) in boxes]
     dims = (round(max(xs) - min(xs), 4), round(max(ys) - min(ys), 4), round(z_top - z_bottom, 4))
-    return {"dims": dims, "boxes": moved, "usage_m": float(usage), "category": category}
+    declaration = None
+    if usage > 0.0:
+        declaration = _usage(usage_kind, side=usage_side, height_m=usage_height_m)
+        declaration["depth_m"] = float(usage)
+    return {"dims": dims, "boxes": moved, "usage_m": float(usage), "category": category,
+            "usage": declaration}
 
 
 # --------------------------------------------------------------------------- #
@@ -290,23 +340,36 @@ def _washer_boxes() -> List[Box]:
 FIXTURE_PARTS: Dict[str, dict] = {
     # kitchen
     "kitchen_cabinet": _part(_kitchen_run_boxes(), usage=0.0, category="kitchen"),
-    "kitchen_stove": _part(_kitchen_stove_boxes(), usage=0.60, category="kitchen"),
-    "kitchen_sink": _part(_kitchen_sink_boxes(), usage=0.60, category="kitchen"),
-    "kitchen_fridge": _part(_kitchen_fridge_boxes(), usage=0.75, category="kitchen"),
+    "kitchen_stove": _part(_kitchen_stove_boxes(), usage=0.60, category="kitchen",
+                           usage_kind=USAGE_DOOR_SWING, usage_height_m=None),
+    "kitchen_sink": _part(_kitchen_sink_boxes(), usage=0.60, category="kitchen",
+                          usage_kind=USAGE_DOOR_SWING, usage_height_m=None),
+    "kitchen_fridge": _part(_kitchen_fridge_boxes(), usage=0.75, category="kitchen",
+                            usage_kind=USAGE_DOOR_SWING, usage_height_m=None),
     "kitchen_upper": _part(_kitchen_upper_boxes(), usage=0.0, category="kitchen"),
     # bathroom
-    "bath_toilet": _part(_toilet_boxes(), usage=0.55, category="bathroom"),
-    "bath_basin": _part(_basin_boxes(), usage=0.55, category="bathroom"),
-    "bath_shower": _part(_shower_boxes(), usage=0.60, category="bathroom"),
+    "bath_toilet": _part(_toilet_boxes(), usage=0.55, category="bathroom",
+                         usage_kind=USAGE_STANDING),
+    "bath_basin": _part(_basin_boxes(), usage=0.55, category="bathroom",
+                        usage_kind=USAGE_STANDING),
+    "bath_shower": _part(_shower_boxes(), usage=0.60, category="bathroom",
+                         usage_kind=USAGE_ENTRY),
     # study / dining / bedroom / entry / storage / laundry
-    "study_desk": _part(_desk_boxes(), usage=0.75, category="study"),
-    "study_chair": _part(_desk_chair_boxes(), usage=0.55, category="study"),
+    "study_desk": _part(_desk_boxes(), usage=0.75, category="study",
+                        usage_kind=USAGE_PULL_OUT, usage_height_m=1.1),
+    "study_chair": _part(_desk_chair_boxes(), usage=0.55, category="study",
+                         usage_kind=USAGE_PULL_OUT, usage_side="back", usage_height_m=1.1),
     "dining_table": _part(_dining_table_boxes(), usage=0.0, category="dining"),
-    "dining_chair": _part(_dining_chair_boxes(), usage=0.55, category="dining"),
-    "wardrobe": _part(_wardrobe_boxes(), usage=0.65, category="bedroom"),
-    "entry_shoe_cabinet": _part(_shoe_cabinet_boxes(), usage=0.55, category="entry"),
-    "storage_shelf": _part(_storage_shelf_boxes(), usage=0.60, category="storage"),
-    "laundry_washer": _part(_washer_boxes(), usage=0.65, category="laundry"),
+    "dining_chair": _part(_dining_chair_boxes(), usage=0.55, category="dining",
+                          usage_kind=USAGE_PULL_OUT, usage_side="back", usage_height_m=1.1),
+    "wardrobe": _part(_wardrobe_boxes(), usage=0.65, category="bedroom",
+                      usage_kind=USAGE_DOOR_SWING, usage_height_m=None),
+    "entry_shoe_cabinet": _part(_shoe_cabinet_boxes(), usage=0.55, category="entry",
+                                usage_kind=USAGE_DOOR_SWING, usage_height_m=None),
+    "storage_shelf": _part(_storage_shelf_boxes(), usage=0.60, category="storage",
+                           usage_kind=USAGE_STANDING),
+    "laundry_washer": _part(_washer_boxes(), usage=0.65, category="laundry",
+                            usage_kind=USAGE_DOOR_SWING, usage_height_m=None),
 }
 
 #: ``builtin:<part>`` -> footprint, the table ``checks.item_dims`` needs.
@@ -332,6 +395,128 @@ def usage_m(part: str, scale: float = 1.0) -> float:
     scaled ``builtin:`` item emits.
     """
     return float(FIXTURE_PARTS[part]["usage_m"]) * float(scale)
+
+
+def _looks_like_bed(asset: str) -> bool:
+    """Fallback for ``gen:bed_01`` / ``ph:GothicBed_01`` when no index entry exists."""
+    token = asset.split(":", 1)[-1].lower()
+    return "bed" in token and "bedside" not in token
+
+
+def usage_declaration(asset: str, entry: Optional[dict] = None,
+                      scale: float = 1.0) -> Optional[dict]:
+    """The machine-readable usage space an asset declares, or ``None``.
+
+    ``entry`` is the asset registry entry (its ``categories`` identify a bed when
+    the index has no measured id); ``scale`` multiplies the clear depth exactly
+    like :func:`usage_m` so a scaled fixture declares a scaled space.  The
+    returned dict is a copy: callers may attach it to their own box records.
+    """
+    if asset.startswith("builtin:"):
+        part = FIXTURE_PARTS.get(asset.split(":", 1)[1])
+        if part is None or not part.get("usage"):
+            return None
+        declaration = dict(part["usage"])
+        declaration["depth_m"] = float(declaration["depth_m"]) * float(scale)
+        return declaration
+    categories = {str(value).lower() for value in ((entry or {}).get("categories") or ())}
+    if "bed" in categories or _looks_like_bed(asset):
+        declaration = dict(BED_SIDE_USAGE)
+        declaration["depth_m"] = float(declaration["depth_m"]) * float(scale)
+        declaration["min_clear_m"] = float(declaration["min_clear_m"]) * float(scale)
+        return declaration
+    return None
+
+
+def _side_rect(aabb: Sequence[float], direction: Sequence[float],
+               depth: float) -> Tuple[float, float, float, float]:
+    """Conservative box grown from one AABB edge along a facing direction."""
+    ux, uy = float(direction[0]), float(direction[1])
+    x0, y0, x1, y1 = (float(value) for value in aabb)
+    if abs(ux) > abs(uy):
+        if ux > 0.0:
+            return (x1, y0, x1 + depth, y1)
+        return (x0 - depth, y0, x0, y1)
+    if uy > 0.0:
+        return (x0, y1, x1, y1 + depth)
+    return (x0, y0 - depth, x1, y0)
+
+
+def usage_rects(aabb: Sequence[float], rot_z_deg: float, depth: float,
+                side: str = "front") -> List[Tuple[float, float, float, float]]:
+    """XY rectangles of a usage volume beside ``aabb``, in world coordinates.
+
+    The rotation convention is the asset one: ``rot_z_deg == 0`` faces -Y, so
+    ``front`` grows from the AABB edge the item faces.  ``left`` / ``right`` are
+    its own sides (used for the two bed passages).  Every rectangle spans the
+    whole perpendicular AABB extent: a conservative box, never smaller than the
+    sector / channel it approximates.
+    """
+    angle = math.radians(float(rot_z_deg))
+    front = (math.sin(angle), -math.cos(angle))
+    right = (math.cos(angle), math.sin(angle))
+    vectors = {
+        "front": front,
+        "back": (-front[0], -front[1]),
+        "left": (-right[0], -right[1]),
+        "right": right,
+    }
+    vector = vectors.get(side)
+    if vector is None:
+        return []
+    return [_side_rect(aabb, vector, float(depth))]
+
+
+def usage_volumes(asset: str, aabb: Sequence[float], z: Sequence[float], floor_z: float,
+                  rot_z_deg: float, scale: float = 1.0, entry: Optional[dict] = None,
+                  declaration: Optional[dict] = None) -> List[dict]:
+    """World-space usage volumes of one placed item -- pure stdlib, JSON-able.
+
+    ``aabb`` is the item's final XY bounding box, ``z`` its world Z range and
+    ``floor_z`` the storey elevation (the bottom of a person's standing volume).
+    A ``door_swing`` volume uses the item's own height; every other kind uses
+    the declared body height, so a ceiling lamp or a picture above the space is
+    not part of it.  A ``bed_side`` declaration yields the two long-side
+    passages, each carrying the clear length it needs.
+    """
+    declaration = declaration or usage_declaration(asset, entry, scale)
+    if not declaration:
+        return []
+    height = declaration.get("height_m")
+    if height is None:
+        vz = (float(z[0]), float(z[1]))
+    else:
+        vz = (float(floor_z), float(floor_z) + float(height))
+    kind = str(declaration["kind"])
+    sides = ("left", "right") if kind == USAGE_BED_SIDE else (declaration.get("side", "front"),)
+    volumes = []
+    for side in sides:
+        for rect in usage_rects(aabb, rot_z_deg, float(declaration["depth_m"]), side):
+            volume = {
+                "item": "",
+                "kind": kind,
+                "side": side,
+                "depth_m": round(float(declaration["depth_m"]), 4),
+                "rect": [round(value, 4) for value in rect],
+                "z": [round(value, 4) for value in vz],
+            }
+            if declaration.get("min_clear_m") is not None:
+                volume["min_clear_m"] = round(float(declaration["min_clear_m"]), 4)
+            volumes.append(volume)
+    return volumes
+
+
+def is_movable_seating(asset: str) -> bool:
+    """A chair or stool: movable seating, not a fixed body.
+
+    The layout generator deliberately parks the desk chair in the desk's
+    pull-out channel (``allow=("study_chair",)``): the channel is where the
+    chair is *pushed in*.  The final-geometry check therefore must not count a
+    chair inside a ``pull_out`` volume as a blocker -- the chair's own pull-out
+    channel, behind it, is checked separately.
+    """
+    token = asset.split(":", 1)[-1].lower()
+    return "chair" in token or "stool" in token
 
 
 def is_fixture(kind: str) -> bool:

@@ -80,12 +80,22 @@ contract shared with the generator:
   and the CLI ``--final-bboxes`` / ``--final-manifest`` take the post-settle
   world boxes and re-run every box-based rule on them, reporting what settle /
   repair moved, so a built scene can be re-checked without Blender.
+* functional usage spaces are final-geometry rules too: every fixture's
+  ``usage_m`` declaration (and a bed's two side passages) becomes a conservative
+  world box (:func:`fixtures.usage_volumes`), and
+  ``functional_usage_report`` checks it against the final furniture, the solid
+  wall spans and the door openings.  Lights, mounted art and thin rugs never
+  block; movable seating in a pull-out channel and a corner fixture within
+  10 cm of a standing spot do not either.  The final report records the
+  authored-vs-final difference of every space, and ``--functional-usage`` runs
+  only this rule on a spec or a final manifest.
 
 CLI::
 
     python blender_agent/checks.py spec.json [--assets-index P] [--report R]
     python blender_agent/checks.py spec.json --final-bboxes boxes.json [--report R]
     python blender_agent/checks.py --final-manifest build/build_manifest.json [--report R]
+    python blender_agent/checks.py --final-manifest build/build_manifest.json --functional-usage
 
 prints a PASS/FAIL line per check and exits non-zero when any check fails.  The
 ``--final-*`` forms do not check the authored spec: they check the boxes that
@@ -235,6 +245,7 @@ class ItemBox:
     floor_id: str = ""
     attached_to: Optional[str] = None
     mount: str = ""  # "floor" / "ceiling" / "wall" as authored ("" when inferred)
+    usage: Optional[dict] = None  # fixtures.usage_declaration of the asset
 
     @property
     def ceiling_mounted(self) -> bool:
@@ -302,6 +313,9 @@ def item_boxes(spec: "spec_mod.SceneSpec", index: Dict[str, dict]) -> Tuple[List
             placement = ""
         floor = spec.room_floor(item.room)
         floor_z, bottom_z, top_z = item_world_z(spec, item, dims)
+        scheme, _, asset_id = item.asset.partition(":")
+        entry = index.get(asset_id) if scheme != "builtin" else None
+        usage = fixtures_mod.usage_declaration(item.asset, entry, item.scale)
         # a world z on the room's own floor is "standing on the floor"; anything
         # lifted off it (relative to *that* floor) is mounted or stacked
         local_z = bottom_z - floor_z
@@ -327,6 +341,7 @@ def item_boxes(spec: "spec_mod.SceneSpec", index: Dict[str, dict]) -> Tuple[List
                 floor_id=floor.id,
                 attached_to=(str(getattr(item, "attached_to", "")) or None),
                 mount=str(getattr(item, "mount", "") or ""),
+                usage=usage,
             )
         )
     return boxes, unknown
@@ -701,7 +716,8 @@ def containment_report(spec: "spec_mod.SceneSpec", boxes: Sequence[ItemBox],
 
 
 def _item_box(entry: dict, spec: Optional["spec_mod.SceneSpec"] = None,
-              rooms_by_name: Optional[Dict[str, str]] = None) -> Tuple[Optional[ItemBox], str]:
+              rooms_by_name: Optional[Dict[str, str]] = None,
+              index: Optional[Dict[str, dict]] = None) -> Tuple[Optional[ItemBox], str]:
     """One world box from a dict: ``bbox`` (x0,y0,z0,x1,y1,z1) or ``aabb`` + ``z``."""
     room = str(entry.get("room") or "")
     name = str(entry.get("name") or "")
@@ -730,25 +746,33 @@ def _item_box(entry: dict, spec: Optional["spec_mod.SceneSpec"] = None,
     if spec is not None and room in {item.id for item in spec.rooms}:
         floor = spec.room_floor(room)
         floor_z, floor_id = float(floor.elevation), floor.id
-    return ItemBox(name=name or f"item_{id(entry)}", asset=str(entry.get("asset") or ""),
+    asset = str(entry.get("asset") or "")
+    scale = float(entry.get("scale") or 1.0)
+    scheme, _, asset_id = asset.partition(":")
+    asset_entry = (index or {}).get(asset_id) if scheme != "builtin" else None
+    usage = fixtures_mod.usage_declaration(asset, asset_entry, scale)
+    return ItemBox(name=name or f"item_{id(entry)}", asset=asset,
                    room=room, aabb=aabb, z=z, dims=None, placement=placement,
                    rot_z_deg=float(entry.get("rot_z_deg") or 0.0), rotation_on_grid=True,
-                   floor_z=floor_z, floor_id=floor_id, mount=mount), ""
+                   floor_z=floor_z, floor_id=floor_id, mount=mount, usage=usage), ""
 
 
-def boxes_from_entries(entries: Sequence[dict], spec: Optional["spec_mod.SceneSpec"] = None
+def boxes_from_entries(entries: Sequence[dict], spec: Optional["spec_mod.SceneSpec"] = None,
+                       index: Optional[Dict[str, dict]] = None
                        ) -> Tuple[List[ItemBox], List[str]]:
     """Item boxes from explicit world boxes; the second value lists unusable entries.
 
     The contract of the final-geometry re-check: whatever produced the boxes
     (settle, a repair pass, another tool) only has to provide the world AABB and
-    the room, and every box-based rule can be measured on it.
+    the room, and every box-based rule can be measured on it.  An ``asset`` (and
+    optionally ``scale``) entry lets the usage-space rule resolve the item's
+    declared operation space as well.
     """
     rooms_by_name = {item.name: item.room for item in spec.furniture} if spec is not None else None
     boxes: List[ItemBox] = []
     notes: List[str] = []
     for entry in entries:
-        box, note = _item_box(entry, spec, rooms_by_name)
+        box, note = _item_box(entry, spec, rooms_by_name, index)
         if box is None:
             notes.append(note)
         else:
@@ -780,16 +804,16 @@ def _built_size_note(name: str, built: Sequence[float], dims: Sequence[float]) -
 def _manifest_boxes(manifest: dict, spec: "spec_mod.SceneSpec",
                     index: Optional[Dict[str, dict]] = None
                     ) -> Tuple[List[ItemBox], List[str]]:
-    """Final boxes from a ``build_manifest.json``: settle's world Z on the placed footprint.
+    """Final boxes from a ``build_manifest.json``: settle's world pose as built.
 
-    The builder walks ``spec.furniture`` in order and records what it placed;
-    settle rewrites ``bbox_z`` to the world Z range of the geometry it relaxed,
-    which is the only part of the final pose the manifest carries.  So the box
-    is the spec's own footprint (same ``rotated_aabb`` as the spec-time check)
-    with the settled Z range -- the height really built, which is what the
-    containment rule needs.  Lateral drift (millimetres, not recorded) is not
-    re-checked here; a caller with true post-settle boxes uses the ``bbox``
-    contract instead.
+    The builder walks ``spec.furniture`` in order and records what it placed.
+    ``run_build`` writes the post-settle world AABB as ``bbox``
+    ``[x0, y0, z0, x1, y1, z1]``; when it is present the re-check measures that
+    box -- lateral drift included -- so the usage spaces are tested on the
+    furniture's *final* footprint.  A manifest from an older build only carries
+    settle's ``bbox_z``; then the box is the spec's own footprint (the same
+    ``rotated_aabb`` as the spec-time check) with the settled Z range, and the
+    lateral part is not re-checked.
     """
     nominal, unknown = item_boxes(spec, index or {})
     notes: List[str] = list(unknown)
@@ -811,6 +835,14 @@ def _manifest_boxes(manifest: dict, spec: "spec_mod.SceneSpec",
             note = _built_size_note(name, built, source.dims)
             if note:
                 notes.append(note)
+        bbox = placement.get("bbox")
+        if bbox is not None:
+            if len(bbox) == 6 and float(bbox[3]) > float(bbox[0]) \
+                    and float(bbox[4]) > float(bbox[1]) and float(bbox[5]) > float(bbox[2]):
+                x0, y0, z0, x1, y1, z1 = (float(value) for value in bbox)
+                boxes.append(replace(source, aabb=(x0, y0, x1, y1), z=(z0, z1)))
+                continue
+            notes.append(f"{name}: unusable 'bbox' {bbox!r} -- falling back to 'bbox_z'")
         z_range = placement.get("bbox_z")
         if not (z_range and len(z_range) == 2 and float(z_range[1]) > float(z_range[0])):
             notes.append(f"{name}: no settled 'bbox_z' -- re-checked at its authored height")
@@ -818,6 +850,365 @@ def _manifest_boxes(manifest: dict, spec: "spec_mod.SceneSpec",
             continue
         boxes.append(replace(source, z=(float(z_range[0]), float(z_range[1]))))
     return boxes, notes
+
+
+# --------------------------------------------------------------------------- #
+# functional usage spaces on the final geometry
+# --------------------------------------------------------------------------- #
+USAGE_BLOCK_TOL_M = 0.02        # a solid body this far inside the space is a blocker
+USAGE_WALL_TOL_M = 0.02         # wall body vs space: ignore placement-tolerance grazes
+USAGE_DOOR_TOL_M = 0.01         # a usage volume touching a door opening is a conflict
+USAGE_Z_TOL_M = 0.01
+#: an item this close to a standing fixture is *beside* it, not in front of it --
+#: the same tolerance ``layout_gen.USAGE_NEIGHBOUR_M`` uses when it places a
+#: basin next to a toilet.  Standing boxes are conservative rectangles, so a
+#: corner fixture may clip the box while the person still stands in the free L.
+USAGE_NEIGHBOUR_M = 0.10
+
+
+def _usage_blocker(box: ItemBox) -> bool:
+    """Is this item a solid body that can block a door swing / standing space?
+
+    Lights (ceiling lamps, wall art and other mounted pieces), floor finishes
+    (rugs / thin slabs) and anything hung above the walk band are not.  A piece
+    of furniture standing on the floor is -- even a low one -- because a door
+    leaf or a pulled-out chair needs the floor volume too.
+    """
+    if box.placement in (FLOOR_FLAT, CEILING, MOUNTED):
+        return False
+    if box.mount in ("ceiling", "wall"):
+        return False
+    # the same rule ``infer_placement`` applies to an entry that carries no
+    # placement: a body whose bottom is 1.2 m above its storey floor hangs on a
+    # wall / rides on other furniture and cannot block a floor-level use
+    if not box.placement and float(box.z[0]) - float(box.floor_z) >= 1.2:
+        return False
+    if box.asset == "builtin:rug":
+        return False
+    if float(box.z[1]) - float(box.z[0]) <= FLAT_FINISH_MAX_M + 1e-9:
+        return False
+    return True
+
+
+def _rect_penetration(a: Sequence[float], b: Sequence[float],
+                      tol: float = USAGE_BLOCK_TOL_M) -> Optional[Tuple[float, float]]:
+    """XY overlap of two rectangles when both axes penetrate more than ``tol``."""
+    dx = min(float(a[2]), float(b[2])) - max(float(a[0]), float(b[0]))
+    dy = min(float(a[3]), float(b[3])) - max(float(a[1]), float(b[1]))
+    if dx <= tol or dy <= tol:
+        return None
+    return (dx, dy)
+
+
+def _z_overlap(a: Sequence[float], b: Sequence[float], tol: float = USAGE_Z_TOL_M) -> bool:
+    return min(float(a[1]), float(b[1])) - max(float(a[0]), float(b[0])) > tol
+
+
+def _subtract_intervals(lo: float, hi: float,
+                        blocks: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """``[lo, hi]`` minus the union of ``blocks`` (clamped, merged, sorted)."""
+    spans = sorted((max(lo, float(a)), min(hi, float(b))) for a, b in blocks
+                   if min(hi, float(b)) > max(lo, float(a)))
+    free: List[Tuple[float, float]] = []
+    cursor = float(lo)
+    for start, end in spans:
+        if start > cursor + 1e-9:
+            free.append((cursor, start))
+        cursor = max(cursor, end)
+    if hi > cursor + 1e-9:
+        free.append((cursor, float(hi)))
+    return free
+
+
+def _segment_rect(segment: "spec_mod.WallSegment", a: float, b: float,
+                  half_thickness: float) -> Tuple[float, float, float, float]:
+    """World XY rectangle of a wall span ``[a, b]`` along its centre line."""
+    ux, uy = segment.direction
+    nx, ny = -uy, ux
+    corners = []
+    for t in (a, b):
+        for offset in (-half_thickness, half_thickness):
+            corners.append((segment.p0[0] + ux * t + nx * offset,
+                            segment.p0[1] + uy * t + ny * offset))
+    xs = [point[0] for point in corners]
+    ys = [point[1] for point in corners]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _usage_wall_geometry(spec: "spec_mod.SceneSpec") -> List[dict]:
+    """Solid wall spans and door-opening rectangles, with openings cut out.
+
+    ``spec.wall_segments`` merges the room boundaries; the door-like connectors
+    are then projected onto the segment they sit on and subtracted, so a usage
+    space that crosses a doorway is reported as a door conflict and one that
+    crosses a solid wall as a wall conflict instead of both.
+    """
+    segments = spec.wall_segments()
+    connectors = [connector for connector in spec.door_connections()
+                  if connector.center is not None]
+    out: List[dict] = []
+    for segment in segments:
+        spans: List[Tuple[float, float]] = []
+        openings: List[dict] = []
+        for connector in connectors:
+            if spec.floors and connector.from_floor != segment.floor_id:
+                continue
+            if not segment.contains_point(connector.center, 1e-4):
+                continue
+            ux, uy = segment.direction
+            along = ((connector.center[0] - segment.p0[0]) * ux
+                     + (connector.center[1] - segment.p0[1]) * uy)
+            half = float(connector.width) / 2.0
+            start, end = max(0.0, along - half), min(segment.length, along + half)
+            if end <= start:
+                continue
+            spans.append((start, end))
+            openings.append({
+                "name": f"{connector.kind} {connector.from_room}->{connector.to_room}",
+                "rect": _segment_rect(segment, start, end, spec.wall_thickness / 2.0),
+                "height": float(connector.height or spec_mod.DEFAULT_DOOR_HEIGHT_M),
+            })
+        solid = [_segment_rect(segment, a, b, spec.wall_thickness / 2.0)
+                 for a, b in _subtract_intervals(0.0, segment.length, spans)]
+        out.append({"segment": segment, "solid": solid, "openings": openings})
+    return out
+
+
+def _space_blockers(space: dict, box: ItemBox, boxes: Sequence[ItemBox],
+                    wall_geometry: Sequence[dict],
+                    spec: "spec_mod.SceneSpec") -> List[dict]:
+    """Every solid body / wall / door opening a usage volume intersects.
+
+    A chair parked in a ``pull_out`` channel is the piece that moves along it
+    (the desk's own chair sits in the desk's channel by construction), so it is
+    not a blocker there.  Everywhere else -- and for every other kind of space --
+    movable seating still counts.  A body within :data:`USAGE_NEIGHBOUR_M` of a
+    *standing* fixture is beside it (a basin in the toilet's corner), not in
+    its standing spot; door swings, pull-out channels and shower entries keep
+    the strict rule, because those are swept volumes, not a spot to occupy.
+    """
+    blockers: List[dict] = []
+    for other in boxes:
+        if other is box or not _usage_blocker(other):
+            continue
+        if space["kind"] == fixtures_mod.USAGE_PULL_OUT \
+                and fixtures_mod.is_movable_seating(other.asset):
+            continue
+        if space["kind"] == fixtures_mod.USAGE_STANDING \
+                and rect_distance(box.aabb, other.aabb) < USAGE_NEIGHBOUR_M:
+            continue
+        overlap = _rect_penetration(space["rect"], other.aabb)
+        if overlap is None or not _z_overlap(space["z"], other.z):
+            continue
+        blockers.append({"kind": "furniture", "name": other.name, "room": other.room,
+                         "penetration_m": round(min(overlap), 3)})
+    for entry in wall_geometry:
+        segment = entry["segment"]
+        if spec.floors and segment.floor_id != box.floor_id:
+            continue
+        if box.room not in segment.owners:
+            continue
+        for rect in entry["solid"]:
+            overlap = _rect_penetration(space["rect"], rect, USAGE_WALL_TOL_M)
+            if overlap is not None:
+                blockers.append({"kind": "wall", "name": f"wall of room '{box.room}'",
+                                 "penetration_m": round(min(overlap), 3)})
+        for opening in entry["openings"]:
+            door_z = (box.floor_z, box.floor_z + float(opening["height"]))
+            if not _z_overlap(space["z"], door_z, USAGE_DOOR_TOL_M):
+                continue
+            overlap = _rect_penetration(space["rect"], opening["rect"], USAGE_DOOR_TOL_M)
+            if overlap is not None:
+                blockers.append({"kind": "door_opening", "name": opening["name"],
+                                 "penetration_m": round(min(overlap), 3)})
+    return blockers
+
+
+def _bed_side_clearance(space: dict, box: ItemBox, boxes: Sequence[ItemBox],
+                        wall_geometry: Sequence[dict], spec: "spec_mod.SceneSpec") -> None:
+    """Fill one bed-side volume's free intervals and whether it is walkable.
+
+    A side passage is usable when a contiguous length of at least
+    ``min_clear_m`` stays free after subtracting blockers; a nightstand at the
+    head of the bed leaves the rest of the side open, two wardrobes along the
+    side do not.
+    """
+    rect = space["rect"]
+    long_x = (box.aabb[2] - box.aabb[0]) >= (box.aabb[3] - box.aabb[1])
+    lo, hi = (box.aabb[0], box.aabb[2]) if long_x else (box.aabb[1], box.aabb[3])
+    blocks: List[Tuple[float, float]] = []
+    blockers: List[dict] = []
+
+    def add_block(name: str, kind: str, other_rect, room: str = "") -> None:
+        overlap = _rect_penetration(rect, other_rect)
+        if overlap is None:
+            return
+        start = max(lo, other_rect[0] if long_x else other_rect[1])
+        end = min(hi, other_rect[2] if long_x else other_rect[3])
+        if end - start <= USAGE_BLOCK_TOL_M:
+            return
+        blocks.append((start, end))
+        blockers.append({"kind": kind, "name": name, "room": room,
+                         "interval": [round(start, 3), round(end, 3)]})
+
+    for other in boxes:
+        if other is box or not _usage_blocker(other):
+            continue
+        if not _z_overlap(space["z"], other.z):
+            continue
+        add_block(other.name, "furniture", other.aabb, other.room)
+    for entry in wall_geometry:
+        segment = entry["segment"]
+        if spec.floors and segment.floor_id != box.floor_id:
+            continue
+        if box.room not in segment.owners:
+            continue
+        for wall_rect in entry["solid"]:
+            add_block(f"wall of room '{box.room}'", "wall", wall_rect)
+        for opening in entry["openings"]:
+            door_z = (box.floor_z, box.floor_z + float(opening["height"]))
+            if _z_overlap(space["z"], door_z, USAGE_DOOR_TOL_M):
+                add_block(opening["name"], "door_opening", opening["rect"])
+
+    free = _subtract_intervals(lo, hi, blocks)
+    longest = max((end - start for start, end in free), default=0.0)
+    required = float(space.get("min_clear_m", fixtures_mod.BED_SIDE_MIN_CLEAR_M))
+    space["clear_length_m"] = round(longest, 3)
+    space["required_clear_m"] = round(required, 3)
+    space["free_intervals"] = [[round(start, 3), round(end, 3)] for start, end in free]
+    space["blockers"] = blockers
+    space["clear"] = longest >= required - 1e-9
+
+
+def functional_usage_report(spec: "spec_mod.SceneSpec", boxes: Sequence[ItemBox],
+                            assets_index: Optional[Dict[str, dict]] = None) -> dict:
+    """Check the declared operation spaces on the given (final) boxes.
+
+    Every fixture with a ``usage_m`` declaration and every bed gets a
+    conservative world volume (:func:`fixtures.usage_volumes`).  A volume fails
+    when another solid piece, a wall span or a door opening occupies it; lights,
+    thin rugs and mounted art never block.  Bed sides are interval checks: one
+    long side with enough contiguous free length is enough.
+
+    ``assets_index`` is accepted for symmetry with :func:`check_final_geometry`;
+    the boxes already carry their resolved usage declaration, so it is only a
+    fallback for boxes built without one.
+    """
+    spaces: List[dict] = []
+    wall_geometry = _usage_wall_geometry(spec)
+    for box in boxes:
+        declaration = box.usage
+        if declaration is None and assets_index:
+            scheme, _, asset_id = box.asset.partition(":")
+            entry = assets_index.get(asset_id) if scheme != "builtin" else None
+            declaration = fixtures_mod.usage_declaration(box.asset, entry)
+        if not declaration:
+            continue
+        for volume in fixtures_mod.usage_volumes(
+                box.asset, box.aabb, box.z, box.floor_z, box.rot_z_deg,
+                declaration=declaration):
+            volume["item"] = box.name
+            volume["room"] = box.room
+            if volume["kind"] == fixtures_mod.USAGE_BED_SIDE:
+                _bed_side_clearance(volume, box, boxes, wall_geometry, spec)
+            else:
+                volume["blockers"] = _space_blockers(volume, box, boxes,
+                                                     wall_geometry, spec)
+                volume["clear"] = not volume["blockers"]
+            spaces.append(volume)
+
+    violations: List[str] = []
+    # two bedrooms may both name their bed "bed": the sides of one must never
+    # satisfy the other, so the group key carries the room as well
+    bed_groups: Dict[Tuple[str, str], List[dict]] = {}
+    for space in spaces:
+        if space["kind"] == fixtures_mod.USAGE_BED_SIDE:
+            bed_groups.setdefault((space["item"], space["room"]), []).append(space)
+            continue
+        if space["clear"]:
+            continue
+        names = ", ".join(blocker["name"] for blocker in space["blockers"])
+        violations.append(
+            f"{space['item']} ({space['room']}): {space['kind']} space "
+            f"'{space['side']}' is blocked by {names}"
+        )
+    for (item, _room), sides in bed_groups.items():
+        if any(side["clear"] for side in sides):
+            continue
+        detail = ", ".join(
+            f"{side['side']} {side['clear_length_m']:.2f} m" for side in sides)
+        required = sides[0].get("required_clear_m", fixtures_mod.BED_SIDE_MIN_CLEAR_M)
+        violations.append(
+            f"{item} ({sides[0]['room']}): no bed side has a {required:.2f} m clear "
+            f"passage ({detail})"
+        )
+    return {
+        "pass": not violations,
+        "violations": violations,
+        "spaces": spaces,
+        "thresholds": {
+            "block_tolerance_m": USAGE_BLOCK_TOL_M,
+            "wall_tolerance_m": USAGE_WALL_TOL_M,
+            "door_tolerance_m": USAGE_DOOR_TOL_M,
+            "standing_neighbour_m": USAGE_NEIGHBOUR_M,
+            "body_height_m": fixtures_mod.USAGE_BODY_HEIGHT_M,
+            "bed_side_min_clear_m": fixtures_mod.BED_SIDE_MIN_CLEAR_M,
+        },
+    }
+
+
+def _usage_adjustments(before: dict, after: dict) -> List[dict]:
+    """Before/after record of every usage volume (authored vs final geometry)."""
+    by_key = {(space["item"], space["room"], space["kind"], space["side"]): space
+              for space in before.get("spaces", [])}
+    entries: List[dict] = []
+    for final in after.get("spaces", []):
+        key = (final["item"], final["room"], final["kind"], final["side"])
+        previous = by_key.get(key)
+        if previous is None:
+            entries.append({"item": final["item"], "room": final["room"],
+                            "kind": final["kind"], "side": final["side"],
+                            "status": "not_in_spec", "clear_after": final["clear"]})
+            continue
+        shift = math.dist(
+            ((final["rect"][0] + final["rect"][2]) / 2.0,
+             (final["rect"][1] + final["rect"][3]) / 2.0),
+            ((previous["rect"][0] + previous["rect"][2]) / 2.0,
+             (previous["rect"][1] + previous["rect"][3]) / 2.0),
+        )
+        before_names = sorted(blocker["name"] for blocker in previous.get("blockers", []))
+        after_names = sorted(blocker["name"] for blocker in final.get("blockers", []))
+        entry = {
+            "item": final["item"], "room": final["room"],
+            "kind": final["kind"], "side": final["side"],
+            "xy_shift_m": round(shift, 4),
+            "rect_before": previous["rect"], "rect_after": final["rect"],
+            "z_before": previous["z"], "z_after": final["z"],
+            "clear_before": bool(previous["clear"]), "clear_after": bool(final["clear"]),
+            "blockers_before": before_names, "blockers_after": after_names,
+        }
+        if final["kind"] == fixtures_mod.USAGE_BED_SIDE:
+            entry["clear_length_before_m"] = previous.get("clear_length_m")
+            entry["clear_length_after_m"] = final.get("clear_length_m")
+        entry["changed"] = bool(
+            entry["clear_before"] != entry["clear_after"]
+            or entry["xy_shift_m"] > 1e-4
+            or before_names != after_names
+            or abs(float(previous["z"][0]) - float(final["z"][0])) > 1e-4
+            or abs(float(previous["z"][1]) - float(final["z"][1])) > 1e-4
+        )
+        entries.append(entry)
+    after_keys = {(space["item"], space["room"], space["kind"], space["side"])
+                  for space in after.get("spaces", [])}
+    for previous in before.get("spaces", []):
+        key = (previous["item"], previous["room"], previous["kind"], previous["side"])
+        if key in after_keys:
+            continue
+        entries.append({"item": previous["item"], "room": previous["room"],
+                        "kind": previous["kind"], "side": previous["side"],
+                        "status": "removed_from_final", "clear_before": previous["clear"],
+                        "changed": True})
+    return entries
 
 
 def check_final_geometry(spec: "spec_mod.SceneSpec", boxes: Sequence[ItemBox],
@@ -833,7 +1224,13 @@ def check_final_geometry(spec: "spec_mod.SceneSpec", boxes: Sequence[ItemBox],
     "repaired" scene cannot pass by being measured before the repair.  A run
     that measured no box at all fails ``final_geometry_measured`` when the spec
     has furniture: an empty re-check must never read as a pass.
+
+    The usage report is measured *before* :func:`check_spec` fills in every
+    box's inferred ``placement``: the standalone ``--functional-usage`` path
+    sees the same boxes and must reach the same verdict, and the authored-vs-
+    final adjustment record must compare like with like.
     """
+    usage = functional_usage_report(spec, boxes, assets_index)
     report = check_spec(spec, assets_index, grid_m=grid_m, boxes=boxes)
     report["kind"] = "blender_agent_final_geometry"
     report["mode"] = "final_geometry"
@@ -848,6 +1245,19 @@ def check_final_geometry(spec: "spec_mod.SceneSpec", boxes: Sequence[ItemBox],
             f"measured none -- the re-check proves nothing"
         )
         report["pass"] = False
+
+    # -- functional usage spaces on the final boxes ------------------------- #
+    report["checks"].append({
+        "name": "functional_usage_clear",
+        "pass": usage["pass"],
+        "violations": usage["violations"],
+        "spaces": usage["spaces"],
+        "thresholds": usage["thresholds"],
+    })
+    report["violations"].extend(usage["violations"])
+    if not usage["pass"]:
+        report["pass"] = False
+
     adjustments = []
     if authored is not None:
         by_name = {box.name: box for box in authored}
@@ -871,13 +1281,29 @@ def check_final_geometry(spec: "spec_mod.SceneSpec", boxes: Sequence[ItemBox],
             entry["changed"] = bool(entry["xy_shift_m"] > 1e-4 or abs(entry["z_shift_m"]) > 1e-4
                                     or abs(entry["height_shift_m"]) > 1e-4)
             adjustments.append(entry)
+    usage_adjustments = []
+    if authored is not None:
+        usage_adjustments = _usage_adjustments(
+            functional_usage_report(spec, authored, assets_index), usage)
+    # an item is blocked only when none of its spaces is usable -- a bed with one
+    # walkable long side has a usable side even though the other side is measured
+    # and reported as blocked
+    usage_items = {space["item"] for space in usage["spaces"]}
+    usable_items = {space["item"] for space in usage["spaces"] if space["clear"]}
     report["final_geometry"] = {
         "boxes": {box.name: {"room": box.room, "placement": box.placement,
                              "aabb": [round(v, 3) for v in box.aabb],
                              "z": [round(v, 3) for v in box.z]} for box in boxes},
         "adjustments": adjustments,
         "moved": sum(1 for entry in adjustments if entry.get("changed")),
+        "usage": {
+            "spaces": usage["spaces"],
+            "adjustments": usage_adjustments,
+            "moved": sum(1 for entry in usage_adjustments if entry.get("changed")),
+            "blocked": sorted(usage_items - usable_items),
+        },
     }
+    report["pass"] = all(entry["pass"] for entry in report["checks"])
     return report
 
 
@@ -905,7 +1331,7 @@ def load_final_boxes(path: str, spec: Optional["spec_mod.SceneSpec"] = None,
         return spec, boxes, notes, os.path.abspath(path)
     if spec is None:
         raise spec_mod.SpecError(f"{path}: a box list needs the spec that goes with it")
-    boxes, notes = boxes_from_entries(data.get("items") or [], spec)
+    boxes, notes = boxes_from_entries(data.get("items") or [], spec, index)
     return spec, boxes, notes, os.path.abspath(path)
 
 
@@ -1793,6 +2219,42 @@ def _print_report(report: dict, label: str) -> None:
     print(f"checks: {'PASS' if report['pass'] else 'FAIL'} ({len(report['violations'])} violations)")
 
 
+def _print_usage_report(report: dict, label: str) -> None:
+    print(f"checks: functional usage ({label})")
+    for space in report["spaces"]:
+        status = "PASS" if space["clear"] else "FAIL"
+        if space["kind"] == fixtures_mod.USAGE_BED_SIDE:
+            detail = f"{space['clear_length_m']:.2f} m clear (needs {space['required_clear_m']:.2f} m)"
+        else:
+            blockers = ", ".join(blocker["name"] for blocker in space["blockers"]) or "clear"
+            detail = blockers
+        print(f"  [{status}] {space['item']:>20s} {space['room']:>10s} "
+              f"{space['kind']:<10s} {space['side']:<5s} {detail}")
+    for violation in report["violations"]:
+        print(f"         - {violation}")
+    print(f"checks: functional usage {'PASS' if report['pass'] else 'FAIL'} "
+          f"({len(report['spaces'])} spaces, {len(report['violations'])} violations)")
+
+
+def _usage_only(spec, boxes, source, args) -> dict:
+    """The ``--functional-usage`` mode: only measure the operation spaces."""
+    index = load_assets_index(args.assets_index) \
+        if args.assets_index and os.path.isfile(args.assets_index) else None
+    report = functional_usage_report(spec, boxes, index)
+    report["kind"] = "blender_agent_functional_usage"
+    report["mode"] = "functional_usage"
+    report["source"] = source
+    if not args.quiet:
+        _print_usage_report(report, f"{source} ({len(boxes)} boxes)")
+    if args.report:
+        os.makedirs(os.path.dirname(os.path.abspath(args.report)), exist_ok=True)
+        with open(args.report, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2)
+        if not args.quiet:
+            print(f"checks: report written to {args.report}")
+    return report
+
+
 def _final_geometry(spec, boxes, notes, source, args, authored=None) -> dict:
     """The ``--final-*`` mode: box-based rules on the geometry as built."""
     index = load_assets_index(args.assets_index) \
@@ -1810,8 +2272,21 @@ def _final_geometry(spec, boxes, notes, source, args, authored=None) -> dict:
             print(f"  {item['name']:>22s} {item['room']:>10s} "
                   f"z {item['z'][0]:6.2f}-{item['z'][1]:6.2f}  lowest body above: "
                   f"{above}  clearance {item['clearance_m']}")
+        usage = next((entry for entry in report["checks"]
+                      if entry["name"] == "functional_usage_clear"), None)
+        for space in (usage or {}).get("spaces", []):
+            status = "PASS" if space["clear"] else "FAIL"
+            if space["kind"] == fixtures_mod.USAGE_BED_SIDE:
+                detail = (f"{space['clear_length_m']:.2f} m clear "
+                          f"(needs {space['required_clear_m']:.2f} m)")
+            else:
+                detail = ", ".join(blocker["name"] for blocker in space["blockers"]) or "clear"
+            print(f"  usage [{status}] {space['item']:>20s} {space['room']:>10s} "
+                  f"{space['kind']:<10s} {space['side']:<5s} {detail}")
         moved = report["final_geometry"]["moved"]
-        print(f"checks: {moved} of {len(boxes)} boxes differ from the spec geometry")
+        usage_moved = report["final_geometry"]["usage"]["moved"]
+        print(f"checks: {moved} of {len(boxes)} boxes differ from the spec geometry; "
+              f"{usage_moved} usage space(s) changed")
         for note in notes:
             print(f"checks: note: {note}")
     if args.report:
@@ -1837,6 +2312,10 @@ def main(argv=None) -> int:
     parser.add_argument("--final-manifest", default=None,
                         help="build_manifest.json of a built scene; its spec and settle's bbox_z "
                              "give the boxes to re-check (spec may be omitted)")
+    parser.add_argument("--functional-usage", action="store_true",
+                        help="only measure the declared operation spaces (door swing / pull-out / "
+                             "standing / shower entry / bed side); works with a spec or with "
+                             "--final-bboxes / --final-manifest")
     args = parser.parse_args(argv)
 
     final_path = args.final_manifest or args.final_bboxes
@@ -1853,6 +2332,11 @@ def main(argv=None) -> int:
         except (spec_mod.SpecError, OSError, ValueError) as error:
             print(f"checks: final geometry input is invalid: {error}")
             return 2
+        if args.functional_usage:
+            report = _usage_only(spec, boxes, source, args)
+            if args.spec:
+                report["spec"] = os.path.abspath(args.spec)
+            return 0 if report["pass"] else 1
         authored = item_boxes(spec, index)[0]
         report = _final_geometry(spec, boxes, notes, source, args, authored=authored)
         if args.spec:
@@ -1873,6 +2357,11 @@ def main(argv=None) -> int:
         return 2
 
     index = load_assets_index(args.assets_index) if args.assets_index and os.path.isfile(args.assets_index) else None
+    if args.functional_usage:
+        boxes = item_boxes(spec, index)[0]
+        report = _usage_only(spec, boxes, args.spec, args)
+        report["spec"] = os.path.abspath(args.spec)
+        return 0 if report["pass"] else 1
     report = check_spec(spec, index, grid_m=args.grid)
     report["spec"] = os.path.abspath(args.spec)
 

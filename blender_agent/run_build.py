@@ -378,6 +378,43 @@ def place_furniture(spec: spec_mod.SceneSpec, libraries: dict, scene_materials: 
             "skipped": skipped}
 
 
+def record_final_bboxes(furniture_info: dict) -> int:
+    """Write every placement's post-settle world AABB into its manifest entry.
+
+    ``check_final_geometry`` has always re-measured settle's Z range; a usage
+    space (a door swing, a pulled-out chair, a bed side) also depends on the
+    *lateral* pose settle left behind.  The bounding box of the objects as they
+    now stand is recorded as ``bbox`` ``[x0, y0, z0, x1, y1, z1]``, so the
+    no-Blender re-check measures the geometry that is really built instead of
+    the authored footprint.
+    """
+    placements = list(furniture_info.get("placements") or [])
+    if not placements:
+        return 0
+    import numpy as np
+
+    bpy.context.view_layer.update()
+    targets = settle.resolve_targets(placements)
+    recorded = 0
+    for placement, target in zip(placements, targets):
+        chunks = []
+        for obj in target["objects"]:
+            points = settle.object_world_points(obj)
+            if len(points):
+                chunks.append(points)
+        if not chunks:
+            placement.pop("bbox", None)
+            continue
+        points = np.vstack(chunks)
+        placement["bbox"] = [
+            round(float(points[:, 0].min()), 4), round(float(points[:, 1].min()), 4),
+            round(float(points[:, 2].min()), 4), round(float(points[:, 0].max()), 4),
+            round(float(points[:, 1].max()), 4), round(float(points[:, 2].max()), 4),
+        ]
+        recorded += 1
+    return recorded
+
+
 def _add_emission(material, strength: float, color=(1.0, 0.92, 0.82)):
     """Add a soft emission to an existing Principled material (lamp shades)."""
     tree = material.node_tree
@@ -576,6 +613,9 @@ def main(argv) -> int:
 
     furniture_info = place_furniture(spec, libraries, textured, front3d_ctx=front3d_ctx)
     furniture_info["settle"] = settle.ground_furniture(spec, furniture_info, build_dir, shell_info)
+    recorded_bboxes = record_final_bboxes(furniture_info)
+    if recorded_bboxes:
+        print(f"[run_build] recorded final world bboxes for {recorded_bboxes} placements")
     if furniture_info["placements"]:
         kinds = {}
         for placement in furniture_info["placements"]:
