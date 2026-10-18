@@ -44,7 +44,7 @@ GLB 支撑面上下楼梯并处理楼板洞口与碰撞；资产库带内容指�
 | 等距柱状全景图 | Cycles 路径追踪 | 无生成伪影 |
 | 米制深度 | Position pass → 射线长度 | 毫米量化，对网格中位误差 0.25 mm |
 | 相机位姿 | 相机矩阵 | 精确 |
-| 实例/语义分割 | Cryptomatte | 像素级精确 |
+| 实例/类别身份 | GLB node extras + `scene3d_manifest.json` | 对象/实例级稳定 ID |
 | 多空间连通 | Boolean 门洞 | 构造保证 |
 
 ## 架构
@@ -344,6 +344,44 @@ GLB 内容：全景相机能看到的一切，减去仅用于渲染的天空球�
 `build/scene3d_manifest.json` 里已把相机位姿与房间范围换算到 glTF 坐标系，
 页面无需猜测；`tools/check_scene_glb.py` 会用几何反查这些数值（包围盒毫米级一致、
 每个相机都落在房间内部）。
+
+## 具身导航（PointNav）
+
+`roomgen_nav/` 把生成场景变成可复现的 PointNav 环境，刻意按能力拆分：
+
+* **规划**：Habitat-Sim 按楼层分别烘焙 Recast NavMesh（Recast 无法表达重叠楼面），
+  复合图再通过 spec 的楼梯/坡道通行轨迹连接上下层。`AgentProfile`
+  （humanoid/wheeled/自定义）参数化半径、身高、最大台阶、最大坡度、步长与转向角，
+  同一个房子对不同身体会产生不同的可达区域。
+* **执行**：`PointNavEnv` 提供 `reset(scene_id, episode_id, seed)` 与
+  `step(forward|left|right|stop)`，固定步长/转向，使用 NavMesh 碰撞与真实轨迹上下楼；
+  闭环 `ShortestPathPolicy` 通过转向/前进跟踪参考路径，不读取预存动作序列。
+* **观测**：headless Blender/Cycles 从同一 GLB 渲染 128×128 针孔 RGB、精确
+  z-depth 与欧氏距离，无需 EGL/X；位姿为 glTF/Habitat Y-up 米制，
+  `yaw_convention="manifest"` 时 0=+X、90=−Z。用
+  `env.set_observation_provider(...)` 接入。
+* **身份**：`scene.glb` 节点带 `instance_id/category_id/room_id/floor_id` extras，
+  `scene3d_manifest.json → semantics` 提供同一映射，供 ObjectNav 与训练数据使用。
+
+```bash
+bash scripts/setup_nav_env.sh                 # 一次性安装 third_party/nav_env
+NAV_PY=third_party/nav_env/bin/python
+NAV_LD=third_party/nav_sysroot/usr/lib/x86_64-linux-gnu:third_party/nav_env/lib
+
+LD_LIBRARY_PATH=$NAV_LD $NAV_PY -m roomgen_nav.eval_pointnav \
+  --policy path --episodes 50 --repro-check \
+  --out outputs/nav_eval/humanoid_50_path
+# -> run.json / run.txt / episodes.jsonl / scenes.json
+
+python tools/build_nav_replay.py outputs/nav_eval/humanoid_50_path --out outputs/nav_eval/humanoid_50_path/replay
+```
+
+基线覆盖 20 场景×50 任务（1000 episodes），含同层、窄门、开放空间与跨层
+（挑空/夹层/错层）；`run.json` 分开记录 **policy** 与 **oracle replay**，
+报告成功率、SPL（全部与成功子集）、碰撞、超时、最终距离、步数与失败原因；
+更紧预算的 `max_steps=40` 压力档可展示策略超时而参考路径仍可执行。静态回放支持
+场景/任务/结果筛选、分楼层地图、参考与实际轨迹以及失败证据（卡门、穿墙、跨洞、
+错误跳层），相同种子与动作序列可复现（`--repro-check` 双跑比对）。
 
 ## 资产与许可
 

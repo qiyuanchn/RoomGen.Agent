@@ -57,7 +57,7 @@ is constructed in Blender and everything else is rendered from it:
 | equirect panorama | Cycles path tracing | no generative artefacts |
 | metric depth | Position pass -> ray length | mm-quantised, vs mesh median 0.25 mm |
 | camera pose | camera matrix | exact |
-| instance/semantic masks | Cryptomatte | pixel-exact |
+| instance / category IDs | GLB node extras + `scene3d_manifest.json` | stable per object and instance |
 | multi-room connectivity | boolean door openings | by construction |
 
 ## Architecture
@@ -551,6 +551,53 @@ in glTF's +Y-up metres. `build/scene3d_manifest.json` carries the camera poses
 and room boxes already converted to glTF axes, so the page never guesses, and
 `tools/check_scene_glb.py` re-checks those numbers against the geometry (bounds
 within millimetres, every camera inside the room).
+
+## Embodied navigation (PointNav)
+
+`roomgen_nav/` turns the generated scenes into a reproducible PointNav
+environment.  Navigation is deliberately split by competence:
+
+* **Planning:** Habitat-Sim (aihabitat channel) bakes one Recast NavMesh **per
+  storey** — Recast cannot represent overlapping floors — and a composite graph
+  joins storeys through the spec's stair/ramp walk tracks.  `AgentProfile`
+  (`humanoid`, `wheeled`, custom) parameterises radius, height, max step, max
+  slope, step size and turn angle, so the same house yields different reachable
+  sets per body.
+* **Execution:** `PointNavEnv` exposes `reset(scene_id, episode_id, seed)` and
+  `step(forward|left|right|stop)` with fixed step/turn, NavMesh collision and
+  physical track traversal.  A closed-loop `ShortestPathPolicy` follows the
+  reference path by steering, never by replaying stored oracle actions.
+* **Observations:** headless Blender/Cycles renders 128×128 pinhole RGB plus
+  exact z-depth and Euclidean distance from the same GLB (no EGL/X server).
+  Poses are glTF/Habitat Y-up metres; `yaw_convention="manifest"` is 0=+X,
+  90=−Z.  Attach with `env.set_observation_provider(...)`.
+* **Identity:** `scene.glb` nodes carry `instance_id` / `category_id` /
+  `room_id` / `floor_id` extras, mirrored in `scene3d_manifest.json → semantics`
+  for ObjectNav and downstream training data.
+
+```bash
+bash scripts/setup_nav_env.sh                 # one-time, into third_party/nav_env
+NAV_PY=third_party/nav_env/bin/python
+NAV_LD=third_party/nav_sysroot/usr/lib/x86_64-linux-gnu:third_party/nav_env/lib
+
+LD_LIBRARY_PATH=$NAV_LD $NAV_PY -m roomgen_nav.eval_pointnav \
+  --policy path --episodes 50 --repro-check \
+  --out outputs/nav_eval/humanoid_50_path
+# -> run.json / run.txt / episodes.jsonl / scenes.json
+
+python tools/build_nav_replay.py outputs/nav_eval/humanoid_50_path --out outputs/nav_eval/humanoid_50_path/replay
+```
+
+The baseline run covers 20 scenes × 50 tasks (1000 episodes), including
+same-floor, narrow-door, open-plan and cross-floor (void/mezzanine/split-level)
+cases.  `run.json` separates **policy** from **oracle replay** and reports
+success rate, SPL (all episodes and successes), collisions, timeout rate, final
+distance, steps and failure reasons; a tighter-budget stress profile
+(`max_steps=40`) demonstrates that the policy can time out while the reference
+path remains executable.  The static replay supports scene/episode/result
+filters, per-floor maps, reference vs actual trajectories and failure evidence
+(stuck-at-door, through-wall, cross-void, wrong floor jump).  Same seeds and
+action sequences reproduce; `--repro-check` compares two rollouts.
 
 ## Assets and licensing
 
