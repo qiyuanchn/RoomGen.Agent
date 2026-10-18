@@ -26,6 +26,29 @@ def _mean(values: Sequence[float]) -> float:
     return float(sum(values) / len(values)) if values else 0.0
 
 
+def _group_summary(results: Sequence[dict]) -> dict:
+    count = len(results)
+    successes = [result for result in results if result.get("success")]
+    timeouts = sum(1 for result in results if result.get("timeout"))
+    return {
+        "episodes": count,
+        "successes": len(successes),
+        "success_rate": round(len(successes) / count, 4) if count else 0.0,
+        # SPL over successful episodes (kept for the historical report shape).
+        "spl": round(_mean([float(r.get("spl", 0.0)) for r in successes]), 4),
+        # Standard SPL over every episode in the group; failures score zero.
+        "spl_all": round(_mean([float(r.get("spl", 0.0)) for r in results]), 4),
+        "collisions": int(sum(int(r.get("collisions", 0)) for r in results)),
+        "timeouts": int(timeouts),
+        "timeout_rate": round(timeouts / count, 4) if count else 0.0,
+        "final_distance_mean": round(_mean([float(r.get("final_distance", 0.0))
+                                            for r in results]), 4),
+        "steps_mean": round(_mean([float(r.get("steps", 0)) for r in results]), 2),
+        "path_length_mean": round(_mean([float(r.get("path_length", 0.0))
+                                         for r in results]), 4),
+    }
+
+
 def summarize_results(results: Sequence[dict]) -> dict:
     count = len(results)
     successes = [result for result in results if result.get("success")]
@@ -33,36 +56,17 @@ def summarize_results(results: Sequence[dict]) -> dict:
                               for result in results if not result.get("success"))
     cross = [result for result in results if result.get("cross_floor")]
     same = [result for result in results if not result.get("cross_floor")]
-    return {
-        "episodes": count,
-        "successes": len(successes),
-        "success_rate": round(len(successes) / count, 4) if count else 0.0,
-        "spl": round(_mean([float(r.get("spl", 0.0)) for r in successes]), 4),
-        "collisions": int(sum(int(r.get("collisions", 0)) for r in results)),
+    summary = _group_summary(results)
+    summary.update({
+        "failures": count - len(successes),
+        "failure_rate": round((count - len(successes)) / count, 4) if count else 0.0,
         "collisions_per_episode": round(
             sum(int(r.get("collisions", 0)) for r in results) / count, 4) if count else 0.0,
-        "timeouts": int(sum(1 for r in results if r.get("timeout"))),
-        "timeout_rate": round(sum(1 for r in results if r.get("timeout")) / count, 4)
-        if count else 0.0,
-        "final_distance_mean": round(_mean([float(r.get("final_distance", 0.0))
-                                            for r in results]), 4),
-        "steps_mean": round(_mean([float(r.get("steps", 0)) for r in results]), 2),
-        "path_length_mean": round(_mean([float(r.get("path_length", 0.0))
-                                         for r in results]), 4),
         "failure_reasons": dict(sorted(failure_reasons.items())),
-        "cross_floor": {
-            "episodes": len(cross),
-            "success_rate": round(
-                sum(1 for r in cross if r.get("success")) / len(cross), 4) if cross else 0.0,
-            "collisions": int(sum(int(r.get("collisions", 0)) for r in cross)),
-        },
-        "same_floor": {
-            "episodes": len(same),
-            "success_rate": round(
-                sum(1 for r in same if r.get("success")) / len(same), 4) if same else 0.0,
-            "collisions": int(sum(int(r.get("collisions", 0)) for r in same)),
-        },
-    }
+        "cross_floor": _group_summary(cross),
+        "same_floor": _group_summary(same),
+    })
+    return summary
 
 
 def summarize_by_scene(scene_results: Dict[str, Sequence[dict]]) -> dict:
@@ -90,21 +94,27 @@ def write_run(path: str, run: dict) -> None:
         json.dump(run, handle, indent=2)
 
 
-def format_summary(summary: dict) -> str:
-    lines = [
+def format_summary(summary: dict, heading: Optional[str] = None) -> str:
+    lines = []
+    if heading:
+        lines.append(heading)
+    lines.extend([
         f"episodes        : {summary.get('episodes', 0)}",
         f"success rate    : {summary.get('success_rate', 0.0):.3f}",
-        f"SPL             : {summary.get('spl', 0.0):.3f}",
+        f"SPL (successes) : {summary.get('spl', 0.0):.3f}",
+        f"SPL (all)       : {summary.get('spl_all', summary.get('spl', 0.0)):.3f}",
         f"collisions      : {summary.get('collisions', 0)} "
         f"({summary.get('collisions_per_episode', 0.0):.3f}/episode)",
         f"timeout rate    : {summary.get('timeout_rate', 0.0):.3f}",
         f"final distance  : {summary.get('final_distance_mean', 0.0):.3f} m",
         f"failure reasons : {summary.get('failure_reasons', {})}",
-    ]
+    ])
     cross = summary.get("cross_floor", {})
     same = summary.get("same_floor", {})
     lines.append(f"cross-floor     : {cross.get('episodes', 0)} episodes, "
-                 f"success {cross.get('success_rate', 0.0):.3f}")
+                 f"success {cross.get('success_rate', 0.0):.3f}, "
+                 f"SPL(all) {cross.get('spl_all', 0.0):.3f}")
     lines.append(f"same-floor      : {same.get('episodes', 0)} episodes, "
-                 f"success {same.get('success_rate', 0.0):.3f}")
+                 f"success {same.get('success_rate', 0.0):.3f}, "
+                 f"SPL(all) {same.get('spl_all', 0.0):.3f}")
     return "\n".join(lines)

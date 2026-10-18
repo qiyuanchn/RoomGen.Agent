@@ -36,6 +36,7 @@ SCRIPT = r"""
 import json, os, random, sys, tempfile
 sys.path.insert(0, sys.argv[1])
 from roomgen_nav import assets, profiles, episodes
+from roomgen_nav.env import PointNavEnv, ShortestPathPolicy
 from roomgen_nav.navmesh import build_composite_navmesh
 
 base = sys.argv[2]
@@ -62,6 +63,26 @@ with tempfile.TemporaryDirectory() as cache:
         "cross_links": cross[0].links_used if cross else [],
         "all_success": all(ep.reference_success for ep in catalog.episodes),
     }
+    path_policy = None
+    if cross:
+        env = PointNavEnv("viewer_walk_duplex", spec, profiles.HUMANOID, nav,
+                          auto_success=False)
+        first = ShortestPathPolicy(env).run(cross[0])
+        second = ShortestPathPolicy(env).run(cross[0])
+        path_policy = {
+            "success": bool(first["result"]["success"]),
+            "spl": float(first["result"]["spl"]),
+            "collisions": int(first["result"]["collisions"]),
+            "steps": int(first["result"]["steps"]),
+            "failure_reason": first["result"]["failure_reason"],
+            "actions": first["actions"],
+            "trajectory_length": len(first["trajectory"]),
+            "reproducible": first["actions"] == second["actions"]
+            and [step["position"] for step in first["trajectory"]]
+            == [step["position"] for step in second["trajectory"]],
+            "last_action": first["actions"][-1] if first["actions"] else None,
+        }
+    result["humanoid"]["path_policy"] = path_policy
     glb_entry = assets.SceneEntry(
         "viewer_walk_duplex_glb",
         os.path.join(base, "build_manifest.json"), base,
@@ -128,6 +149,18 @@ class DuplexIntegrationTest(unittest.TestCase):
         self.assertTrue(any(link.startswith("stair_") for link in humanoid["cross_links"]))
         self.assertGreater(humanoid["cross_actions"], 20)
         self.assertTrue(humanoid["verification"]["ok"])
+
+    def test_path_policy_crosses_the_stair_closed_loop(self):
+        policy = self.payload["humanoid"]["path_policy"]
+        self.assertIsNotNone(policy)
+        self.assertTrue(policy["success"])
+        self.assertGreater(policy["steps"], 20)
+        self.assertTrue(policy["reproducible"])
+        self.assertEqual(policy["last_action"], "stop")
+        self.assertEqual(policy["trajectory_length"], len(policy["actions"]) + 1)
+        self.assertTrue(set(policy["actions"]).issubset(
+            {"left", "right", "forward", "stop"}))
+        self.assertTrue(any(action == "forward" for action in policy["actions"]))
 
     def test_wheeled_cannot_use_the_stair(self):
         wheeled = self.payload["wheeled"]
@@ -266,6 +299,105 @@ class NarrowDoorIntegrationTest(unittest.TestCase):
         self.assertTrue(tiny["has_path"])
         self.assertGreater(tiny["distance"], 1.0)
         self.assertEqual(tiny["stats"]["islands"]["F0"], 1)
+
+
+BENCH_SCENE_BUILD = os.path.join(
+    REPO_ROOT, "outputs", "benchmark100", "sample", "scene_0000", "build")
+
+
+@unittest.skipUnless(os.path.isfile(os.path.join(BENCH_SCENE_BUILD, "build_manifest.json")),
+                     "bench_scene_0000 build is not present")
+@unittest.skipUnless(os.path.isfile(NAV_PYTHON), "third_party/nav_env is not present")
+class PointNavEvalCliTest(unittest.TestCase):
+    """The evaluator CLI writes separated policy / oracle results and JSONL."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="roomgen_nav_eval_")
+        cls.out = os.path.join(cls.tmp, "out")
+        cls.cache = os.path.join(cls.tmp, "cache")
+        env = dict(os.environ)
+        env["LD_LIBRARY_PATH"] = (NAV_LIB + ":" + NAV_ENV_LIB + ":"
+                                  + env.get("LD_LIBRARY_PATH", ""))
+        cls.completed = subprocess.run(
+            [NAV_PYTHON, "-m", "roomgen_nav.eval_pointnav",
+             "--scene-ids", "bench_scene_0000", "--episodes", "2",
+             "--policy", "path", "--repro-check", "--verify-sample", "0",
+             "--out", cls.out, "--cache-dir", cls.cache],
+            cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=300)
+        if cls.completed.returncode != 0:
+            raise AssertionError(
+                "eval_pointnav subprocess failed\nSTDOUT:\n"
+                + cls.completed.stdout[-4000:] + "\nSTDERR:\n"
+                + cls.completed.stderr[-4000:])
+        with open(os.path.join(cls.out, "run.json"), "r", encoding="utf-8") as handle:
+            cls.run_record = json.load(handle)
+        with open(os.path.join(cls.out, "episodes.jsonl"), "r",
+                  encoding="utf-8") as handle:
+            cls.records = [json.loads(line) for line in handle if line.strip()]
+        with open(os.path.join(cls.out, "scenes.json"), "r", encoding="utf-8") as handle:
+            cls.scene_geometry = json.load(handle)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_policy_and_oracle_are_reported_separately(self):
+        self.assertEqual(self.run_record["policy_name"], "path")
+        self.assertEqual(self.run_record["summary_scope"], "policy")
+        self.assertEqual(self.run_record["policy"]["name"], "path")
+        self.assertEqual(self.run_record["oracle"]["name"], "oracle")
+        self.assertIn("not a policy", self.run_record["oracle"]["note"])
+        self.assertEqual(self.run_record["policy"]["summary"]["episodes"],
+                         len(self.records))
+        self.assertEqual(self.run_record["oracle"]["summary"]["episodes"],
+                         len(self.records))
+        self.assertEqual(self.run_record["summary"],
+                         self.run_record["policy"]["summary"])
+        for scene in self.run_record["scenes"]:
+            self.assertIn("oracle_summary", scene)
+            self.assertTrue(all("oracle" in result for result in scene["results"]))
+
+    def test_episodes_jsonl_matches_the_replay_contract(self):
+        self.assertEqual(len(self.records), 2)
+        required = {
+            "scene_id", "episode_id", "seed", "start", "goal",
+            "start_floor", "goal_floor", "reference_path", "trajectory",
+            "success", "spl", "collisions", "timeout", "failure_reason",
+        }
+        actions = {"left", "right", "forward", "stop"}
+        for record in self.records:
+            self.assertTrue(required.issubset(record))
+            self.assertEqual(record["policy"], "path")
+            self.assertEqual(record["yaw_unit"], "degrees")
+            self.assertEqual(record["yaw_convention"], "manifest")
+            self.assertGreaterEqual(len(record["reference_path"]["points"]), 2)
+            self.assertGreaterEqual(len(record["trajectory"]), 2)
+            self.assertEqual(record["trajectory"][0]["action"], "start")
+            for step in record["trajectory"][1:]:
+                self.assertIn(step["action"], actions)
+                self.assertEqual(len(step["position"]), 3)
+                self.assertIsInstance(step["yaw"], float)
+                self.assertIsInstance(step["collision"], bool)
+
+    def test_scenes_json_provides_the_replay_geometry(self):
+        self.assertEqual(self.scene_geometry["coordinate_system"], "gltf")
+        self.assertEqual(len(self.scene_geometry["scenes"]), 1)
+        scene = self.scene_geometry["scenes"][0]
+        self.assertEqual(scene["scene_id"], "bench_scene_0000")
+        self.assertTrue(scene["rooms"])
+        self.assertTrue(scene["floors"])
+        for room in scene["rooms"]:
+            self.assertIn("floor_id", room)
+            self.assertGreaterEqual(len(room["polygon"]), 3)
+
+    def test_repro_check_covers_every_episode(self):
+        self.assertTrue(self.run_record["repro_check"])
+        for scene in self.run_record["scenes"]:
+            self.assertEqual(scene["policy_reproducible_episodes"],
+                             scene["episode_count"])
+            self.assertEqual(scene["oracle_reproducible_episodes"],
+                             scene["episode_count"])
 
 
 if __name__ == "__main__":

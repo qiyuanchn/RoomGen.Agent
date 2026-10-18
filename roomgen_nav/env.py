@@ -73,7 +73,8 @@ class PointNavEnv:
                  success_radius: Optional[float] = None,
                  link_enter_radius: Optional[float] = None,
                  link_enter_angle_deg: float = 60.0,
-                 observation_provider: Optional[Callable] = None):
+                 observation_provider: Optional[Callable] = None,
+                 auto_success: bool = True):
         if scene_id != nav.entry.scene_id:
             raise ValueError(f"env scene '{scene_id}' != nav scene '{nav.entry.scene_id}'")
         self.scene_id = scene_id
@@ -90,6 +91,10 @@ class PointNavEnv:
             else max(0.35, 1.4 * self.step_size))
         self.link_enter_angle_deg = float(link_enter_angle_deg)
         self.observation_provider = observation_provider
+        #: When True (scripted oracle) entering ``success_radius`` ends the
+        #: episode immediately.  A closed-loop policy sets this False so it can
+        #: observe the arrival and issue the explicit ``stop`` action.
+        self.auto_success = bool(auto_success)
         #: set by the evaluator: fn(scene_id, episode_id, seed) -> Episode-like
         self.episode_provider: Optional[Callable] = None
         self.episode = None
@@ -189,15 +194,29 @@ class PointNavEnv:
 
         self.step_count += 1
         if not self.done:
-            self.success = self._at_goal()
-            if self.success:
-                self.done = True
-            elif self.consecutive_collisions >= 10:
-                self.done = True
-                self.failure_reason = "stuck"
-            elif self.step_count >= self.max_steps:
-                self.done = True
-                self.failure_reason = "timeout"
+            if self.auto_success:
+                self.success = self._at_goal()
+                if self.success:
+                    self.done = True
+                elif self.consecutive_collisions >= 10:
+                    self.done = True
+                    self.failure_reason = "stuck"
+                elif self.step_count >= self.max_steps:
+                    self.done = True
+                    self.failure_reason = "timeout"
+            else:
+                # The policy sees the arrival in its next observation and emits
+                # ``stop`` itself.  Landing on the goal exactly at the budget is
+                # still a success, not a timeout.
+                if self._at_goal() and self.step_count >= self.max_steps:
+                    self.success = True
+                    self.done = True
+                elif self.consecutive_collisions >= 10:
+                    self.done = True
+                    self.failure_reason = "stuck"
+                elif self.step_count >= self.max_steps:
+                    self.done = True
+                    self.failure_reason = "timeout"
         return self.observation()
 
     def _forward(self) -> None:
@@ -395,6 +414,189 @@ class PointNavEnv:
         self.reset(self.scene_id, self.episode.episode_id, self.episode.seed,
                    episode=self.episode)
         return self.rollout(getattr(self.episode, "actions", []) or [])
+
+
+# --------------------------------------------------------------------------- #
+# closed-loop path policy
+# --------------------------------------------------------------------------- #
+def trajectory_row(observation: dict, action: str, collision=None) -> dict:
+    """One replay-compatible trajectory row (position, yaw, action, collision)."""
+    return {
+        "position": [float(value) for value in observation["position"]],
+        "yaw": float(observation["heading_deg"]),
+        "action": action,
+        "collision": bool(observation["collision"] if collision is None else collision),
+        "floor_id": observation.get("floor_id"),
+    }
+
+
+class ShortestPathPolicy:
+    """Closed-loop PointNav policy that follows the reference path waypoints.
+
+    The policy never reads ``episode.actions`` (the stored oracle sequence).
+    On every step it locates the current pose on the reference polyline, takes a
+    look-ahead point on that polyline and emits a single discrete action:
+
+    * if the goal floor and ``success_radius`` are reached -> ``stop``;
+    * while a stair / ramp link is active the link track drives the body, so
+      -> ``forward``;
+    * heading error larger than the alignment threshold -> ``left`` / ``right``;
+    * otherwise -> ``forward``.
+
+    Motion parameters come from the env / :class:`AgentProfile`: ``step_size``
+    and ``turn_deg`` are the profile values, the alignment threshold defaults to
+    ``0.75 * turn_deg`` and the look-ahead defaults to ``0.6 * step_size``.
+    Collisions are counted by :class:`PointNavEnv`; the policy only reacts to
+    the position it observes after each action.
+    """
+
+    name = "path"
+
+    def __init__(self, env: PointNavEnv, align_deg: Optional[float] = None,
+                 lookahead: Optional[float] = None):
+        profile = env.profile
+        self.env = env
+        self.profile = profile
+        self.step_size = float(env.step_size)
+        self.turn_deg = float(env.turn_deg)
+        self.align_deg = float(
+            align_deg if align_deg is not None else max(0.5, self.turn_deg * 0.75))
+        self.lookahead = float(
+            lookahead if lookahead is not None else max(0.05, self.step_size * 0.6))
+        if self.align_deg <= 0.0:
+            raise ValueError("alignment threshold must be positive")
+        if self.lookahead <= 0.0:
+            raise ValueError("look-ahead distance must be positive")
+        self.episode = None
+        self.path_points: List[tuple] = []
+        self.dense: List[tuple] = []
+        self._cursor = 0
+        self._was_on_link = False
+
+    def describe(self) -> dict:
+        return {
+            "name": self.name,
+            "source": "reference_path waypoints",
+            "step_size": self.step_size,
+            "turn_deg": self.turn_deg,
+            "align_deg": round(self.align_deg, 4),
+            "lookahead": round(self.lookahead, 4),
+        }
+
+    # -- episode setup ------------------------------------------------------ #
+    def reset(self, episode=None, path=None) -> None:
+        if episode is not None:
+            self.episode = episode
+        if self.episode is None:
+            raise RuntimeError("reset the env to an episode before running the policy")
+        if path is None:
+            path = getattr(self.episode, "reference_path", None) or []
+        if hasattr(path, "points"):
+            path = path.points
+        points = [tuple(float(value) for value in point) for point in path or []]
+        if len(points) < 2:
+            points = [tuple(self.env.start_position), tuple(self.env.goal_position)]
+        start = tuple(float(value) for value in self.env.position)
+        goal = tuple(float(value) for value in self.env.goal_position)
+        if point_distance(start, points[0]) > 1e-6:
+            points.insert(0, start)
+        if point_distance(goal, points[-1]) > 1e-6:
+            points.append(goal)
+        self.path_points = points
+        self.dense = densify_polyline(
+            points, max_spacing=max(0.02, min(0.08, self.step_size * 0.4)))
+        self._cursor = 0
+        self._was_on_link = False
+
+    # -- control ------------------------------------------------------------ #
+    def act(self) -> Optional[str]:
+        """Return the next discrete action, or None when the episode is over."""
+        env = self.env
+        if env.done:
+            return None
+        if env._at_goal():
+            return ACTION_STOP
+        if env.link_state is not None:
+            self._was_on_link = True
+            return ACTION_FORWARD
+        if self._was_on_link:
+            # The link moved the body along its track without the policy looking
+            # at the polyline; re-locate the cursor once on the destination floor.
+            self._was_on_link = False
+            self._cursor = min(
+                range(len(self.dense)),
+                key=lambda index: point_distance(env.position, self.dense[index]))
+        target = self._lookahead_target(env.position)
+        horizontal = xy_distance(env.position, target)
+        vertical = abs(float(env.position[1]) - float(target[1]))
+        if horizontal < 1e-6 and vertical < 1e-6:
+            if env._at_goal():
+                return ACTION_STOP
+            target = env.goal_position
+        error = angle_delta_deg(heading_deg(env.position, target), env.yaw_deg)
+        if abs(error) > self.align_deg:
+            return ACTION_LEFT if error > 0.0 else ACTION_RIGHT
+        return ACTION_FORWARD
+
+    def _lookahead_target(self, position: Sequence[float]) -> tuple:
+        dense = self.dense
+        if not dense:
+            return tuple(position)
+        count = len(dense)
+        low = max(0, self._cursor - 16)
+        high = min(count, self._cursor + 65)
+        closest = min(range(low, high),
+                      key=lambda index: point_distance(position, dense[index]))
+        if closest == low and low > 0:
+            closest = min(range(count),
+                          key=lambda index: point_distance(position, dense[index]))
+        self._cursor = closest
+        target = closest
+        while target < count - 1 and \
+                point_distance(position, dense[target]) < self.lookahead:
+            target += 1
+        return dense[target]
+
+    def run(self, episode=None) -> dict:
+        """Run the closed loop from a fresh reset and return actions + trajectory."""
+        if episode is not None:
+            self.env.reset(self.env.scene_id, int(episode.episode_id),
+                           int(episode.seed), episode=episode)
+        self.reset(episode)
+        env = self.env
+        actions: List[str] = []
+        trajectory = [trajectory_row(env.observation(), "start", False)]
+        while not env.done:
+            action = self.act()
+            if action is None:
+                break
+            observation = env.step(action)
+            actions.append(action)
+            trajectory.append(trajectory_row(observation, action))
+        return {
+            "policy": self.name,
+            "actions": actions,
+            "trajectory": trajectory,
+            "result": env.evaluate(),
+        }
+
+
+def run_action_sequence(env: PointNavEnv, actions: Sequence[str]) -> dict:
+    """Execute a stored action list and record the same replay trajectory shape."""
+    executed: List[str] = []
+    trajectory = [trajectory_row(env.observation(), "start", False)]
+    for action in actions:
+        if env.done:
+            break
+        observation = env.step(action)
+        executed.append(action)
+        trajectory.append(trajectory_row(observation, action))
+    return {
+        "policy": "oracle",
+        "actions": executed,
+        "trajectory": trajectory,
+        "result": env.evaluate(),
+    }
 
 
 # --------------------------------------------------------------------------- #
