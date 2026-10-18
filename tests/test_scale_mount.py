@@ -23,6 +23,14 @@ Both facts below were the third review's counterexamples and are frozen here:
 
 The Blender half is skipped when no Blender binary is installed (same rule as
 ``test_settle.py``); everything else runs on the host python.
+
+The asset-orientation half freezes the fourth review's counterexample: the
+Poly Haven registry measures ``modern_coffee_table_01`` as 1.20 x 0.60 m but
+the glTF imports as 0.60 x 1.20 m (X/Y transposed), so the checker and the
+builder disagreed about the footprint at every yaw.  ``normalise_asset`` now
+aligns a transposed footprint to ``api_dimensions_mm`` with one quarter turn,
+and its ``yaw_deg`` front correction actually moves the geometry (glTF imports
+are in quaternion mode; the old code wrote the ignored Euler channels).
 """
 
 from __future__ import annotations
@@ -39,6 +47,7 @@ REPO_ROOT = os.path.dirname(TESTS_DIR)
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+from blender_agent import assets as assets_mod  # noqa: E402
 from blender_agent import checks as checks_mod  # noqa: E402
 from blender_agent import fixtures as fixtures_mod  # noqa: E402
 from blender_agent import spec as spec_mod  # noqa: E402
@@ -421,6 +430,134 @@ class BlenderGeneratedGeometryTest(unittest.TestCase):
         self.assertEqual(len(light), 1)
         self.assertAlmostEqual(light[0][2], lamp["bbox_z"][0] + 0.88 * 0.17, places=6)
         self.assertLess(light[0][2], ROOM_TOP_M)
+
+
+# --------------------------------------------------------------------------- #
+# registry frame: the coffee table's glTF is yawed against its own metadata
+# --------------------------------------------------------------------------- #
+COFFEE_TABLE_GLTF = os.path.join(
+    REPO_ROOT, "third_party", "assets", "polyhaven", "models",
+    "modern_coffee_table_01", "modern_coffee_table_01_1k.gltf",
+)
+#: Poly Haven's ``dimensions`` for modern_coffee_table_01, the values the
+#: checker reads: width 1.2018 m (X), depth 0.600 m (Y), height 0.390 m (Z)
+COFFEE_TABLE_REGISTRY_M = (1.2018, 0.600, 0.390)
+
+ORIENTATION_SCRIPT = '''
+import json, os, sys
+
+ROOT = os.environ["ROOMGEN_REPO_ROOT"]
+sys.path.insert(0, ROOT)
+
+import bpy
+from blender_agent import assets
+
+cache = os.path.join(ROOT, "third_party", "assets", "polyhaven")
+entry = assets.load_index(cache)["models"]["modern_coffee_table_01"]
+
+result = {}
+bpy.ops.wm.read_factory_settings(use_empty=True)
+_collection, meshes, _imported = assets.import_gltf_asset(os.environ["COFFEE_GLTF"], "coffee")
+result["coffee"] = assets.normalise_asset(meshes, "modern_coffee_table_01", {}, entry)
+
+# a 2 x 1 x 0.5 m cube in the glTF importer's quaternion rotation mode: the
+# yaw_deg correction has to move it even though rotation_euler stays untouched
+bpy.ops.wm.read_factory_settings(use_empty=True)
+bpy.ops.mesh.primitive_cube_add(size=1.0)
+cube = bpy.context.active_object
+cube.scale = (2.0, 1.0, 0.5)
+cube.rotation_mode = "QUATERNION"
+bpy.context.view_layer.update()
+result["cube"] = assets.normalise_asset(
+    [cube], "synthetic", {"synthetic": {"yaw_deg": 90.0}},
+    {"api_dimensions_mm": [2000.0, 1000.0, 500.0]},
+)
+result["cube"]["rotation_mode"] = cube.rotation_mode
+print("ORIENTATION " + json.dumps(result))
+'''
+
+
+def run_orientation_probe(binary: str) -> dict:
+    """Import the cached coffee table in Blender and return normalise's facts."""
+    with tempfile.TemporaryDirectory() as workdir:
+        script_path = os.path.join(workdir, "orientation.py")
+        with open(script_path, "w", encoding="utf-8") as handle:
+            handle.write(ORIENTATION_SCRIPT)
+        environment = dict(os.environ, ROOMGEN_REPO_ROOT=REPO_ROOT,
+                           COFFEE_GLTF=COFFEE_TABLE_GLTF)
+        result = subprocess.run(
+            [binary, "--background", "--factory-startup", "--python", script_path],
+            capture_output=True, text=True, timeout=600, env=environment,
+        )
+    if result.returncode != 0:
+        raise AssertionError(f"orientation probe failed\n{result.stdout[-3000:]}\n"
+                             f"{result.stderr[-3000:]}")
+    for line in result.stdout.splitlines():
+        if line.startswith("ORIENTATION "):
+            return json.loads(line[len("ORIENTATION "):])
+    raise AssertionError(f"orientation probe printed no result\n{result.stdout[-3000:]}")
+
+
+class RegistryAxisAlignmentTest(unittest.TestCase):
+    """The loader turns a transposed glTF footprint into the registry frame."""
+
+    API = [1201.8300294876099, 600.0000834465027, 389.99998569488525]
+
+    def test_transposed_footprint_gets_one_quarter_turn(self):
+        yaw, note = assets_mod.registry_axis_yaw([0.6, 1.2018, 0.39], self.API)
+        self.assertEqual(yaw, 90.0)
+        self.assertIn("transpose", note)
+
+    def test_aligned_footprint_is_left_alone(self):
+        self.assertEqual(assets_mod.registry_axis_yaw([1.2018, 0.6, 0.39], self.API),
+                         (0.0, None))
+
+    def test_square_missing_and_wrong_height_are_not_rotated(self):
+        square = [430.0, 431.0, 951.0]
+        self.assertEqual(assets_mod.registry_axis_yaw([0.430, 0.431, 0.951], square),
+                         (0.0, None))
+        self.assertEqual(assets_mod.registry_axis_yaw([0.6, 1.2018, 0.39], None),
+                         (0.0, None))
+        # a height that disagrees is a real size problem, not an axis-order one
+        self.assertEqual(assets_mod.registry_axis_yaw([0.6, 1.2018, 0.50], self.API),
+                         (0.0, None))
+
+    def test_manifest_drift_note_clears_for_the_aligned_size(self):
+        aligned = COFFEE_TABLE_REGISTRY_M
+        self.assertIsNone(checks_mod._built_size_note("coffee_table", aligned, aligned))
+        stale = checks_mod._built_size_note("coffee_table", [0.6, 1.2018, 0.39], aligned)
+        self.assertIsNotNone(stale)
+        self.assertIn("built size differs", stale)
+
+
+class PolyHavenOrientationTest(unittest.TestCase):
+    """Measure the real imported asset: extents and yaw, not just helpers."""
+
+    @classmethod
+    def setUpClass(cls):
+        binary = blender_binary()
+        if binary is None:
+            raise unittest.SkipTest("no Blender binary (PANOWORLD_BLENDER / third_party/blender-*)")
+        if not os.path.isfile(COFFEE_TABLE_GLTF):
+            raise unittest.SkipTest("coffee table glTF is not cached; run assets.py fetch first")
+        cls.probe = run_orientation_probe(binary)
+
+    def test_coffee_table_builds_at_the_registry_size(self):
+        facts = self.probe["coffee"]
+        for measured, registry in zip(facts["size_m"], COFFEE_TABLE_REGISTRY_M):
+            self.assertAlmostEqual(measured, registry, places=3)
+        self.assertEqual(facts["axis_yaw_deg"], 90.0)
+        self.assertEqual(facts["front_yaw_deg"], 0.0)
+        self.assertIsNone(facts["scale_warning"])
+
+    def test_yaw_correction_moves_quaternion_mode_geometry(self):
+        facts = self.probe["cube"]
+        self.assertEqual(facts["rotation_mode"], "QUATERNION")
+        self.assertEqual(facts["axis_yaw_deg"], 0.0)
+        self.assertEqual(facts["front_yaw_deg"], 90.0)
+        self.assertAlmostEqual(facts["size_m"][0], 1.0, places=6)
+        self.assertAlmostEqual(facts["size_m"][1], 2.0, places=6)
+        self.assertAlmostEqual(facts["size_m"][2], 0.5, places=6)
 
 
 if __name__ == "__main__":

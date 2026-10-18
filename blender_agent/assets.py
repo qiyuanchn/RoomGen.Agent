@@ -47,6 +47,14 @@ Asset conventions (see ``asset_meta.json`` for per-asset overrides):
 * units: the glTF importer brings Poly Haven models in at 1 unit = 1 m; the
   loader re-checks the measured bounding box against the API's ``dimensions``
   and against absolute plausibility (0.02 m .. 20 m) and refuses wild ones.
+* registry frame: ``api_dimensions_mm`` is ``[width_x, depth_y, height_z]`` in
+  the **Blender frame after the glTF Y-up conversion** (Blender X = glTF X,
+  Blender Y = -glTF Z, Blender Z = glTF Y).  Most exports match that metadata
+  axis for axis.  When a glTF was exported 90 deg yawed against its own
+  dimensions (the X/Y footprint is the transpose of the registry), the loader
+  applies a +90 deg Z rotation at library-build time so the built extents are
+  the registry extents axis for axis; the scene checker and the builder then
+  agree without a per-asset fudge factor.
 * origin: after normalisation the object origin sits at the **bottom-centre of
   the bounding box**, so ``z = 0`` means "standing on the floor of a room whose
   floor is at z = 0" (the P0 shell's floors are exactly there).
@@ -54,8 +62,11 @@ Asset conventions (see ``asset_meta.json`` for per-asset overrides):
   with ``rot_z_deg = 0`` looks towards -Y; ``rot_z_deg = 180`` faces +Y, and so
   on (counter-clockwise around +Z, matching Blender's rotation_euler.z).
   Poly Haven models arrive with the front along +Y for some assets and -Y for
-  others; the per-asset correction ships in ``asset_meta.json`` and is applied
-  once at library-build time, so the scene spec never needs a fudge factor.
+  others; the per-asset correction ships in ``asset_meta.json`` (``yaw_deg``)
+  and is applied as a world-space Z rotation after the registry-frame
+  alignment, once at library-build time, so the scene spec never needs a fudge
+  factor.  glTF imports use quaternion rotation mode, so the correction is
+  applied to ``matrix_world`` rather than to the invisible Euler channels.
 """
 
 from __future__ import annotations
@@ -82,6 +93,12 @@ DEFAULT_RESOLUTION = "2k"
 
 # every library a scene spec may name in a furniture ref
 ASSET_SCHEMES = ("ph", "midi3d", "gen")
+
+#: Version of the import/normalisation convention (origin, facing, registry
+#: axis alignment).  Cached ``library/<id>.blend`` files are reused only when
+#: their sidecar records this version, so changing the convention rebuilds the
+#: libraries instead of silently serving geometry built by the old rules.
+NORMALISATION_VERSION = 2
 
 #: Per-cache metadata recording the content digest of every indexed asset.
 #: The digest covers the bytes of the model and its key texture files, not
@@ -764,10 +781,82 @@ def _measured_bbox(objects):
     return lo, hi
 
 
+#: A footprint whose X/Y extents match the registry only after a transpose is a
+#: 90 deg frame difference between the glTF and ``api_dimensions_mm`` -- a
+#: source-model/library inconsistency, not a scale problem.  Cached Poly Haven
+#: geometry and its registry agree to millimetres, so 5 cm is generous without
+#: ever turning a genuinely different size into a rotation.
+AXIS_ALIGN_TOL_M = 0.05
+
+
+def registry_axis_yaw(size_m, api_dimensions_mm, tolerance: float = AXIS_ALIGN_TOL_M) -> tuple:
+    """Yaw about +Z that puts a measured footprint into the registry frame.
+
+    ``api_dimensions_mm`` is ``[width_x, depth_y, height_z]`` in the Blender
+    frame after the glTF Y-up conversion.  A model exported 90 deg yawed
+    against its own metadata has the X/Y footprint of the registry transposed
+    (``modern_coffee_table_01`` is the cached example: the glTF measures
+    0.60 x 1.20 m while the registry says 1.20 x 0.60 m).
+
+    Returns ``(90.0, note)`` when the direct match is out of ``tolerance`` and
+    a transpose brings both footprint axes and the height inside it; otherwise
+    ``(0.0, None)``.  The rotation is always +90 deg, so an asset that needs
+    the other quarter turn to face -Y declares ``yaw_deg: 180`` in
+    ``asset_meta.json`` on top of this alignment.
+    """
+    try:
+        if not api_dimensions_mm or len(api_dimensions_mm) != 3 or len(size_m) != 3:
+            return 0.0, None
+        api = [float(value) / 1000.0 for value in api_dimensions_mm]
+        measured = [float(value) for value in size_m]
+    except (TypeError, ValueError):
+        return 0.0, None
+    if any(value <= 0.0 for value in api):
+        return 0.0, None
+    direct = max(abs(measured[0] - api[0]), abs(measured[1] - api[1]))
+    transposed = max(abs(measured[0] - api[1]), abs(measured[1] - api[0]))
+    height_error = abs(measured[2] - api[2])
+    if (direct <= tolerance or height_error > tolerance
+            or transposed > tolerance or transposed >= direct):
+        return 0.0, None
+    return 90.0, (
+        f"footprint {[round(v, 3) for v in measured[:2]]} m is the transpose of "
+        f"the registry {[round(v, 3) for v in api[:2]]} m"
+    )
+
+
+def _measurement_warning(size, api_dims, front_yaw: float):
+    """Axis-wise size drift, allowing for a quarter-turn facing correction."""
+    try:
+        api = [float(value) / 1000.0 for value in api_dims]
+    except (TypeError, ValueError):
+        return None
+    if len(api) != 3 or any(value <= 1e-9 for value in api):
+        return None
+    quarter_turns = front_yaw / 90.0
+    if abs(quarter_turns - round(quarter_turns)) < 1e-9 and int(round(quarter_turns)) % 2:
+        # an odd quarter turn is a deliberate X/Y transpose of the front frame
+        api = [api[1], api[0], api[2]]
+    elif abs(quarter_turns - round(quarter_turns)) >= 1e-9:
+        # a non-quarter-turn front correction cannot keep an axis-aligned AABB
+        size, api = sorted(size), sorted(api)
+    ratios = [m / a for m, a in zip(size, api)]
+    if ratios and (max(ratios) > 1.15 or min(ratios) < 0.87):
+        return (f"measured {[round(v, 3) for v in size]} m vs API "
+                f"{[round(v, 3) for v in api]} m")
+    return None
+
+
 def normalise_asset(objects, asset_id: str, meta: dict = None, entry: dict = None) -> dict:
     """Rotate/scale/centre imported glTF objects; returns geometry facts.
 
-    * per-asset front correction from ``asset_meta.json`` (``yaw_deg``)
+    * registry-frame alignment: a glTF whose X/Y footprint is the transpose of
+      ``api_dimensions_mm`` gets a +90 deg Z rotation, so the built extents are
+      the registry extents axis for axis
+    * per-asset front correction from ``asset_meta.json`` (``yaw_deg``),
+      applied as a world-space Z rotation after the alignment (glTF imports
+      are in quaternion rotation mode, so writing ``rotation_euler`` is a
+      no-op and must not be used)
     * origin moved to the bottom-centre of the bounding box
     * sanity checks against the API dimensions and absolute plausibility
     """
@@ -781,9 +870,16 @@ def normalise_asset(objects, asset_id: str, meta: dict = None, entry: dict = Non
     for obj in objects:  # shared mesh data would be transformed twice
         if obj.data.users > 1:
             obj.data = obj.data.copy()
-    if yaw:
+    bpy.context.view_layer.update()
+    raw_lo, raw_hi = _measured_bbox(objects)
+    raw_size = [raw_hi[i] - raw_lo[i] for i in range(3)]
+    axis_yaw, axis_note = registry_axis_yaw(
+        raw_size, (entry or {}).get("api_dimensions_mm"))
+    total_yaw = axis_yaw + yaw
+    if total_yaw:
+        rotation = mathutils.Matrix.Rotation(total_yaw * math.pi / 180.0, 4, "Z")
         for obj in objects:
-            obj.rotation_euler.z += yaw * math.pi / 180.0
+            obj.matrix_world = rotation @ obj.matrix_world
         bpy.context.view_layer.update()
     # bake transforms so the instance geometry is already in the final pose
     for obj in objects:
@@ -800,16 +896,7 @@ def normalise_asset(objects, asset_id: str, meta: dict = None, entry: dict = Non
             f"furniture scale (units problem?), bbox {[round(v, 3) for v in size]}"
         )
     api_dims = (entry or {}).get("api_dimensions_mm")
-    warning = None
-    if api_dims:
-        api_sorted = sorted(float(v) / 1000.0 for v in api_dims)
-        measured_sorted = sorted(size)
-        ratios = [m / a for m, a in zip(measured_sorted, api_sorted) if a > 1e-9]
-        if ratios and (max(ratios) > 1.15 or min(ratios) < 0.87):
-            warning = (
-                f"measured {[round(v, 3) for v in measured_sorted]} m vs API "
-                f"{[round(v, 3) for v in api_sorted]} m"
-            )
+    warning = _measurement_warning(size, api_dims, yaw) if api_dims else None
     offset = mathutils.Vector((-(lo[0] + hi[0]) / 2.0, -(lo[1] + hi[1]) / 2.0, -lo[2]))
     for obj in objects:
         obj.data.transform(mathutils.Matrix.Translation(offset))
@@ -819,7 +906,10 @@ def normalise_asset(objects, asset_id: str, meta: dict = None, entry: dict = Non
         "bbox_min": [round(v, 4) for v in lo],
         "bbox_max": [round(v, 4) for v in hi],
         "size_m": [round(v, 4) for v in size],
-        "yaw_applied_deg": yaw,
+        "yaw_applied_deg": total_yaw,
+        "axis_yaw_deg": axis_yaw,
+        "front_yaw_deg": yaw,
+        "axis_alignment": axis_note,
         "scale_warning": warning,
     }
 
@@ -883,8 +973,9 @@ def ensure_library(cache_dir: str, asset_id: str, meta: dict = None, force: bool
     for a furnished scene).
 
     The library carries a ``<id>.<res>.json`` sidecar with the content digest of
-    the model and its textures.  A cached ``.blend`` is reused only when that
-    digest still matches the cache; replacing a file in place rebuilds the
+    the model and its textures and the normalisation version that produced it.
+    A cached ``.blend`` is reused only when both still match; replacing a file
+    in place -- or changing the import/axis/facing convention -- rebuilds the
     library instead of silently reusing the old geometry.
     """
     bpy = _bpy()
@@ -904,7 +995,8 @@ def ensure_library(cache_dir: str, asset_id: str, meta: dict = None, force: bool
     content_sha = (content["content"].get("models") or {}).get(asset_id)
     lib_dir = os.path.join(cache_dir, "library")
     lib_path = os.path.join(lib_dir, f"{asset_id}.{resolution}.blend")
-    if not force and library_is_current(lib_path, content_sha):
+    if (not force and library_is_current(lib_path, content_sha)
+            and _load_library_metadata(lib_path).get("normalisation_version") == NORMALISATION_VERSION):
         return lib_path
 
     gltf_path = os.path.join(cache_dir, variants[resolution])
@@ -945,6 +1037,7 @@ def ensure_library(cache_dir: str, asset_id: str, meta: dict = None, force: bool
         "schema_version": CONTENT_MANIFEST_SCHEMA,
         "asset": asset_id,
         "resolution": resolution,
+        "normalisation_version": NORMALISATION_VERSION,
         "content_sha256": content_sha,
         "files": entry_record.get("files") or [],
     })
