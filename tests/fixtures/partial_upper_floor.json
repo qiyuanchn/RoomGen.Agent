@@ -61,7 +61,7 @@
   },
   "lighting": {"lamp_w": 8.0, "lamp_radius": 0.08},
   "furniture": [
-    {"asset": "builtin:storage_shelf", "room": "entry", "pos": [9.5, 0.3], "rot_z_deg": 0,
+    {"asset": "builtin:storage_shelf", "room": "entry", "pos": [9.5, 0.3], "rot_z_deg": 180,
      "name": "entry_shelf"}
   ]
 }

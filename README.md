@@ -30,6 +30,15 @@ For delivered-mix analysis (requested vs generated vs successful layouts,
 fallback rates and request bias), use
 `python tools/diversity_report.py success --root <batch> [--scenes]`.
 
+New in this series: `--shape open_plan` builds concave rectilinear rooms and
+an L-shaped open LDK (physical rooms vs semantic zones).  The final-geometry
+check also verifies usage spaces (door swing, chair pull-out, bed-side access,
+shower entry); `checks.py --functional-usage` runs it standalone.  The browser
+viewer’s Walk mode follows GLB support surfaces through stairs and slabs with
+collision and floor sections.  Asset libraries carry a content fingerprint:
+same-path byte replacement invalidates resume, while an mtime-only touch does
+not re-read unchanged files.
+
 ## Why build the scene in 3D first
 
 Classic pipelines generate panoramas with diffusion models and then
